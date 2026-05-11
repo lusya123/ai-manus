@@ -1,4 +1,4 @@
-from typing import Optional, AsyncGenerator, List
+from typing import Any, Optional, AsyncGenerator, List
 import logging
 from datetime import datetime
 from app.domain.models.session import Session, SessionStatus
@@ -41,6 +41,31 @@ class AgentDomainService:
         self._file_storage = file_storage
         self._mcp_repository = mcp_repository
         logger.info("AgentDomainService initialization completed")
+
+    @staticmethod
+    def _attachment_value(attachment: Any, key: str) -> Optional[str]:
+        if isinstance(attachment, dict):
+            return attachment.get(key)
+        if hasattr(attachment, "model_dump"):
+            return attachment.model_dump().get(key)
+        return getattr(attachment, key, None)
+
+    def _to_file_infos(self, attachments: Optional[List[Any]]) -> Optional[List[FileInfo]]:
+        if not attachments:
+            return None
+
+        file_infos = []
+        for attachment in attachments:
+            file_id = self._attachment_value(attachment, "file_id")
+            if not file_id:
+                continue
+            file_infos.append(
+                FileInfo(
+                    file_id=file_id,
+                    filename=self._attachment_value(attachment, "filename"),
+                )
+            )
+        return file_infos or None
             
     async def shutdown(self) -> None:
         """Clean up all Agent's resources"""
@@ -111,7 +136,7 @@ class AgentDomainService:
         message: Optional[str] = None,
         timestamp: Optional[datetime] = None,
         latest_event_id: Optional[str] = None,
-        attachments: Optional[List[dict]] = None
+        attachments: Optional[List[Any]] = None
     ) -> AsyncGenerator[BaseEvent, None]:
         """
         Chat with an agent
@@ -136,7 +161,7 @@ class AgentDomainService:
                 message_event = MessageEvent(
                     message=message, 
                     role="user", 
-                    attachments=[FileInfo(file_id=attachment["file_id"], filename=attachment["filename"]) for attachment in attachments] if attachments else None
+                    attachments=self._to_file_infos(attachments),
                 )
 
                 event_id = await task.input_stream.put(message_event.model_dump_json())

@@ -26,6 +26,8 @@ from app.domain.services.tools.browser import BrowserToolkit
 from app.domain.services.tools.file import FileToolkit
 from app.domain.services.tools.message import MessageToolkit
 from app.domain.services.tools.search import SearchToolkit
+from app.domain.services.tools.preview import PreviewToolkit
+from app.domain.services.prompts.runtime import build_runtime_environment_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +62,7 @@ class PlanActFlow(BaseFlow):
             ShellToolkit(sandbox),
             BrowserToolkit(browser),
             FileToolkit(sandbox),
+            PreviewToolkit(),
             MessageToolkit(),
             mcp_tool
         ]
@@ -68,11 +71,14 @@ class PlanActFlow(BaseFlow):
         if search_engine:
             tools.append(SearchToolkit(search_engine))
 
+        runtime_prompt = build_runtime_environment_prompt(sandbox)
+
         # Create planner and execution agents
         self.planner = PlannerAgent(
             agent_id=self._agent_id,
             agent_repository=self._repository,
             tools=tools,
+            runtime_prompt=runtime_prompt,
         )
         logger.debug(f"Created planner agent for Agent {self._agent_id}")
             
@@ -80,6 +86,7 @@ class PlanActFlow(BaseFlow):
             agent_id=self._agent_id,
             agent_repository=self._repository,
             tools=tools,
+            runtime_prompt=runtime_prompt,
         )
         logger.debug(f"Created execution agent for Agent {self._agent_id}")
 

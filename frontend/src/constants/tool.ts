@@ -29,6 +29,9 @@ export const TOOL_FUNCTION_MAP: {[key: string]: string} = {
   "browser_scroll_down": "Scrolling down",
   "browser_console_exec": "Executing JS code",
   "browser_console_view": "Viewing console output",
+
+  // Preview tools
+  "preview_show": "Showing preview",
   
   // Search tools
   "info_search_web": "Searching web",
@@ -64,6 +67,7 @@ export const TOOL_FUNCTION_ARG_MAP: {[key: string]: string} = {
   "browser_scroll_down": "page",
   "browser_console_exec": "code",
   "browser_console_view": "console",
+  "preview_show": "url",
   "info_search_web": "query",
   "message_notify_user": "message",
   "message_ask_user": "question"
@@ -76,6 +80,7 @@ export const TOOL_NAME_MAP: {[key: string]: string} = {
   "shell": "Terminal",
   "file": "File",
   "browser": "Browser",
+  "preview": "Preview",
   "info": "Information",
   "message": "Message",
   "mcp": "MCP Tool"
@@ -93,6 +98,7 @@ export const TOOL_ICON_MAP: {[key: string]: any} = {
   "shell": ShellIcon,
   "file": EditIcon,
   "browser": BrowserIcon,
+  "preview": BrowserIcon,
   "search": SearchIcon,
   "message": "",
   "mcp": SearchIcon  // 暂时使用搜索图标，可以后续创建专门的MCP图标
@@ -103,6 +109,7 @@ import FileToolView from '@/components/toolViews/FileToolView.vue';
 import SearchToolView from '@/components/toolViews/SearchToolView.vue';
 import BrowserToolView from '@/components/toolViews/BrowserToolView.vue';
 import McpToolView from '@/components/toolViews/McpToolView.vue';
+import PreviewToolView from '@/components/toolViews/PreviewToolView.vue';
 
 /**
  * Mapping from tool names to components
@@ -112,5 +119,6 @@ export const TOOL_COMPONENT_MAP: {[key: string]: any} = {
   "file": FileToolView,
   "search": SearchToolView,
   "browser": BrowserToolView,
+  "preview": PreviewToolView,
   "mcp": McpToolView
 };

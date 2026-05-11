@@ -41,8 +41,8 @@ class Session(BaseModel):
     latest_message_at: Optional[datetime] = Field(default_factory=lambda: datetime.now(UTC))
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    events: List[AgentEvent] = []
-    files: List[FileInfo] = []
+    events: List[AgentEvent] = Field(default_factory=list)
+    files: List[FileInfo] = Field(default_factory=list)
     status: SessionStatus = SessionStatus.PENDING
     is_shared: bool = False  # Whether this session is shared publicly
 

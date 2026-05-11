@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     
     # Sandbox configuration
     sandbox_address: str | None = None
+    sandbox_api_port: int = 8080
+    sandbox_cdp_port: int = 9222
+    sandbox_vnc_port: int = 5901
     sandbox_image: str | None = None
     sandbox_name_prefix: str | None = None
     sandbox_ttl_minutes: int | None = 30
@@ -58,6 +61,22 @@ class Settings(BaseSettings):
 
     # Browser engine configuration
     browser_engine: str = "browser_use"  # "playwright" or "browser_use"
+    tool_call_timeout_seconds: int = 180
+
+    # Runtime topology advertised to agents.
+    # Public URLs are for the user's machine or internet-facing access.
+    # Internal/container URLs are for services on the Docker/cloud private network.
+    # Sandbox URLs are what commands and the browser inside the sandbox should use.
+    deployment_environment: str = "development"
+    frontend_public_url: str | None = None
+    backend_public_url: str | None = None
+    frontend_internal_url: str | None = None
+    backend_internal_url: str | None = None
+    frontend_sandbox_url: str | None = None
+    backend_sandbox_url: str | None = None
+    claw_public_url: str | None = None
+    claw_internal_url: str | None = None
+    host_gateway_url: str | None = None
     
     # Search engine configuration
     search_provider: str | None = "bing_web"  # "baidu", "baidu_web", "google", "bing", "bing_web", "tavily"

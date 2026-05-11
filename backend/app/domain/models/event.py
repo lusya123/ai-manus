@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, RootModel
+from pydantic import BaseModel, Field, RootModel, field_validator
 from typing import Dict, Any, Literal, Optional, Union, List, get_args
 from datetime import datetime
 import time
@@ -52,6 +52,11 @@ class BrowserToolContent(BaseModel):
     """Browser tool content"""
     screenshot: str
 
+class PreviewToolContent(BaseModel):
+    """Interactive web preview content"""
+    url: str
+    title: Optional[str] = None
+
 class SearchToolContent(BaseModel):
     """Search tool content"""
     results: List[SearchResultItem]
@@ -70,6 +75,7 @@ class McpToolContent(BaseModel):
 
 ToolContent = Union[
     BrowserToolContent,
+    PreviewToolContent,
     SearchToolContent,
     ShellToolContent,
     FileToolContent,
@@ -104,6 +110,39 @@ class MessageEvent(BaseEvent):
     role: Literal["user", "assistant"] = "assistant"
     message: str
     attachments: Optional[List[FileInfo]] = None
+
+    @field_validator("message", mode="before")
+    @classmethod
+    def normalize_message(cls, value: Any) -> str:
+        """Normalize model content blocks to plain text for SSE/storage events."""
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            parts: list[str] = []
+            for item in value:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    if isinstance(item.get("text"), str):
+                        parts.append(item["text"])
+                    elif "content" in item:
+                        parts.append(cls.normalize_message(item["content"]))
+                    else:
+                        parts.append(json.dumps(item, ensure_ascii=False))
+                elif hasattr(item, "text") and isinstance(item.text, str):
+                    parts.append(item.text)
+                else:
+                    parts.append(str(item))
+            return "\n".join(part for part in parts if part)
+        if isinstance(value, dict):
+            if isinstance(value.get("text"), str):
+                return value["text"]
+            if "content" in value:
+                return cls.normalize_message(value["content"])
+            return json.dumps(value, ensure_ascii=False)
+        return str(value)
 
 class DoneEvent(BaseEvent):
     """Done event"""

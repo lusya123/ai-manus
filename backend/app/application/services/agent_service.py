@@ -1,5 +1,6 @@
-from typing import AsyncGenerator, Optional, List
+from typing import Any, AsyncGenerator, Optional, List
 import logging
+from urllib.parse import urlparse
 from datetime import datetime
 from app.domain.models.session import Session, SessionSummary
 from app.domain.repositories.session_repository import SessionRepository
@@ -83,7 +84,7 @@ class AgentService:
         message: Optional[str] = None,
         timestamp: Optional[datetime] = None,
         event_id: Optional[str] = None,
-        attachments: Optional[List[dict]] = None
+        attachments: Optional[List[Any]] = None
     ) -> AsyncGenerator[AgentEvent, None]:
         logger.info(f"Starting chat with session {session_id}: {message[:50]}...")
         # Directly use the domain service's chat method, which will check if the session exists
@@ -183,6 +184,55 @@ class AgentService:
             raise RuntimeError("Sandbox environment not found")
         
         return sandbox.vnc_url
+
+    async def get_preview_host(self, session_id: str) -> str:
+        """Get the network host for proxying web apps running in a session sandbox."""
+        logger.info(f"Getting preview host for session {session_id}")
+
+        session = await self._session_repository.find_by_id(session_id)
+        if not session:
+            logger.error(f"Session {session_id} not found")
+            raise RuntimeError("Session not found")
+
+        if not session.sandbox_id:
+            raise RuntimeError("Session has no sandbox environment")
+
+        sandbox = await self._sandbox_cls.get(session.sandbox_id)
+        if not sandbox:
+            raise RuntimeError("Sandbox environment not found")
+
+        host = getattr(sandbox, "ip", None)
+        if host:
+            return host
+
+        base_url = getattr(sandbox, "base_url", None)
+        if base_url:
+            parsed = urlparse(base_url)
+            if parsed.hostname:
+                return parsed.hostname
+
+        raise RuntimeError("Sandbox preview host not available")
+
+    async def get_preview_proxy_base_url(self, session_id: str) -> str:
+        """Get sandbox API base URL for proxying sandbox-local web apps."""
+        logger.info(f"Getting preview proxy base URL for session {session_id}")
+
+        session = await self._session_repository.find_by_id(session_id)
+        if not session:
+            logger.error(f"Session {session_id} not found")
+            raise RuntimeError("Session not found")
+
+        if not session.sandbox_id:
+            raise RuntimeError("Session has no sandbox environment")
+
+        sandbox = await self._sandbox_cls.get(session.sandbox_id)
+        if not sandbox:
+            raise RuntimeError("Sandbox environment not found")
+
+        base_url = getattr(sandbox, "base_url", None)
+        if not base_url:
+            raise RuntimeError("Sandbox preview proxy URL not available")
+        return base_url.rstrip("/")
 
     async def file_view(self, session_id: str, file_path: str, user_id: str) -> FileViewResponse:
         """View file content, ensuring session belongs to the user"""

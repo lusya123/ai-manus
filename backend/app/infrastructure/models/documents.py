@@ -52,8 +52,8 @@ class UserDocument(BaseDocument[User], id_field="user_id", domain_model_class=Us
     password_hash: Optional[str] = None
     role: UserRole = UserRole.USER
     is_active: bool = True
-    created_at: datetime = datetime.now(timezone.utc)
-    updated_at: datetime = datetime.now(timezone.utc)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_login_at: Optional[datetime] = None
 
     class Settings:
@@ -70,9 +70,9 @@ class AgentDocument(BaseDocument[Agent], id_field="agent_id", domain_model_class
     model_name: str
     temperature: float
     max_tokens: int
-    memories: Dict[str, Memory] = {}
-    created_at: datetime = datetime.now(timezone.utc)
-    updated_at: datetime = datetime.now(timezone.utc)
+    memories: Dict[str, Memory] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     class Settings:
         name = "agents"
@@ -92,11 +92,11 @@ class SessionDocument(BaseDocument[Session], id_field="session_id", domain_model
     unread_message_count: int = 0
     latest_message: Optional[str] = None
     latest_message_at: Optional[datetime] = None
-    created_at: datetime = datetime.now(timezone.utc)
-    updated_at: datetime = datetime.now(timezone.utc)
-    events: List[AgentEvent]
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    events: List[AgentEvent] = Field(default_factory=list)
     status: SessionStatus
-    files: List[FileInfo] = []
+    files: List[FileInfo] = Field(default_factory=list)
     is_shared: Optional[bool] = False
     class Settings:
         name = "sessions"
@@ -120,7 +120,7 @@ class ClawDocument(BaseDocument[Claw], id_field="claw_id", domain_model_class=Cl
     status: ClawStatus = ClawStatus.CREATING
     error_message: Optional[str] = None
     expires_at: Optional[datetime] = None
-    messages: List[ClawMessage] = []
+    messages: List[ClawMessage] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 

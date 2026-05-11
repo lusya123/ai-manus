@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, Query
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, Query, Request, Response, HTTPException
 from sse_starlette.sse import EventSourceResponse
 from typing import AsyncGenerator, List, Optional
 from sse_starlette.event import ServerSentEvent
@@ -6,6 +6,9 @@ from datetime import datetime
 import asyncio
 import websockets
 import logging
+import httpx
+import re
+from urllib.parse import urlparse, urlunparse
 from app.interfaces.dependencies import get_file_service
 
 from app.application.services.agent_service import AgentService
@@ -16,7 +19,7 @@ from app.interfaces.schemas.base import APIResponse
 from app.interfaces.schemas.session import (
     ChatRequest, ShellViewRequest, CreateSessionResponse, GetSessionResponse,
     ListSessionItem, ListSessionResponse, ShellViewResponse,
-    ShareSessionResponse, SharedSessionResponse
+    ShareSessionResponse, SharedSessionResponse, PreviewUrlRequest
 )
 from app.interfaces.schemas.file import FileViewRequest, FileViewResponse
 from app.interfaces.schemas.resource import AccessTokenRequest, SignedUrlResponse
@@ -28,6 +31,47 @@ logger = logging.getLogger(__name__)
 SESSION_POLL_INTERVAL = 5
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
+
+LOCAL_PREVIEW_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+
+
+def _rewrite_preview_content(content: bytes, content_type: str, prefix: str) -> bytes:
+    """Rewrite root-relative asset URLs so apps work under the preview proxy."""
+    lowered = content_type.lower()
+    if not any(kind in lowered for kind in ("text/html", "text/css", "javascript", "ecmascript")):
+        return content
+
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return content
+
+    escaped_prefix = prefix.rstrip("/")
+    if "text/html" in lowered:
+        text = re.sub(
+            r'(\b(?:src|href|action|poster)=["\'])/(?!/)',
+            rf'\1{escaped_prefix}/',
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(
+            r'(\bsrcset=["\'][^"\']*?)(\s|^)/(?!/)',
+            rf'\1\2{escaped_prefix}/',
+            text,
+            flags=re.IGNORECASE,
+        )
+
+    if "text/css" in lowered or "text/html" in lowered:
+        text = re.sub(r'url\((["\']?)/(?!/)', rf'url(\1{escaped_prefix}/', text)
+
+    if "javascript" in lowered or "ecmascript" in lowered:
+        text = re.sub(
+            r'((?:from|import)\s*\(?\s*["\'])/(?!/)',
+            rf'\1{escaped_prefix}/',
+            text,
+        )
+
+    return text.encode("utf-8")
 
 @router.put("", response_model=APIResponse[CreateSessionResponse])
 async def create_session(
@@ -324,6 +368,144 @@ async def create_vnc_signed_url(
         signed_url=signed_url,
         expires_in=expire_minutes * 60,
     ))
+
+@router.post("/{session_id}/preview-url", response_model=APIResponse[SignedUrlResponse])
+async def create_preview_url(
+    session_id: str,
+    request_data: PreviewUrlRequest,
+    current_user: Optional[User] = Depends(get_optional_current_user),
+    agent_service: AgentService = Depends(get_agent_service),
+    token_service: TokenService = Depends(get_token_service)
+) -> APIResponse[SignedUrlResponse]:
+    """Create a temporary URL for an interactive web preview.
+
+    Localhost-style URLs are proxied through the backend because the user's
+    browser cannot reach the sandbox network directly. Public URLs are returned
+    unchanged.
+    """
+    session = await agent_service.get_session(session_id, current_user.id if current_user else None)
+    if not session:
+        raise NotFoundError("Session not found")
+    if not current_user and not session.is_shared:
+        raise UnauthorizedError()
+
+    raw_url = request_data.url.strip()
+    parsed = urlparse(raw_url if "://" in raw_url else f"http://{raw_url}")
+    if not parsed.scheme or not parsed.netloc:
+        raise HTTPException(status_code=400, detail="Invalid preview URL")
+
+    host = parsed.hostname or ""
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = parsed.path or "/"
+    if host.lower() not in LOCAL_PREVIEW_HOSTS:
+        return APIResponse.success(SignedUrlResponse(
+            signed_url=urlunparse(parsed),
+            expires_in=request_data.expire_minutes * 60,
+        ))
+
+    expire_minutes = min(request_data.expire_minutes, 15)
+    token = token_service.create_resource_access_token(
+        resource_type="preview",
+        resource_id=f"{session_id}:{port}",
+        user_id=current_user.id if current_user else "shared",
+        expire_minutes=expire_minutes,
+    )
+    preview_path = f"/api/v1/sessions/{session_id}/preview/{token}/{port}{path}"
+    if parsed.query:
+        preview_path = f"{preview_path}?{parsed.query}"
+
+    logger.info(f"Created preview URL for session {session_id}, port {port}")
+    return APIResponse.success(SignedUrlResponse(
+        signed_url=preview_path,
+        expires_in=expire_minutes * 60,
+    ))
+
+
+@router.api_route("/{session_id}/preview/{token}/{port}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
+@router.api_route("/{session_id}/preview/{token}/{port}/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
+async def proxy_preview(
+    request: Request,
+    session_id: str,
+    token: str,
+    port: int,
+    path: str = "",
+    agent_service: AgentService = Depends(get_agent_service),
+    token_service: TokenService = Depends(get_token_service)
+) -> Response:
+    """Proxy a sandbox-local web app so it can be used in the right panel."""
+    payload = token_service.verify_token(token)
+    if (
+        not payload
+        or payload.get("type") != "resource_access"
+        or payload.get("resource_type") != "preview"
+        or payload.get("resource_id") != f"{session_id}:{port}"
+    ):
+        raise UnauthorizedError()
+
+    sandbox_proxy_base_url = await agent_service.get_preview_proxy_base_url(session_id)
+    target_path = f"/{path}" if path else "/"
+    target_url = f"{sandbox_proxy_base_url}/api/v1/proxy/{port}{target_path}"
+    if request.url.query:
+        target_url = f"{target_url}?{request.url.query}"
+
+    excluded_headers = {
+        "host",
+        "connection",
+        "content-length",
+        "transfer-encoding",
+        "content-encoding",
+    }
+    outbound_headers = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() not in excluded_headers
+    }
+    body = await request.body()
+
+    async with httpx.AsyncClient(follow_redirects=False, timeout=30.0) as client:
+        proxied = await client.request(
+            request.method,
+            target_url,
+            content=body,
+            headers=outbound_headers,
+        )
+
+    response_headers = {
+        key: value
+        for key, value in proxied.headers.items()
+        if key.lower() not in {
+            "content-length",
+            "transfer-encoding",
+            "content-encoding",
+            "connection",
+            "content-type",
+            "date",
+            "server",
+            "x-frame-options",
+            "content-security-policy",
+        }
+    }
+    content_type = proxied.headers.get("content-type", "")
+    prefix = f"/api/v1/sessions/{session_id}/preview/{token}/{port}"
+    location = response_headers.get("location")
+    if location:
+        parsed_location = urlparse(location)
+        if location.startswith("/"):
+            response_headers["location"] = f"{prefix}{location}"
+        elif (parsed_location.hostname or "").lower() in LOCAL_PREVIEW_HOSTS:
+            location_path = parsed_location.path or "/"
+            rewritten_location = f"{prefix}{location_path}"
+            if parsed_location.query:
+                rewritten_location = f"{rewritten_location}?{parsed_location.query}"
+            response_headers["location"] = rewritten_location
+    content = _rewrite_preview_content(proxied.content, content_type, prefix)
+
+    return Response(
+        content=content,
+        status_code=proxied.status_code,
+        headers=response_headers,
+        media_type=content_type.split(";")[0] if content_type else None,
+    )
 
 
 @router.post("/{session_id}/share", response_model=APIResponse[ShareSessionResponse])

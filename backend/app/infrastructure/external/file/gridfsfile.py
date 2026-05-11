@@ -45,6 +45,12 @@ class GridFSFileStorage(FileStorage):
         
         database = self.mongodb.client[self.settings.mongodb_database]
         return database[f"{self.bucket_name}.files"]
+
+    def _to_object_id(self, file_id: str) -> ObjectId:
+        try:
+            return ObjectId(file_id)
+        except Exception as exc:
+            raise FileNotFoundError(f"File not found with ID: {file_id}") from exc
     
     def _create_file_info(self, file_info: Dict[str, Any], file_id: str) -> FileInfo:
         """Create FileInfo object from GridFS file metadata"""
@@ -116,11 +122,7 @@ class GridFSFileStorage(FileStorage):
             bucket = self._get_gridfs_bucket()
             files_collection = self._get_files_collection()
             
-            # Convert ObjectId
-            try:
-                obj_id = ObjectId(file_id)
-            except Exception:
-                raise ValueError(f"Invalid file ID format: {file_id}")
+            obj_id = self._to_object_id(file_id)
             
             # Get file information and check user ownership
             file_info = await files_collection.find_one({"_id": obj_id})
@@ -137,8 +139,6 @@ class GridFSFileStorage(FileStorage):
             stream.seek(0)
             return stream, self._create_file_info(file_info, file_id)
             
-        except FileNotFoundError:
-            raise
         except (FileNotFoundError, PermissionError):
             raise
         except Exception as e:
@@ -151,11 +151,7 @@ class GridFSFileStorage(FileStorage):
             bucket = self._get_gridfs_bucket()
             files_collection = self._get_files_collection()
             
-            # Convert ObjectId
-            try:
-                obj_id = ObjectId(file_id)
-            except Exception:
-                raise ValueError(f"Invalid file ID format: {file_id}")
+            obj_id = self._to_object_id(file_id)
             
             # Check if file exists and belongs to user
             file_info = await files_collection.find_one({"_id": obj_id})
@@ -182,11 +178,10 @@ class GridFSFileStorage(FileStorage):
         try:
             files_collection = self._get_files_collection()
             
-            # Convert ObjectId
             try:
-                obj_id = ObjectId(file_id)
-            except Exception:
-                raise ValueError(f"Invalid file ID format: {file_id}")
+                obj_id = self._to_object_id(file_id)
+            except FileNotFoundError:
+                return None
             
             # Get file information and check user ownership
             file_info = await files_collection.find_one({"_id": obj_id})

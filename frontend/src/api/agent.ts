@@ -4,7 +4,7 @@ import { AgentSSEEvent } from '../types/event';
 import { CreateSessionResponse, GetSessionResponse, ShellViewResponse, FileViewResponse, ListSessionResponse, SignedUrlResponse, ShareSessionResponse, SharedSessionResponse } from '../types/response';
 import type { FileInfo } from './file';
 
-
+type ChatAttachment = Pick<FileInfo, 'file_id' | 'filename'>;
 
 /**
  * Create Session
@@ -84,7 +84,7 @@ export const chatWithSession = async (
   sessionId: string, 
   message: string = '',
   eventId?: string,
-  attachments?: string[],
+  attachments?: ChatAttachment[],
   callbacks?: SSECallbacks<AgentSSEEvent['data']>
 ): Promise<() => void> => {
   return createSSEConnection<AgentSSEEvent['data']>(
@@ -126,6 +126,18 @@ export async function viewFile(sessionId: string, file: string): Promise<FileVie
   const response = await apiClient.post<ApiResponse<FileViewResponse>>(
     `/sessions/${sessionId}/file`,
     { file }
+  );
+  return response.data.data;
+}
+
+export async function createPreviewUrl(
+  sessionId: string,
+  url: string,
+  expireMinutes: number = 15
+): Promise<SignedUrlResponse> {
+  const response = await apiClient.post<ApiResponse<SignedUrlResponse>>(
+    `/sessions/${sessionId}/preview-url`,
+    { url, expire_minutes: expireMinutes }
   );
   return response.data.data;
 }

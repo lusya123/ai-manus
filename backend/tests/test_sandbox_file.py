@@ -9,6 +9,7 @@ import io
 
 from app.infrastructure.external.sandbox.docker_sandbox import DockerSandbox
 from app.domain.models.tool_result import ToolResult
+from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -16,8 +17,15 @@ logger = logging.getLogger(__name__)
 @pytest.fixture
 def sandbox_instance():
     """Create a DockerSandbox instance for testing"""
-    # Use localhost for testing (assumes sandbox is running locally)
-    return DockerSandbox(ip="127.0.0.1", container_name="test-sandbox")
+    # Use configured local sandbox ports for testing.
+    settings = get_settings()
+    return DockerSandbox(
+        ip=settings.sandbox_address or "127.0.0.1",
+        container_name="test-sandbox",
+        api_port=settings.sandbox_api_port,
+        cdp_port=settings.sandbox_cdp_port,
+        vnc_port=settings.sandbox_vnc_port,
+    )
 
 
 @pytest.fixture
@@ -258,4 +266,4 @@ async def test_file_overwrite(sandbox_instance, temp_file_path):
     download_result = await sandbox_instance.file_download(temp_file_path)
     downloaded_content = download_result.read()
     assert downloaded_content == new_content
-    assert downloaded_content != initial_content 
+    assert downloaded_content != initial_content

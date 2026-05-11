@@ -104,7 +104,7 @@ const avatarLetter = computed(() => {
 
 // User menu state
 const showUserMenu = ref(false);
-const userMenuTimeout = ref<number | null>(null);
+const userMenuTimeout = ref<ReturnType<typeof setTimeout> | null>(null);
 
 // Show user menu on hover
 const handleUserMenuEnter = () => {

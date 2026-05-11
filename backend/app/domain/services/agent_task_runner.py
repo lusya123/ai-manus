@@ -2,6 +2,8 @@ from typing import Optional, AsyncGenerator, List
 import asyncio
 import logging
 import os
+import re
+from pathlib import PurePosixPath
 import debugpy
 from pydantic import TypeAdapter
 from app.domain.models.message import Message
@@ -17,6 +19,7 @@ from app.domain.models.event import (
     ShellToolContent,
     SearchToolContent,
     BrowserToolContent,
+    PreviewToolContent,
     ToolStatus,
     AgentEvent,
     McpToolContent,
@@ -40,6 +43,30 @@ logger = logging.getLogger(__name__)
 
 class AgentTaskRunner(TaskRunner):
     """Agent task that can be cancelled"""
+    _DELIVERABLE_ROOT = "/home/ubuntu/upload"
+    _GENERATING_FILE_FUNCTIONS = {"file_write", "file_str_replace"}
+    _ARTIFACT_EXTENSIONS = {
+        ".csv",
+        ".docx",
+        ".html",
+        ".htm",
+        ".jpeg",
+        ".jpg",
+        ".json",
+        ".log",
+        ".md",
+        ".pdf",
+        ".png",
+        ".pptx",
+        ".py",
+        ".tar",
+        ".tgz",
+        ".ts",
+        ".txt",
+        ".vue",
+        ".xlsx",
+        ".zip",
+    }
     def __init__(
         self,
         session_id: str,
@@ -63,6 +90,8 @@ class AgentTaskRunner(TaskRunner):
         self._session_repository = session_repository
         self._file_storage = file_storage
         self._mcp_repository = mcp_repository
+        self._generated_artifacts: dict[str, FileInfo] = {}
+        self._synced_artifacts: dict[str, FileInfo] = {}
         self._mcp_tool = MCPToolkit()
         self._flow = PlanActFlow(
             self._agent_id,
@@ -94,9 +123,148 @@ class AgentTaskRunner(TaskRunner):
         result = await self._file_storage.upload_file(screenshot, "screenshot.png", self._user_id)
         return result.file_id
 
-    async def _sync_file_to_storage(self, file_path: str) -> Optional[FileInfo]:
+    def _normalize_sandbox_path(self, file_path: str) -> str:
+        """Normalize common model-produced sandbox path variants."""
+        path = (file_path or "").strip().strip("\"'`")
+        if path.startswith("~/"):
+            return f"/home/ubuntu/{path[2:]}"
+        return path
+
+    def _looks_like_artifact_path(self, file_path: str) -> bool:
+        path = self._normalize_sandbox_path(file_path).lower()
+        if path.endswith(".tar.gz"):
+            return True
+        return PurePosixPath(path).suffix in self._ARTIFACT_EXTENSIONS
+
+    def _is_auto_deliverable_path(self, file_path: str) -> bool:
+        path = self._normalize_sandbox_path(file_path)
+        return path == self._DELIVERABLE_ROOT or path.startswith(f"{self._DELIVERABLE_ROOT}/")
+
+    def _extract_artifact_paths(self, text: str) -> List[str]:
+        """Extract plausible generated file paths from shell commands or model text."""
+        if not text:
+            return []
+
+        suffixes = sorted(
+            (extension.lstrip(".") for extension in self._ARTIFACT_EXTENSIONS),
+            key=len,
+            reverse=True,
+        )
+        suffix_pattern = "|".join(re.escape(suffix) for suffix in suffixes)
+        path_pattern = re.compile(
+            rf"(?P<path>(?:~|/)[^\s\"'`<>|;&]*?\.(?:tar\.gz|{suffix_pattern}))",
+            re.IGNORECASE,
+        )
+
+        paths = []
+        for match in path_pattern.finditer(text):
+            path = self._normalize_sandbox_path(match.group("path"))
+            if path and path not in paths:
+                paths.append(path)
+        return paths
+
+    def _remember_generated_artifact(self, file_info: Optional[FileInfo]) -> None:
+        if not file_info or not file_info.file_path:
+            return
+        if self._looks_like_artifact_path(file_info.file_path) and self._is_auto_deliverable_path(file_info.file_path):
+            self._generated_artifacts[file_info.file_path] = file_info
+
+    def _remember_synced_artifact(self, file_info: Optional[FileInfo]) -> None:
+        if not file_info or not file_info.file_path:
+            return
+        if self._looks_like_artifact_path(file_info.file_path):
+            self._synced_artifacts[file_info.file_path] = file_info
+
+    async def _resolve_existing_sandbox_file(self, file_path: str) -> Optional[str]:
+        """Resolve a model-provided attachment path to an existing sandbox file."""
+        if not file_path:
+            return None
+
+        normalized_path = self._normalize_sandbox_path(file_path)
+        direct_candidates = [normalized_path]
+        if normalized_path and not normalized_path.startswith("/"):
+            direct_candidates.extend(
+                [
+                    f"{self._DELIVERABLE_ROOT}/{normalized_path}",
+                    f"/home/ubuntu/{normalized_path}",
+                    f"/tmp/{normalized_path}",
+                ]
+            )
+
+        for candidate in direct_candidates:
+            try:
+                await self._sandbox.file_download(candidate)
+                return candidate
+            except Exception:
+                pass
+
+        basename = PurePosixPath(normalized_path).name
+        if not basename:
+            return None
+
+        search_dirs = []
+        parent = str(PurePosixPath(normalized_path).parent)
+        if parent == ".":
+            parent = ""
+        for candidate in [parent, "/home/ubuntu", self._DELIVERABLE_ROOT, "/tmp"]:
+            if candidate and candidate not in search_dirs:
+                search_dirs.append(candidate)
+
+        for search_dir in search_dirs:
+            try:
+                result = await self._sandbox.file_find(search_dir, f"**/{basename}")
+                files = (result.data or {}).get("files") or []
+                for candidate in files:
+                    try:
+                        await self._sandbox.file_download(candidate)
+                        logger.warning(
+                            "Resolved missing attachment path %s to %s",
+                            normalized_path,
+                            candidate,
+                        )
+                        return candidate
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+        return None
+
+    async def _sync_file_to_storage(
+        self,
+        file_path: str,
+        fallback_content: Optional[str] = None,
+        generated: bool = False,
+    ) -> Optional[FileInfo]:
         """Upload or update file and return FileInfo"""
         try:
+            resolved_path = await self._resolve_existing_sandbox_file(file_path)
+            normalized_path = self._normalize_sandbox_path(file_path)
+            if not resolved_path and fallback_content and PurePosixPath(normalized_path).suffix.lower() == ".md":
+                resolved_path = (
+                    normalized_path
+                    if normalized_path.startswith("/")
+                    else f"{self._DELIVERABLE_ROOT}/{normalized_path}"
+                )
+                logger.warning(
+                    "Attachment file %s was missing; materializing markdown from final message",
+                    resolved_path,
+                )
+                await self._sandbox.file_write(
+                    file=resolved_path,
+                    content=fallback_content,
+                    trailing_newline=True,
+                )
+                resolved_path = await self._resolve_existing_sandbox_file(resolved_path)
+
+            if not resolved_path:
+                logger.warning("Attachment file not found in sandbox: %s", file_path)
+                return None
+
+            file_path = resolved_path
+            if not generated and file_path in self._synced_artifacts:
+                return self._synced_artifacts[file_path]
+
             file_info = await self._session_repository.get_file_by_path(self._session_id, file_path)
             file_data = await self._sandbox.file_download(file_path)
             if file_info:
@@ -105,6 +273,9 @@ class AgentTaskRunner(TaskRunner):
             file_info = await self._file_storage.upload_file(file_data, file_name, self._user_id)
             file_info.file_path = file_path
             await self._session_repository.add_file(self._session_id, file_info)
+            self._remember_synced_artifact(file_info)
+            if generated:
+                self._remember_generated_artifact(file_info)
             return file_info
         except Exception as e:
             logger.exception(f"Agent {self._agent_id} failed to sync file: {e}")
@@ -113,7 +284,7 @@ class AgentTaskRunner(TaskRunner):
         """Download file from storage to sandbox"""
         try:
             file_data, file_info = await self._file_storage.download_file(file_id, self._user_id)
-            file_path = "/home/ubuntu/upload/" + file_info.filename
+            file_path = f"{self._DELIVERABLE_ROOT}/{file_info.filename}"
             result = await self._sandbox.file_upload(file_data, file_path)
             if result.success:
                 file_info.file_path = file_path
@@ -124,12 +295,31 @@ class AgentTaskRunner(TaskRunner):
     async def _sync_message_attachments_to_storage(self, event: MessageEvent) -> None:
         """Sync message attachments and update event attachments"""
         attachments: List[FileInfo] = []
+        seen_paths = set()
         try:
             if event.attachments:
                 for attachment in event.attachments:
-                    file_info = await self._sync_file_to_storage(attachment.file_path)
+                    file_info = await self._sync_file_to_storage(attachment.file_path, event.message)
                     if file_info:
                         attachments.append(file_info)
+                        if file_info.file_path:
+                            seen_paths.add(file_info.file_path)
+
+            for path in self._extract_artifact_paths(event.message):
+                if path in seen_paths:
+                    continue
+                file_info = await self._sync_file_to_storage(path)
+                if file_info:
+                    attachments.append(file_info)
+                    if file_info.file_path:
+                        seen_paths.add(file_info.file_path)
+
+            for path, file_info in self._generated_artifacts.items():
+                if path in seen_paths:
+                    continue
+                attachments.append(file_info)
+                seen_paths.add(path)
+
             event.attachments = attachments
         except Exception as e:
             logger.exception(f"Agent {self._agent_id} failed to sync attachments to storage: {e}")
@@ -147,7 +337,37 @@ class AgentTaskRunner(TaskRunner):
             event.attachments = attachments
         except Exception as e:
             logger.exception(f"Agent {self._agent_id} failed to sync attachments to event: {e}")
-    
+
+    async def _sync_shell_artifacts(self, event: ToolEvent, shell_result: Optional[ToolResult]) -> None:
+        """Best-effort sync for files created through shell commands."""
+        text_parts = []
+        for key in ("command", "exec_dir"):
+            value = event.function_args.get(key)
+            if isinstance(value, str):
+                text_parts.append(value)
+
+        if shell_result and getattr(shell_result, "data", None):
+            data = shell_result.data or {}
+            for key in ("command", "output"):
+                value = data.get(key)
+                if isinstance(value, str):
+                    text_parts.append(value)
+
+            console = data.get("console") or []
+            if isinstance(console, list):
+                for record in console:
+                    if hasattr(record, "model_dump"):
+                        record = record.model_dump()
+                    if isinstance(record, dict):
+                        for key in ("command", "output"):
+                            value = record.get(key)
+                            if isinstance(value, str):
+                                text_parts.append(value)
+
+        for path in self._extract_artifact_paths("\n".join(text_parts)):
+            if not self._looks_like_artifact_path(path):
+                continue
+            await self._sync_file_to_storage(path, generated=True)
 
     # TODO: refactor this function
     async def _handle_tool_event(self, event: ToolEvent):
@@ -156,23 +376,36 @@ class AgentTaskRunner(TaskRunner):
             if event.status == ToolStatus.CALLED:
                 if event.tool_name == "browser":
                     event.tool_content = BrowserToolContent(screenshot=await self._get_browser_screenshot())
+                elif event.tool_name == "preview":
+                    result_data = {}
+                    if event.function_result and getattr(event.function_result, "data", None):
+                        result_data = event.function_result.data or {}
+                    event.tool_content = PreviewToolContent(
+                        url=result_data.get("url") or event.function_args.get("url", ""),
+                        title=result_data.get("title") or event.function_args.get("title"),
+                    )
                 elif event.tool_name == "search":
                     search_results: ToolResult[SearchResults] = event.function_result
                     logger.debug(f"Search tool results: {search_results}")
                     event.tool_content = SearchToolContent(results=search_results.data.results)
                 elif event.tool_name == "shell":
+                    shell_result = None
                     if "id" in event.function_args:
                         shell_result = await self._sandbox.view_shell(event.function_args["id"], console=True)
                         event.tool_content = ShellToolContent(console=shell_result.data.get("console", []))
                     else:
                         event.tool_content = ShellToolContent(console="(No Console)")
+                    await self._sync_shell_artifacts(event, shell_result)
                 elif event.tool_name == "file":
                     if "file" in event.function_args:
                         file_path = event.function_args["file"]
                         file_read_result = await self._sandbox.file_read(file_path)
                         file_content: str = file_read_result.data.get("content", "")
                         event.tool_content = FileToolContent(content=file_content)
-                        await self._sync_file_to_storage(file_path)
+                        await self._sync_file_to_storage(
+                            file_path,
+                            generated=event.function_name in self._GENERATING_FILE_FUNCTIONS,
+                        )
                     else:
                         event.tool_content = FileToolContent(content="(No Content)")
                 elif event.tool_name == "mcp":

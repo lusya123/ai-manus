@@ -16,7 +16,7 @@ class Step(BaseModel):
     result: Optional[str] = None
     error: Optional[str] = None
     success: bool = False
-    attachments: List[str] = []
+    attachments: List[str] = Field(default_factory=list)
 
     def is_done(self) -> bool:
         return self.status == ExecutionStatus.COMPLETED or self.status == ExecutionStatus.FAILED
@@ -26,7 +26,7 @@ class Plan(BaseModel):
     title: str = ""
     goal: str = ""
     language: Optional[str] = "en"
-    steps: List[Step] = []
+    steps: List[Step] = Field(default_factory=list)
     message: Optional[str] = None
     status: ExecutionStatus = ExecutionStatus.PENDING
     result: Optional[Dict[str, Any]] = None

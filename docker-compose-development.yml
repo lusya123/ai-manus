@@ -9,7 +9,7 @@ services:
       - ./frontend:/app  # Mount source code directory
       - /app/node_modules  # Avoid overwriting container's node_modules
     ports:
-      - "5173:5173"  # Vite default development port
+      - "${FRONTEND_PORT:-5173}:5173"  # Vite default development port
     environment:
       - NODE_ENV=development
       #- VITE_API_URL=http://127.0.0.1:8000
@@ -38,7 +38,7 @@ services:
       - /app/__pycache__  # Avoid overwriting cache files
       - /app/.venv  # Avoid overwriting virtual environment
     ports:
-      - "8000:8000"
+      - "${BACKEND_PORT:-8000}:8000"
       - "5678:5678" # Debug port
     depends_on:
       sandbox:
@@ -63,6 +63,14 @@ services:
       - CLAW_ADDRESS=claw       # Use single fixed claw container in development
       - MANUS_API_BASE_URL=http://backend:8000
       - CLAW_API_KEY=${CLAW_DEV_API_KEY:-manus-dev-api-key-changeme}
+      - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://localhost:5173}
+      - BACKEND_PUBLIC_URL=${BACKEND_PUBLIC_URL:-http://localhost:8000}
+      - FRONTEND_INTERNAL_URL=${FRONTEND_INTERNAL_URL:-http://frontend-dev:5173}
+      - BACKEND_INTERNAL_URL=${BACKEND_INTERNAL_URL:-http://backend:8000}
+      - FRONTEND_SANDBOX_URL=${FRONTEND_SANDBOX_URL:-http://frontend-dev:5173}
+      - BACKEND_SANDBOX_URL=${BACKEND_SANDBOX_URL:-http://backend:8000}
+      - CLAW_PUBLIC_URL=${CLAW_PUBLIC_URL:-http://localhost:18788}
+      - CLAW_INTERNAL_URL=${CLAW_INTERNAL_URL:-http://claw:18788}
 
   sandbox:
     build:
@@ -75,10 +83,10 @@ services:
       - /app/__pycache__  # Avoid overwriting cache files
       - /app/.venv  # Avoid overwriting virtual environment
     ports:
-      #- "9222:9222"
+      - "${SANDBOX_CDP_PORT:-9222}:9222"
       - "5902:5900"
-      #- "5901:5901"
-      - "8080:8080"
+      - "${SANDBOX_VNC_PORT:-5901}:5901"
+      - "${SANDBOX_API_PORT:-8080}:8080"
     environment:
       - UVI_ARGS="--reload"
       - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
@@ -129,6 +137,8 @@ services:
   redis:
     image: redis:7.0
     restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
     networks:
       - manus-network
 

@@ -1,20 +1,31 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List
 from app.interfaces.schemas.event import AgentSSEEvent
 from app.domain.models.session import SessionStatus
+
+
+class ChatAttachment(BaseModel):
+    """Attachment reference sent with a chat message."""
+    file_id: str
+    filename: Optional[str] = None
 
 
 class ChatRequest(BaseModel):
     """Chat request schema"""
     timestamp: Optional[int] = None
     message: Optional[str] = None
-    attachments: Optional[List[dict]] = None
+    attachments: Optional[List[ChatAttachment]] = None
     event_id: Optional[str] = None
 
 
 class ShellViewRequest(BaseModel):
     """Shell view request schema"""
     session_id: str
+
+class PreviewUrlRequest(BaseModel):
+    """Interactive web preview URL request schema"""
+    url: str
+    expire_minutes: int = Field(15, description="Token expiration time in minutes (max 15 minutes)", ge=1, le=15)
 
 
 class CreateSessionResponse(BaseModel):
@@ -27,7 +38,7 @@ class GetSessionResponse(BaseModel):
     session_id: str
     title: Optional[str] = None
     status: SessionStatus
-    events: List[AgentSSEEvent] = []
+    events: List[AgentSSEEvent] = Field(default_factory=list)
     is_shared: bool = False
 
 
@@ -72,5 +83,5 @@ class SharedSessionResponse(BaseModel):
     session_id: str
     title: Optional[str] = None
     status: SessionStatus
-    events: List[AgentSSEEvent] = []
+    events: List[AgentSSEEvent] = Field(default_factory=list)
     is_shared: bool

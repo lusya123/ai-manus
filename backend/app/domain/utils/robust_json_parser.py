@@ -173,12 +173,63 @@ class RobustJsonParser(Runnable[AIMessage, AIMessage]):
     # Per-message repair (Stages 1-3)
     # ------------------------------------------------------------------
 
+    def _promote_content_tool_use_blocks(self, message: AIMessage) -> AIMessage:
+        """Promote Anthropic tool_use content blocks when LangChain misses them."""
+        if message.tool_calls or not isinstance(message.content, list):
+            return message
+
+        tool_calls = []
+        invalid_tool_calls = list(message.invalid_tool_calls or [])
+        text_blocks = []
+        for block in message.content:
+            if not isinstance(block, dict):
+                text_blocks.append(block)
+                continue
+            if block.get("type") != "tool_use":
+                text_blocks.append(block)
+                continue
+            name = block.get("name")
+            args = block.get("input")
+            if isinstance(args, str):
+                args = self._stage1_partial_json(args) or self._stage2_json_markdown(args) or args
+            if isinstance(name, str) and isinstance(args, dict):
+                tool_calls.append(
+                    create_tool_call(name=name, args=args, id=block.get("id"))
+                )
+            else:
+                invalid_tool_calls.append(
+                    {
+                        "name": name or "unknown",
+                        "args": args if isinstance(args, str) else str(args),
+                        "id": block.get("id"),
+                        "error": "Malformed Anthropic tool_use content block",
+                    }
+                )
+
+        if not tool_calls and not invalid_tool_calls:
+            return message
+
+        if tool_calls:
+            logger.info(
+                "Promoted %d Anthropic tool_use content block(s) to tool_calls",
+                len(tool_calls),
+            )
+        return message.model_copy(
+            update={
+                "content": text_blocks,
+                "tool_calls": tool_calls,
+                "invalid_tool_calls": invalid_tool_calls,
+            }
+        )
+
     async def _repair_invalid_tool_calls(self, message: AIMessage) -> AIMessage:
         """Attempt to repair each invalid_tool_call through stages 1-3.
 
         Repaired calls are promoted from invalid_tool_calls to tool_calls.
         Calls that cannot be repaired remain in invalid_tool_calls.
         """
+        message = self._promote_content_tool_use_blocks(message)
+
         if not message.invalid_tool_calls:
             return message
 

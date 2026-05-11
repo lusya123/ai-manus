@@ -3,7 +3,7 @@ import tempfile
 import os
 import io
 from unittest.mock import patch, mock_open
-from conftest import BASE_URL
+from conftest import BASE_URL, SERVER_URL
 import logging
 import requests
 
@@ -118,10 +118,10 @@ def test_download_file_success(client, sample_text_file, sample_file_content):
         upload_response = client.post(upload_url, files=files)
     
     logger.info(f"Upload for download test response: {upload_response.status_code} - {upload_response.text}")
-    file_id = upload_response.json()['data']['file_id']
+    file_url = upload_response.json()['data']['file_url']
     
     # Download file
-    download_url = f"{BASE_URL}/files/{file_id}"
+    download_url = f"{SERVER_URL.rstrip('/')}{file_url}"
     response = client.get(download_url)
     
     logger.info(f"Download file response: {response.status_code} - Content length: {len(response.content)}")
@@ -134,7 +134,7 @@ def test_download_file_success(client, sample_text_file, sample_file_content):
 def test_download_file_not_found(client):
     """Test downloading non-existent file"""
     fake_file_id = "507f1f77bcf86cd799439011"  # Valid ObjectId format
-    url = f"{BASE_URL}/files/{fake_file_id}"
+    url = f"{BASE_URL}/files/{fake_file_id}/download"
     response = client.get(url)
     
     logger.info(f"Download file not found response: {response.status_code} - {response.text}")
@@ -207,10 +207,9 @@ def test_upload_binary_file(client):
     assert data['data']['size'] == 256
     
     # Download and verify content
-    file_id = data['data']['file_id']
-    download_url = f"{BASE_URL}/files/{file_id}"
+    file_url = data['data']['file_url']
+    download_url = f"{SERVER_URL.rstrip('/')}{file_url}"
     download_response = client.get(download_url)
     
     assert download_response.status_code == 200
     assert download_response.content == binary_content
-

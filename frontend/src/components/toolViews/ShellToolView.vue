@@ -38,7 +38,7 @@ defineExpose({
 });
 
 const shell = ref('');
-const refreshTimer = ref<number | null>(null);
+const refreshTimer = ref<ReturnType<typeof setInterval> | null>(null);
 
 // Get shellSessionId from toolContent
 const shellSessionId = computed(() => {

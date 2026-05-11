@@ -45,6 +45,7 @@ export default {
   'Viewing webpage': 'Viewing webpage',
   'Navigating to webpage': 'Navigating to webpage',
   'Restarting browser': 'Restarting browser',
+  'Showing preview': 'Showing preview',
   'Clicking element': 'Clicking element',
   'Entering text': 'Entering text',
   'Moving mouse': 'Moving mouse',
@@ -77,6 +78,8 @@ export default {
   'Chat history will be cleared. The Claw instance will remain available for re-creation.': 'Chat history will be cleared. The Claw instance will remain available for re-creation.',
   'Exit Takeover': 'Exit Takeover',
   'Take Over': 'Take Over',
+  'Open preview': 'Open preview',
+  'Preparing preview': 'Preparing preview',
   // Session File List
   'All Files in This Task': 'All Files in This Task',
   'No Content': 'No Content',

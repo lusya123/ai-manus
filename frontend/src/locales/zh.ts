@@ -45,6 +45,7 @@ export default {
   'Viewing webpage': '正在查看网页',
   'Navigating to webpage': '正在导航到网页',
   'Restarting browser': '正在重启浏览器',
+  'Showing preview': '正在显示预览',
   'Clicking element': '正在点击元素',
   'Entering text': '正在输入文本',
   'Moving mouse': '正在移动鼠标',
@@ -77,6 +78,8 @@ export default {
   'Chat history will be cleared. The Claw instance will remain available for re-creation.': '聊天记录将被清除，Claw 实例仍可重新创建。',
   'Exit Takeover': '退出接管',
   'Take Over': '接管',
+  'Open preview': '打开预览',
+  'Preparing preview': '正在准备预览',
   // Session File List
   'All Files in This Task': '此任务中的所有文件',
   'No Content': '暂无内容',

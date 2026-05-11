@@ -4,7 +4,7 @@ from datetime import datetime
 from dataclasses import dataclass
 from app.domain.models.plan import ExecutionStatus, Step
 from app.interfaces.schemas.file import FileInfoResponse
-from app.domain.models.event import ToolStatus, ToolContent, BrowserToolContent
+from app.domain.models.event import ToolStatus, ToolContent, BrowserToolContent, PreviewToolContent
 from app.domain.models.event import (
     AgentEvent,
     ErrorEvent,

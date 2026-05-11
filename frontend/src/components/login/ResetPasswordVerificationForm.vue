@@ -168,7 +168,7 @@ const showConfirmPassword = ref(false)
 
 // Resend cooldown
 const resendCooldown = ref(0)
-let resendTimer: number | null = null
+let resendTimer: ReturnType<typeof setInterval> | null = null
 
 // Form data
 const formData = ref({

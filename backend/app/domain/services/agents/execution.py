@@ -37,12 +37,14 @@ class ExecutionAgent(BaseAgent):
         agent_id: str,
         agent_repository: AgentRepository,
         tools: List[BaseToolkit],
+        runtime_prompt: str = "",
     ):
         super().__init__(
             agent_id=agent_id,
             agent_repository=agent_repository,
             tools=tools
         )
+        self.system_prompt = SYSTEM_PROMPT + runtime_prompt + "\n" + EXECUTION_SYSTEM_PROMPT
     
     async def execute_step(self, plan: Plan, step: Step, message: Message) -> AsyncGenerator[BaseEvent, None]:
         message = EXECUTION_PROMPT.format(

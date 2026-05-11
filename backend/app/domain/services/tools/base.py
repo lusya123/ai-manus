@@ -8,7 +8,7 @@ from langchain.messages import ToolMessage
 from langchain.messages import ToolCall
 from langchain_core.tools.base import BaseToolkit as LangchainBaseToolkit, ArgsSchema
 from typing import Any, Optional
-from pydantic import BaseModel, create_model, ConfigDict
+from pydantic import BaseModel, create_model, ConfigDict, Field
 
 
 def create_model_without_fields(model_class: type[BaseModel], exclude_fields: set[str]) -> type[BaseModel]:
@@ -51,7 +51,7 @@ class BaseToolkit(LangchainBaseToolkit):
     """Base toolset class, providing common tool calling methods"""
 
     name: str = ""
-    tools: List[Tool] = []
+    tools: List[Tool] = Field(default_factory=list)
     model_config = ConfigDict(ignored_types=(BaseTool,), extra='allow')
 
     def __init__(self):

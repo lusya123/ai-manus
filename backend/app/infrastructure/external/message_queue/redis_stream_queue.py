@@ -1,6 +1,7 @@
 import json
 import uuid
 import asyncio
+import re
 from typing import Any, AsyncGenerator, Optional, Tuple
 import logging
 from app.infrastructure.storage.redis import get_redis
@@ -10,6 +11,8 @@ logger = logging.getLogger(__name__)
 
 class RedisStreamQueue(MessageQueue):
     """Redis Stream implementation of message queue"""
+
+    _STREAM_ID_PATTERN = re.compile(r"^(?:\$|\d+(?:-\d+)?)$")
     
     def __init__(self, stream_name: str):
         self._stream_name = stream_name
@@ -99,6 +102,13 @@ class RedisStreamQueue(MessageQueue):
         logger.debug(f"Getting message from stream ({self._stream_name}): {start_id}")
         # Handle None start_id by using "0" (read from beginning)
         if start_id is None:
+            start_id = "0"
+        elif not self._STREAM_ID_PATTERN.fullmatch(start_id):
+            logger.warning(
+                "Invalid Redis stream start id for %s: %s; falling back to 0",
+                self._stream_name,
+                start_id,
+            )
             start_id = "0"
             
         # Read new messages

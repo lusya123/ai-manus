@@ -1,5 +1,6 @@
 from typing import Any, Optional, AsyncGenerator, List
 import logging
+import re
 from datetime import datetime
 from app.domain.models.session import Session, SessionStatus
 from app.domain.external.sandbox import Sandbox
@@ -22,6 +23,8 @@ class AgentDomainService:
     """
     Agent domain service, responsible for coordinating the work of planning agent and execution agent
     """
+
+    _REDIS_STREAM_ID_PATTERN = re.compile(r"^(?:\$|\d+(?:-\d+)?)$")
     
     def __init__(
         self,
@@ -66,6 +69,19 @@ class AgentDomainService:
                 )
             )
         return file_infos or None
+
+    @classmethod
+    def _is_redis_stream_id(cls, event_id: Optional[str]) -> bool:
+        return bool(event_id and cls._REDIS_STREAM_ID_PATTERN.fullmatch(event_id))
+
+    @staticmethod
+    async def _get_latest_output_stream_id(task: Optional[Task]) -> Optional[str]:
+        if not task:
+            return None
+        get_latest_id = getattr(task.output_stream, "get_latest_id", None)
+        if not get_latest_id:
+            return None
+        return await get_latest_id()
             
     async def shutdown(self) -> None:
         """Clean up all Agent's resources"""
@@ -170,6 +186,8 @@ class AgentDomainService:
                 await self._session_repository.update_status(session_id, SessionStatus.COMPLETED)
                 return
 
+            message_sent = False
+
             if message:
                 if not task or session.status != SessionStatus.RUNNING:
                     task = await self._create_task(session)
@@ -190,10 +208,19 @@ class AgentDomainService:
                 await self._session_repository.add_event(session_id, message_event)
                 
                 await task.run()
+                message_sent = True
                 logger.debug(f"Put message into Session {session_id}'s event queue: {message[:50]}...")
             
             logger.info(f"Session {session_id} started")
             logger.debug(f"Session {session_id} task: {task}")
+
+            if latest_event_id and not self._is_redis_stream_id(latest_event_id):
+                logger.warning(
+                    "Ignoring non-Redis stream event id for session %s: %s",
+                    session_id,
+                    latest_event_id,
+                )
+                latest_event_id = None if message_sent else await self._get_latest_output_stream_id(task)
            
             while task and not task.done:
                 event_id, event_str = await task.output_stream.get(start_id=latest_event_id, block_ms=0)

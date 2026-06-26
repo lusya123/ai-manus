@@ -12,6 +12,9 @@ class Agent(BaseModel):
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:16])
     memories: Dict[str, Memory] = Field(default_factory=dict)
     model_name: str = Field(default="")
+    model_provider: str = Field(default="")
+    api_base: Optional[str] = Field(default=None)
+    api_key: Optional[str] = Field(default=None)
     temperature: float = Field(default=0.7)
     max_tokens: int = Field(default=2000)
     

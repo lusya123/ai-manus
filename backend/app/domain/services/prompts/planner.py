@@ -32,7 +32,7 @@ Return format requirements:
 TypeScript Interface Definition:
 ```typescript
 interface CreatePlanResponse {{
-  /** Response to user's message and thinking about the task, as detailed as possible, use the user's language */
+  /** Brief user-facing acknowledgement in the user's language. Do not include hidden reasoning, private chain-of-thought, tool JSON, or scratchpad content. */
   message: string;
   /** The working language according to the user's message */
   language: string;

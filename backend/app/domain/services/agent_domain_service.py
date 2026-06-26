@@ -78,7 +78,16 @@ class AgentDomainService:
         sandbox = None
         sandbox_id = session.sandbox_id
         if sandbox_id:
-            sandbox = await self._sandbox_cls.get(sandbox_id)
+            try:
+                sandbox = await self._sandbox_cls.get(sandbox_id)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to restore sandbox %s for session %s; creating a new sandbox: %s",
+                    sandbox_id,
+                    session.id,
+                    exc,
+                )
+                session.sandbox_id = None
         if not sandbox:
             sandbox = await self._sandbox_cls.create()
             session.sandbox_id = sandbox.id
@@ -89,6 +98,7 @@ class AgentDomainService:
             raise RuntimeError(f"Failed to get browser for Sandbox {sandbox_id}")
         
         await self._session_repository.save(session)
+        agent = await self._repository.find_by_id(session.agent_id)
 
         task_runner = AgentTaskRunner(
             session_id=session.id,
@@ -101,6 +111,7 @@ class AgentDomainService:
             session_repository=self._session_repository,
             agent_repository=self._repository,
             mcp_repository=self._mcp_repository,
+            agent=agent,
         )
 
         task = self._task_cls.create(task_runner)
@@ -150,8 +161,17 @@ class AgentDomainService:
 
             task = await self._get_task(session)
 
+            if not message and not task and session.status in (SessionStatus.PENDING, SessionStatus.RUNNING):
+                logger.warning(
+                    "Session %s is %s but has no live task; marking it completed",
+                    session_id,
+                    session.status,
+                )
+                await self._session_repository.update_status(session_id, SessionStatus.COMPLETED)
+                return
+
             if message:
-                if session.status != SessionStatus.RUNNING:
+                if not task or session.status != SessionStatus.RUNNING:
                     task = await self._create_task(session)
                     if not task:
                         raise RuntimeError("Failed to create task")

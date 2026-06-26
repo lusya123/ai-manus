@@ -166,7 +166,8 @@ async def get_current_user(
             fullname="anonymous",
             email="anonymous@localhost",
             role=UserRole.USER,
-            is_active=True
+            is_active=True,
+            auth_provider="none",
         )
     
     # Check if bearer token is provided
@@ -211,7 +212,8 @@ async def get_optional_current_user(
             fullname="anonymous",
             email="anonymous@localhost",
             role=UserRole.USER,
-            is_active=True
+            is_active=True,
+            auth_provider="none",
         )
     
     # If no bearer token provided, return None

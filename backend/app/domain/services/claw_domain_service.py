@@ -10,6 +10,7 @@ import httpx
 from app.domain.models.claw import Claw, ClawStatus, ClawMessage, ClawAttachment
 from app.domain.external.claw import ClawRuntime, ClawClient
 from app.domain.repositories.claw_repository import ClawRepository
+from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,17 @@ class ClawDomainService:
         self.claw_repository = claw_repository
         self.claw_runtime = claw_runtime
         self.claw_client = claw_client
+        self.settings = get_settings()
+
+    @staticmethod
+    def _as_utc(value: Optional[datetime]) -> Optional[datetime]:
+        if value and value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value
+
+    def _creating_timeout_seconds(self) -> int:
+        runtime_timeout = getattr(self.claw_runtime, "ready_timeout", None)
+        return max(30, runtime_timeout or self.settings.claw_ready_timeout)
 
     # ------------------------------------------------------------------
     # Claw CRUD / lifecycle
@@ -59,10 +71,26 @@ class ClawDomainService:
 
     async def get_claw(self, user_id: str) -> Optional[Claw]:
         claw = await self.claw_repository.get_by_user_id(user_id)
+        if claw and claw.status == ClawStatus.CREATING:
+            updated_at = self._as_utc(claw.updated_at)
+            if updated_at:
+                age_seconds = (datetime.now(UTC) - updated_at).total_seconds()
+                timeout_seconds = self._creating_timeout_seconds()
+                if age_seconds > timeout_seconds + 30:
+                    claw.status = ClawStatus.ERROR
+                    claw.error_message = (
+                        "Claw provisioning timed out or was interrupted. "
+                        "Please retry deployment."
+                    )
+                    await self.claw_repository.update(claw)
         if claw and claw.status == ClawStatus.RUNNING:
+            if self.settings.claw_ttl_seconds <= 0 and claw.expires_at:
+                claw.expires_at = None
+                claw = await self.claw_repository.update(claw)
             expires = claw.expires_at.replace(tzinfo=UTC) if claw.expires_at and claw.expires_at.tzinfo is None else claw.expires_at
             if expires and datetime.now(UTC) >= expires:
                 logger.info(f"[claw] expired for user={user_id}, auto-deleting")
+                await self.claw_runtime.destroy(claw.container_name)
                 await self.claw_repository.delete_by_user_id(user_id)
                 return None
             elif claw.http_base_url and not await self._health_check(claw.http_base_url):
@@ -83,16 +111,30 @@ class ClawDomainService:
     async def get_claw_by_api_key(self, api_key: str) -> Optional[Claw]:
         return await self.claw_repository.get_by_api_key(api_key)
 
-    async def prepare_claw_for_creation(self, user_id: str) -> Optional[Claw]:
+    async def prepare_claw_for_creation(self, user_id: str) -> Claw:
         """Prepare a Claw record for creation (or return existing running one).
 
-        Returns the Claw object ready for async provisioning, or the already-running
-        instance. Returns ``None`` only when a new/updated Claw was persisted and the
-        caller should kick off ``provision_claw_instance``.
+        Returns the existing running/creating instance, or a newly persisted
+        creating instance ready for asynchronous provisioning.
         """
         existing = await self.claw_repository.get_by_user_id(user_id)
         if existing and existing.status == ClawStatus.RUNNING:
             return existing
+        if existing and existing.status == ClawStatus.CREATING:
+            updated_at = self._as_utc(existing.updated_at)
+            if updated_at and (datetime.now(UTC) - updated_at).total_seconds() <= self._creating_timeout_seconds() + 30:
+                return existing
+
+        active_count = await self.claw_repository.count_by_statuses([
+            ClawStatus.CREATING,
+            ClawStatus.RUNNING,
+        ])
+        if (
+            self.settings.claw_max_instances_total > 0
+            and active_count >= self.settings.claw_max_instances_total
+            and not (existing and existing.status in {ClawStatus.CREATING, ClawStatus.RUNNING})
+        ):
+            raise RuntimeError("Claw capacity reached, please try again later")
 
         if existing:
             api_key = existing.api_key
@@ -106,6 +148,7 @@ class ClawDomainService:
             user_id=user_id,
             api_key=api_key,
             status=ClawStatus.CREATING,
+            last_activity_at=datetime.now(UTC),
         )
         if existing:
             claw = await self.claw_repository.update(claw)
@@ -128,8 +171,11 @@ class ClawDomainService:
                     raise RuntimeError(f"Claw service not ready: {claw.http_base_url}")
             logger.info(f"Claw created: id={claw.id} address={info.address}")
             claw.status = ClawStatus.RUNNING
+            claw.last_activity_at = datetime.now(UTC)
             if ttl_seconds and ttl_seconds > 0:
                 claw.expires_at = datetime.now(UTC) + timedelta(seconds=ttl_seconds)
+            else:
+                claw.expires_at = None
             await self.claw_repository.update(claw)
             await self.claw_repository.append_message(
                 claw.user_id, "assistant", "i18n:Claw is ready, let's chat!",
@@ -144,11 +190,60 @@ class ClawDomainService:
                 pass
 
     async def delete_claw(self, user_id: str) -> bool:
-        """Delete the claw record from MongoDB but keep the container alive."""
+        """Delete the claw record and destroy its runtime instance when configured."""
         claw = await self.claw_repository.get_by_user_id(user_id)
         if not claw:
             return False
+        if self.settings.claw_destroy_on_delete:
+            await self.claw_runtime.destroy(claw.container_name)
         return await self.claw_repository.delete_by_user_id(user_id)
+
+    async def cleanup_instances(self) -> dict[str, int]:
+        """Clean interrupted Claw instances and optional retention-policy matches."""
+        now = datetime.now(UTC)
+        removed = 0
+        errored = 0
+
+        claws = await self.claw_repository.list_by_statuses([
+            ClawStatus.CREATING,
+            ClawStatus.RUNNING,
+        ])
+        for claw in claws:
+            if claw.status == ClawStatus.CREATING:
+                updated_at = self._as_utc(claw.updated_at)
+                if updated_at and (now - updated_at).total_seconds() > self._creating_timeout_seconds() + 30:
+                    await self.claw_runtime.destroy(claw.container_name)
+                    claw.status = ClawStatus.ERROR
+                    claw.error_message = "Claw provisioning timed out or was interrupted."
+                    await self.claw_repository.update(claw)
+                    errored += 1
+                continue
+
+            if claw.status != ClawStatus.RUNNING:
+                continue
+
+            if self.settings.claw_ttl_seconds <= 0 and claw.expires_at:
+                claw.expires_at = None
+                await self.claw_repository.update(claw)
+
+            expires_at = self._as_utc(claw.expires_at)
+            expired = bool(expires_at and now >= expires_at)
+            idle = False
+            if self.settings.claw_idle_timeout_seconds > 0:
+                last_activity_at = self._as_utc(claw.last_activity_at or claw.updated_at)
+                idle = bool(
+                    last_activity_at
+                    and (now - last_activity_at).total_seconds() > self.settings.claw_idle_timeout_seconds
+                )
+
+            if expired or idle:
+                reason = "expired" if expired else "idle"
+                logger.info("[claw-cleanup] removing %s claw id=%s user=%s", reason, claw.id, claw.user_id)
+                await self.claw_runtime.destroy(claw.container_name)
+                await self.claw_repository.delete_by_user_id(claw.user_id)
+                removed += 1
+
+        return {"removed": removed, "errored": errored}
 
     # ------------------------------------------------------------------
     # History merge

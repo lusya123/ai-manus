@@ -1,36 +1,91 @@
 import logging
 import asyncio
+import json
+import uuid
 from collections import defaultdict
 from typing import Optional, List
 
 from app.domain.models.claw import Claw, ClawMessage, ClawStatus
 from app.domain.services.claw_domain_service import ClawDomainService
 from app.core.config import get_settings
+from app.infrastructure.storage.redis import get_redis
 
 logger = logging.getLogger(__name__)
 
 
 class ClawEventBus:
-    """Simple in-memory pub/sub per user for broadcasting SSE events."""
+    """Per-user event bus backed by Redis pub/sub with local in-process fanout."""
 
     def __init__(self):
         self._subscribers: dict[str, list[asyncio.Queue]] = defaultdict(list)
+        self._subscriber_tasks: dict[asyncio.Queue, asyncio.Task] = {}
+        self._origin = str(uuid.uuid4())
+
+    @staticmethod
+    def _channel(user_id: str) -> str:
+        return f"claw:events:{user_id}"
 
     def subscribe(self, user_id: str) -> asyncio.Queue:
-        queue: asyncio.Queue = asyncio.Queue()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=200)
         self._subscribers[user_id].append(queue)
+        try:
+            task = asyncio.create_task(self._redis_subscribe(user_id, queue))
+            self._subscriber_tasks[queue] = task
+        except RuntimeError:
+            logger.warning("[claw-bus] unable to start redis subscriber; using local events only")
         return queue
 
     def unsubscribe(self, user_id: str, queue: asyncio.Queue):
         subs = self._subscribers.get(user_id)
         if subs:
             self._subscribers[user_id] = [q for q in subs if q is not queue]
+        task = self._subscriber_tasks.pop(queue, None)
+        if task:
+            task.cancel()
 
     async def publish(self, user_id: str, event: dict):
         for queue in self._subscribers.get(user_id, []):
             try:
                 queue.put_nowait(event)
             except asyncio.QueueFull:
+                pass
+        try:
+            await get_redis().client.publish(
+                self._channel(user_id),
+                json.dumps({"origin": self._origin, "event": event}, ensure_ascii=False),
+            )
+        except Exception as e:
+            logger.warning("[claw-bus] redis publish failed: %s", e)
+
+    async def _redis_subscribe(self, user_id: str, queue: asyncio.Queue) -> None:
+        pubsub = get_redis().client.pubsub()
+        try:
+            await pubsub.subscribe(self._channel(user_id))
+            async for message in pubsub.listen():
+                if message.get("type") != "message":
+                    continue
+                try:
+                    payload = json.loads(message.get("data") or "{}")
+                except Exception:
+                    continue
+                if payload.get("origin") == self._origin:
+                    continue
+                event = payload.get("event")
+                if not isinstance(event, dict):
+                    continue
+                try:
+                    queue.put_nowait(event)
+                except asyncio.QueueFull:
+                    pass
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning("[claw-bus] redis subscribe failed: %s", e)
+        finally:
+            try:
+                await pubsub.unsubscribe(self._channel(user_id))
+                await pubsub.close()
+            except Exception:
                 pass
 
 
@@ -58,6 +113,7 @@ class ClawService:
         self.event_bus = ClawEventBus()
         self._bg_tasks: set[asyncio.Task] = set()
         self._chat_states: dict[str, _ChatState] = {}
+        self._maintenance_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
     # Delegates to domain service
@@ -76,7 +132,40 @@ class ClawService:
         return await self.domain.get_history(user_id)
 
     async def delete_claw(self, user_id: str) -> bool:
-        return await self.domain.delete_claw(user_id)
+        claw = await self.claw_repository.get_by_user_id(user_id)
+        deleted = await self.domain.delete_claw(user_id)
+        if claw:
+            await self._release_provision_lock(f"claw:provision:{claw.id}")
+        return deleted
+
+    def start_maintenance(self) -> None:
+        if self._maintenance_task and not self._maintenance_task.done():
+            return
+        if self.settings.claw_cleanup_interval_seconds <= 0:
+            return
+        self._maintenance_task = asyncio.create_task(self._maintenance_loop())
+        self._bg_tasks.add(self._maintenance_task)
+        self._maintenance_task.add_done_callback(self._bg_tasks.discard)
+
+    async def shutdown(self) -> None:
+        tasks = list(self._bg_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _maintenance_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self.settings.claw_cleanup_interval_seconds)
+                try:
+                    result = await self.domain.cleanup_instances()
+                    if result.get("removed") or result.get("errored"):
+                        logger.info("[claw-cleanup] result=%s", result)
+                except Exception as e:
+                    logger.warning("[claw-cleanup] failed: %s", e)
+        except asyncio.CancelledError:
+            pass
 
     async def get_file(self, user_id: str, filename: str) -> tuple[bytes, str]:
         return await self.domain.get_file(user_id, filename)
@@ -92,13 +181,37 @@ class ClawService:
         claw = await self.domain.prepare_claw_for_creation(user_id)
         if claw.status == ClawStatus.RUNNING:
             return claw
-        task = asyncio.create_task(self._provision_in_background(claw))
+        lock_key = f"claw:provision:{claw.id}"
+        if not await self._acquire_provision_lock(lock_key):
+            return claw
+        task = asyncio.create_task(self._provision_in_background(claw, lock_key))
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
         return claw
 
-    async def _provision_in_background(self, claw: Claw) -> None:
-        await self.domain.provision_claw_instance(claw, self.settings.claw_ttl_seconds)
+    async def _acquire_provision_lock(self, lock_key: str) -> bool:
+        try:
+            return bool(await get_redis().client.set(
+                lock_key,
+                "1",
+                nx=True,
+                ex=self.settings.claw_ready_timeout + 60,
+            ))
+        except Exception as e:
+            logger.warning("[claw] provisioning lock unavailable, proceeding locally: %s", e)
+            return True
+
+    async def _release_provision_lock(self, lock_key: str) -> None:
+        try:
+            await get_redis().client.delete(lock_key)
+        except Exception:
+            pass
+
+    async def _provision_in_background(self, claw: Claw, lock_key: str) -> None:
+        try:
+            await self.domain.provision_claw_instance(claw, self.settings.claw_ttl_seconds)
+        finally:
+            await self._release_provision_lock(lock_key)
 
     # ------------------------------------------------------------------
     # Chat  – fire-and-forget + event bus

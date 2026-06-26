@@ -2,7 +2,7 @@
 import axios, { AxiosError } from 'axios';
 import { fetchEventSource, EventSourceMessage } from '@microsoft/fetch-event-source';
 import { router } from '@/main';
-import { clearStoredTokens, getStoredToken, getStoredRefreshToken, storeToken } from './auth';
+import { clearStoredTokens, getStoredToken, getStoredRefreshToken, storeToken, storeRefreshToken, storeExternalAuthToken } from './auth';
 
 // API configuration
 export const API_CONFIG = {
@@ -123,6 +123,10 @@ const refreshAuthToken = async (): Promise<string | null> => {
     if (response.data && response.data.data) {
       const newAccessToken = response.data.data.access_token;
       storeToken(newAccessToken);
+      if (response.data.data.refresh_token) {
+        storeRefreshToken(response.data.data.refresh_token);
+        storeExternalAuthToken(newAccessToken);
+      }
       
       // Update default headers
       apiClient.defaults.headers.Authorization = `Bearer ${newAccessToken}`;
@@ -390,4 +394,4 @@ export const createSSEConnection = async <T = any>(
   return () => {
     abortController.abort();
   };
-}; 
+};

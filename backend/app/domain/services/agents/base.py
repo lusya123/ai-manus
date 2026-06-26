@@ -13,6 +13,7 @@ from app.domain.models.event import (
     MessageEvent,
 )
 from app.domain.repositories.agent_repository import AgentRepository
+from app.domain.models.agent import Agent
 from langchain.chat_models import init_chat_model
 from langchain_classic.output_parsers.retry import RetryWithErrorOutputParser
 from langchain_core.output_parsers import JsonOutputParser
@@ -62,20 +63,28 @@ class BaseAgent(ABC):
         self,
         agent_id: str,
         agent_repository: AgentRepository,
-        tools: Optional[List[BaseToolkit]] = None
+        tools: Optional[List[BaseToolkit]] = None,
+        agent: Optional[Agent] = None,
     ):
         settings = get_settings()
         self._agent_id = agent_id
         self._repository = agent_repository
-        self._model_provider = settings.model_provider
+        model_name = agent.model_name if agent and agent.model_name else settings.model_name
+        model_provider = agent.model_provider if agent and agent.model_provider else settings.model_provider
+        api_base = agent.api_base if agent and agent.api_base else settings.api_base
+        api_key = agent.api_key if agent and agent.api_key else settings.api_key
+
+        self._model_provider = model_provider
         self._tool_call_timeout_seconds = settings.tool_call_timeout_seconds
         kwargs = dict(
-            model=settings.model_name,
-            model_provider=settings.model_provider,
-            temperature=settings.temperature,
-            max_tokens=settings.max_tokens,
-            base_url=settings.api_base,
+            model=model_name,
+            model_provider=model_provider,
+            temperature=agent.temperature if agent else settings.temperature,
+            max_tokens=agent.max_tokens if agent else settings.max_tokens,
+            base_url=api_base,
         )
+        if api_key:
+            kwargs["api_key"] = api_key
         if settings.extra_headers:
             kwargs["default_headers"] = settings.extra_headers
         self._model = init_chat_model(**kwargs)

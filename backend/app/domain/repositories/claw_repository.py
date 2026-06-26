@@ -1,6 +1,6 @@
 from typing import Optional, List, Protocol
 
-from app.domain.models.claw import Claw, ClawMessage, ClawAttachment
+from app.domain.models.claw import Claw, ClawMessage, ClawAttachment, ClawStatus
 
 
 class ClawRepository(Protocol):
@@ -24,6 +24,14 @@ class ClawRepository(Protocol):
 
     async def update(self, claw: Claw) -> Claw:
         """Update an existing claw instance"""
+        ...
+
+    async def count_by_statuses(self, statuses: List[ClawStatus]) -> int:
+        """Count claw instances by status."""
+        ...
+
+    async def list_by_statuses(self, statuses: List[ClawStatus]) -> List[Claw]:
+        """List claw instances by status."""
         ...
 
     async def delete_by_user_id(self, user_id: str) -> bool:

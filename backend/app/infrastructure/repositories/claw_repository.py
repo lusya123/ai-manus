@@ -1,7 +1,7 @@
 from typing import Optional, List
 from datetime import datetime, UTC
 from app.infrastructure.models.documents import ClawDocument
-from app.domain.models.claw import Claw, ClawMessage, ClawAttachment
+from app.domain.models.claw import Claw, ClawMessage, ClawAttachment, ClawStatus
 import logging
 
 logger = logging.getLogger(__name__)
@@ -46,6 +46,17 @@ class ClawRepository:
         await doc.save()
         return doc.to_domain()
 
+    async def count_by_statuses(self, statuses: List[ClawStatus]) -> int:
+        """Count claw instances by status."""
+        values = [status.value for status in statuses]
+        return await ClawDocument.find({"status": {"$in": values}}).count()
+
+    async def list_by_statuses(self, statuses: List[ClawStatus]) -> List[Claw]:
+        """List claw instances by status."""
+        values = [status.value for status in statuses]
+        docs = await ClawDocument.find({"status": {"$in": values}}).to_list()
+        return [doc.to_domain() for doc in docs]
+
     async def delete_by_user_id(self, user_id: str) -> bool:
         """Delete claw instance by user ID"""
         doc = await ClawDocument.find_one(ClawDocument.user_id == user_id)
@@ -77,6 +88,7 @@ class ClawRepository:
         )
         doc.messages.append(msg)
         doc.updated_at = datetime.now(UTC)
+        doc.last_activity_at = doc.updated_at
         await doc.save()
 
     async def clear_messages(self, user_id: str) -> None:

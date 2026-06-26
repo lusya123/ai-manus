@@ -61,7 +61,7 @@
 | `CLAW_ENABLED` | `true` | 否 | 是否启用 Claw 功能，设为 `false` 关闭左侧面板入口 |
 | `CLAW_IMAGE` | `simpleyyt/manus-claw` | 否 | Claw Docker 镜像名称 |
 | `CLAW_NAME_PREFIX` | `manus-claw` | 否 | Claw 容器名称前缀 |
-| `CLAW_TTL_SECONDS` | `3600` | 否 | Claw 容器生存时间（秒），设为 `0` 表示不限时 |
+| `CLAW_TTL_SECONDS` | `0` | 否 | Claw 容器生存时间（秒），默认不限时；仅临时/开发部署建议设为正数 |
 | `CLAW_NETWORK` | - | 否 | Claw 容器使用的 Docker 网络桥名称 |
 | `CLAW_READY_TIMEOUT` | `300` | 否 | 等待 Claw 容器就绪的最大秒数（默认 5 分钟） |
 | `CLAW_ADDRESS` | - | 否 | 固定 Claw 地址（开发环境使用，设置后跳过 Docker 容器创建） |
@@ -167,5 +167,4 @@
 | 配置项 | 默认值 | 是否必需 | 说明 |
 |--------|--------|----------|------|
 | `LOG_LEVEL` | `INFO` | 否 | 日志级别 (`DEBUG`、`INFO`、`WARNING`、`ERROR`、`CRITICAL`) |
-
 

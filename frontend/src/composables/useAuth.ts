@@ -9,6 +9,7 @@ import {
   clearAuthToken,
   storeToken,
   storeRefreshToken,
+  storeExternalAuthToken,
   getStoredToken,
   getStoredRefreshToken,
   clearStoredTokens,
@@ -182,6 +183,10 @@ export function useAuth() {
       // Store new access token
       storeToken(response.access_token)
       setAuthToken(response.access_token)
+      if (response.refresh_token) {
+        storeRefreshToken(response.refresh_token)
+        storeExternalAuthToken(response.access_token)
+      }
       
       return true
     } catch (error: any) {
@@ -247,4 +252,4 @@ export function useAuth() {
     clearError,
     clearAuth
   }
-} 
+}

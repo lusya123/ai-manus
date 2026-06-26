@@ -47,7 +47,10 @@ async def create_claw(
     claw_service: ClawService = Depends(get_claw_service),
 ) -> APIResponse[ClawResponse]:
     """Create a new claw instance for the current user"""
-    claw = await claw_service.create_claw(current_user.id)
+    try:
+        claw = await claw_service.create_claw(current_user.id)
+    except RuntimeError as e:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     return APIResponse.success(ClawResponse.from_claw(claw))
 
 
@@ -196,7 +199,10 @@ async def _resolve_ws_user(token: str | None) -> User:
         raise ValueError("Authentication required")
     from app.interfaces.dependencies import get_auth_service
     auth_service = get_auth_service()
-    return await auth_service.verify_token(token)
+    user = await auth_service.verify_token(token)
+    if not user:
+        raise ValueError("Authentication failed")
+    return user
 
 
 @router.websocket("/ws")

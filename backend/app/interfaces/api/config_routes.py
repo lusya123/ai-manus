@@ -11,10 +11,15 @@ router = APIRouter(prefix="/config", tags=["config"])
 async def get_frontend_config() -> APIResponse[ClientConfigResponse]:
     """Get frontend runtime config."""
     settings = get_settings()
+    sub2api_base = settings.sub2api_base_url.rstrip("/") if settings.sub2api_base_url else None
 
     return APIResponse.success(
         ClientConfigResponse(
             auth_provider=settings.auth_provider,
+            sub2api_login_url=settings.sub2api_login_url,
+            sub2api_console_url=settings.sub2api_console_url or (f"{sub2api_base}/dashboard" if sub2api_base else None),
+            sub2api_marketplace_url=settings.sub2api_marketplace_url or (f"{sub2api_base}/model-marketplace" if sub2api_base else None),
+            sub2api_use_token_url=settings.sub2api_use_token_url or (f"{sub2api_base}/use-token" if sub2api_base else None),
             show_github_button=settings.show_github_button,
             github_repository_url=settings.github_repository_url,
             google_analytics_id=settings.google_analytics_id,

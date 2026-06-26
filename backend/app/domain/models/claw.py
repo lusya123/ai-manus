@@ -38,12 +38,17 @@ class Claw(BaseModel):
     status: ClawStatus = ClawStatus.CREATING
     error_message: Optional[str] = None
     expires_at: Optional[datetime] = None
+    last_activity_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     @property
     def http_base_url(self) -> Optional[str]:
         """HTTP base URL for the manus-claw plugin server"""
-        if self.container_ip:
-            return f"http://{self.container_ip}:18788"
-        return None
+        if not self.container_ip:
+            return None
+        if self.container_ip.startswith(("http://", "https://")):
+            return self.container_ip.rstrip("/")
+        if ":" in self.container_ip:
+            return f"http://{self.container_ip}"
+        return f"http://{self.container_ip}:18788"

@@ -1,4 +1,4 @@
-from typing import Dict, Optional, List, Type, TypeVar, Generic, get_args, Self
+from typing import Any, Dict, Optional, List, Type, TypeVar, Generic, get_args, Self
 from datetime import datetime, timezone, UTC
 from beanie import Document
 from pydantic import BaseModel, Field
@@ -55,6 +55,9 @@ class UserDocument(BaseDocument[User], id_field="user_id", domain_model_class=Us
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_login_at: Optional[datetime] = None
+    auth_provider: Optional[str] = None
+    external_id: Optional[str] = None
+    external_user: Optional[Dict[str, Any]] = None
 
     class Settings:
         name = "users"
@@ -68,6 +71,9 @@ class AgentDocument(BaseDocument[Agent], id_field="agent_id", domain_model_class
     """MongoDB document for Agent"""
     agent_id: str
     model_name: str
+    model_provider: str = ""
+    api_base: Optional[str] = None
+    api_key: Optional[str] = None
     temperature: float
     max_tokens: int
     memories: Dict[str, Memory] = Field(default_factory=dict)
@@ -120,6 +126,7 @@ class ClawDocument(BaseDocument[Claw], id_field="claw_id", domain_model_class=Cl
     status: ClawStatus = ClawStatus.CREATING
     error_message: Optional[str] = None
     expires_at: Optional[datetime] = None
+    last_activity_at: Optional[datetime] = None
     messages: List[ClawMessage] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

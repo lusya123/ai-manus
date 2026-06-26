@@ -19,7 +19,8 @@ from app.interfaces.schemas.base import APIResponse
 from app.interfaces.schemas.session import (
     ChatRequest, ShellViewRequest, CreateSessionResponse, GetSessionResponse,
     ListSessionItem, ListSessionResponse, ShellViewResponse,
-    ShareSessionResponse, SharedSessionResponse, PreviewUrlRequest
+    ShareSessionResponse, SharedSessionResponse, PreviewUrlRequest,
+    CreateSessionRequest
 )
 from app.interfaces.schemas.file import FileViewRequest, FileViewResponse
 from app.interfaces.schemas.resource import AccessTokenRequest, SignedUrlResponse
@@ -75,10 +76,11 @@ def _rewrite_preview_content(content: bytes, content_type: str, prefix: str) -> 
 
 @router.put("", response_model=APIResponse[CreateSessionResponse])
 async def create_session(
+    request: CreateSessionRequest | None = None,
     current_user: User = Depends(get_current_user),
     agent_service: AgentService = Depends(get_agent_service)
 ) -> APIResponse[CreateSessionResponse]:
-    session = await agent_service.create_session(current_user.id)
+    session = await agent_service.create_session(current_user.id, request.agent_model_config if request else None)
     return APIResponse.success(
         CreateSessionResponse(
             session_id=session.id,

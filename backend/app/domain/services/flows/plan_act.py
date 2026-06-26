@@ -10,6 +10,7 @@ from app.domain.models.event import (
     MessageEvent,
     DoneEvent,
     TitleEvent,
+    ErrorEvent,
 )
 from app.domain.models.plan import ExecutionStatus
 from app.domain.services.agents.planner import PlannerAgent
@@ -20,6 +21,7 @@ from app.domain.external.search import SearchEngine
 from app.domain.repositories.agent_repository import AgentRepository
 from app.domain.repositories.session_repository import SessionRepository
 from app.domain.models.session import SessionStatus
+from app.domain.models.agent import Agent
 from app.domain.services.tools.mcp import MCPToolkit
 from app.domain.services.tools.shell import ShellToolkit
 from app.domain.services.tools.browser import BrowserToolkit
@@ -50,6 +52,7 @@ class PlanActFlow(BaseFlow):
         browser: Browser,
         mcp_tool: MCPToolkit,
         search_engine: Optional[SearchEngine] = None,
+        agent: Optional[Agent] = None,
     ):
         self._agent_id = agent_id
         self._repository = agent_repository
@@ -79,6 +82,7 @@ class PlanActFlow(BaseFlow):
             agent_repository=self._repository,
             tools=tools,
             runtime_prompt=runtime_prompt,
+            agent=agent,
         )
         logger.debug(f"Created planner agent for Agent {self._agent_id}")
             
@@ -87,6 +91,7 @@ class PlanActFlow(BaseFlow):
             agent_repository=self._repository,
             tools=tools,
             runtime_prompt=runtime_prompt,
+            agent=agent,
         )
         logger.debug(f"Created execution agent for Agent {self._agent_id}")
 
@@ -122,16 +127,27 @@ class PlanActFlow(BaseFlow):
             elif self.status == AgentStatus.PLANNING:
                 # Create plan
                 logger.info(f"Agent {self._agent_id} started creating plan")
+                plan_created = False
+                planning_error_emitted = False
                 async for event in self.planner.create_plan(message):
                     if isinstance(event, PlanEvent) and event.status == PlanStatus.CREATED:
+                        plan_created = True
                         self.plan = event.plan
                         logger.info(f"Agent {self._agent_id} created plan successfully with {len(event.plan.steps)} steps")
                         yield TitleEvent(title=event.plan.title)
-                        yield MessageEvent(role="assistant", message=event.plan.message)
+                    elif isinstance(event, ErrorEvent):
+                        planning_error_emitted = True
                     yield event
+                if not plan_created or self.plan is None:
+                    logger.warning(f"Agent {self._agent_id} failed to create a plan")
+                    if not planning_error_emitted:
+                        yield ErrorEvent(error="Failed to create a plan.")
+                    self.status = AgentStatus.IDLE
+                    yield DoneEvent()
+                    return
                 logger.info(f"Agent {self._agent_id} state changed from {AgentStatus.PLANNING} to {AgentStatus.EXECUTING}")
                 self.status = AgentStatus.EXECUTING
-                if len(event.plan.steps) == 0:
+                if len(self.plan.steps) == 0:
                     logger.info(f"Agent {self._agent_id} created plan successfully with no steps")
                     self.status = AgentStatus.COMPLETED
                     

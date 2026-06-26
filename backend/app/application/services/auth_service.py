@@ -1,7 +1,8 @@
 import hashlib
 import secrets
-from typing import Optional
-from datetime import datetime
+from typing import Any, Optional
+from datetime import datetime, UTC
+import httpx
 from app.domain.models.user import User, UserRole
 from app.domain.repositories.user_repository import UserRepository
 from app.application.errors.exceptions import UnauthorizedError, ValidationError, BadRequestError
@@ -59,6 +60,125 @@ class AuthService:
     def _generate_user_id(self) -> str:
         """Generate unique user ID"""
         return secrets.token_urlsafe(16)
+
+    def _sub2api_auth_url(self, path: str) -> str:
+        base_url = (self.settings.sub2api_base_url or "").rstrip("/")
+        if not base_url:
+            raise UnauthorizedError("Sub2API auth is not configured")
+        return f"{base_url}/{path.lstrip('/')}"
+
+    def _coerce_datetime(self, value: Any) -> datetime:
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str) and value:
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                logger.debug("Failed to parse Sub2API datetime: %s", value)
+        return datetime.now(UTC)
+
+    def _map_sub2api_user(self, data: dict[str, Any]) -> User:
+        external_id = str(data.get("id") or data.get("user_id") or data.get("sub") or "")
+        if not external_id:
+            raise UnauthorizedError("Sub2API user response is missing id")
+
+        email = str(data.get("email") or "").strip().lower()
+        if not email:
+            email = f"sub2api-{external_id}@localhost"
+
+        fullname = (
+            str(data.get("username") or "").strip()
+            or str(data.get("display_name") or "").strip()
+            or str(data.get("name") or "").strip()
+            or email.split("@", 1)[0]
+            or f"Sub2API User {external_id}"
+        )
+        if len(fullname.strip()) < 2:
+            fullname = f"Sub2API User {external_id}"
+
+        sub2api_role = str(data.get("role") or "").lower()
+        role = UserRole.ADMIN if sub2api_role == "admin" else UserRole.USER
+        status = str(data.get("status") or "active").lower()
+        is_active = status not in {"inactive", "disabled", "banned", "deleted", "blocked"}
+
+        return User(
+            id=f"sub2api:{external_id}",
+            fullname=fullname,
+            email=email,
+            role=role,
+            is_active=is_active,
+            created_at=self._coerce_datetime(data.get("created_at")),
+            updated_at=self._coerce_datetime(data.get("updated_at")),
+            last_login_at=self._coerce_datetime(data["last_login_at"]) if data.get("last_login_at") else None,
+            auth_provider="sub2api",
+            external_id=external_id,
+            external_user=data,
+        )
+
+    async def _verify_sub2api_token(self, token: str) -> Optional[User]:
+        if not token:
+            return None
+
+        url = self._sub2api_auth_url(self.settings.sub2api_auth_me_path)
+        try:
+            async with httpx.AsyncClient(timeout=self.settings.sub2api_timeout_seconds) as client:
+                response = await client.get(url, headers={"Authorization": f"Bearer {token}"})
+        except httpx.HTTPError as e:
+            logger.warning("Sub2API auth request failed: %s", e)
+            return None
+
+        if response.status_code != 200:
+            logger.warning("Sub2API auth rejected token: status=%s", response.status_code)
+            return None
+
+        try:
+            payload = response.json()
+        except ValueError:
+            logger.warning("Sub2API auth returned non-JSON response")
+            return None
+
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            logger.warning("Sub2API auth returned invalid response shape")
+            return None
+
+        code = payload.get("code")
+        if code not in (None, 0):
+            logger.warning("Sub2API auth returned error code: %s", code)
+            return None
+
+        return self._map_sub2api_user(data)
+
+    async def _refresh_sub2api_access_token(self, refresh_token: str) -> AuthToken:
+        url = self._sub2api_auth_url(self.settings.sub2api_auth_refresh_path)
+        try:
+            async with httpx.AsyncClient(timeout=self.settings.sub2api_timeout_seconds) as client:
+                response = await client.post(url, json={"refresh_token": refresh_token})
+        except httpx.HTTPError as e:
+            logger.warning("Sub2API token refresh request failed: %s", e)
+            raise UnauthorizedError("Token refresh failed")
+
+        if response.status_code != 200:
+            raise UnauthorizedError("Invalid refresh token")
+
+        try:
+            payload = response.json()
+        except ValueError:
+            raise UnauthorizedError("Invalid refresh token")
+
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict) or payload.get("code") not in (None, 0):
+            raise UnauthorizedError("Invalid refresh token")
+
+        access_token = data.get("access_token")
+        if not access_token:
+            raise UnauthorizedError("Invalid refresh token")
+
+        return AuthToken(
+            access_token=access_token,
+            refresh_token=data.get("refresh_token"),
+            token_type=str(data.get("token_type") or "bearer").lower(),
+        )
     
     async def register_user(self, fullname: str, password: str, email: str, role: UserRole = UserRole.USER) -> User:
         """Register a new user"""
@@ -158,6 +278,9 @@ class AuthService:
             
             logger.info(f"User authenticated successfully: {email}")
             return user
+
+        elif self.settings.auth_provider == "sub2api":
+            raise BadRequestError("Use Sub2API authentication token")
         
         else:
             raise ValueError(f"Unsupported auth provider: {self.settings.auth_provider}")
@@ -182,6 +305,9 @@ class AuthService:
     
     async def refresh_access_token(self, refresh_token: str) -> AuthToken:
         """Refresh access token using refresh token"""
+        if self.settings.auth_provider == "sub2api":
+            return await self._refresh_sub2api_access_token(refresh_token)
+
         payload = self.token_service.verify_token(refresh_token)
         
         if not payload:
@@ -207,6 +333,9 @@ class AuthService:
     
     async def verify_token(self, token: str) -> Optional[User]:
         """Verify JWT token and return user"""
+        if self.settings.auth_provider == "sub2api":
+            return await self._verify_sub2api_token(token)
+
         user_info = self.token_service.get_user_from_token(token)
         
         if not user_info:
@@ -352,4 +481,4 @@ class AuthService:
         await self.user_repository.update_user(user)
         
         logger.info(f"Password reset successfully for user: {email}")
-        return True 
+        return True

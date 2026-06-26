@@ -181,7 +181,8 @@ async def refresh_token(
     
     return APIResponse.success(RefreshTokenResponse(
         access_token=token_result.access_token,
-        token_type=token_result.token_type
+        token_type=token_result.token_type,
+        refresh_token=token_result.refresh_token
     ))
 
 
@@ -243,4 +244,3 @@ async def reset_password(
     await auth_service.reset_password(request.email, request.new_password)
     
     return APIResponse.success({})
- 

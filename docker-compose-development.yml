@@ -61,6 +61,9 @@ services:
     environment:
       - SANDBOX_ADDRESS=sandbox # Use single container as sandbox
       - CLAW_ADDRESS=claw       # Use single fixed claw container in development
+      - MONGODB_URI=mongodb://mongodb:27017
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
       - MANUS_API_BASE_URL=http://backend:8000
       - CLAW_API_KEY=${CLAW_DEV_API_KEY:-manus-dev-api-key-changeme}
       - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://localhost:5173}

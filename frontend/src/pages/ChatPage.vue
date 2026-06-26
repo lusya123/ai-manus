@@ -330,6 +330,10 @@ const handlePlanEvent = (planData: PlanEventData) => {
   plan.value = planData;
 }
 
+const hasTerminalEvent = (events: AgentSSEEvent[]) => {
+  return events.some((event) => event.event === 'done' || event.event === 'error' || event.event === 'wait');
+}
+
 // Main event handler function
 const handleEvent = (event: AgentSSEEvent) => {
   if (event.event === 'message') {
@@ -339,9 +343,9 @@ const handleEvent = (event: AgentSSEEvent) => {
   } else if (event.event === 'step') {
     handleStepEvent(event.data as StepEventData);
   } else if (event.event === 'done') {
-    //isLoading.value = false;
+    isLoading.value = false;
   } else if (event.event === 'wait') {
-    // TODO: handle wait event
+    isLoading.value = false;
   } else if (event.event === 'error') {
     handleErrorEvent(event.data as ErrorEventData);
   } else if (event.event === 'title') {
@@ -451,8 +455,15 @@ const restoreSession = async () => {
     handleEvent(event);
   }
   realTime.value = true;
-  if (session.status === SessionStatus.RUNNING || session.status === SessionStatus.PENDING) {
+  const canResume = (
+    (session.status === SessionStatus.RUNNING || session.status === SessionStatus.PENDING) &&
+    session.events.length > 0 &&
+    !hasTerminalEvent(session.events)
+  );
+  if (canResume) {
     await chat();
+  } else {
+    isLoading.value = false;
   }
   agentApi.clearUnreadMessageCount(sessionId.value);
 }

@@ -6,7 +6,7 @@
 
  * [x] 集成 [OpenClaw](https://github.com/anthropics/openclaw) AI 助手
  * [x] 一键部署、用户隔离容器
- * [x] 自动过期倒计时
+ * [x] 常驻容器与可选过期策略
  * [x] 完整聊天历史（MongoDB + OpenClaw 会话合并）
  * [x] 文件上传与下载
  * [x] OpenAI 兼容 LLM 代理

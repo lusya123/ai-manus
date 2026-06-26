@@ -1,17 +1,28 @@
 import asyncio
 import io
 from types import MethodType
+from datetime import datetime, timedelta, UTC
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+from app.domain.models.claw import Claw, ClawStatus
 from app.domain.models.event import ErrorEvent, MessageEvent, ToolEvent, ToolStatus
 from app.domain.models.file import FileInfo
 from app.domain.models.memory import Memory
 from app.domain.models.tool_result import ToolResult
+from app.domain.services.claw_domain_service import ClawDomainService
 from app.domain.services.agents.base import BaseAgent
 from app.domain.services.agent_task_runner import AgentTaskRunner
 from app.domain.services.prompts.runtime import build_runtime_environment_prompt
 from app.domain.utils.robust_json_parser import RobustJsonParser
+from app.infrastructure.external.claw.docker_claw_runtime import DockerClawRuntime
+from app.interfaces.api.openai_routes import (
+    _anthropic_stream_event_to_openai_chunks,
+    _anthropic_messages_url,
+    _anthropic_to_openai_response,
+    _openai_chat_url,
+    _openai_to_anthropic_request,
+)
 
 
 class PassthroughParser:
@@ -71,6 +82,96 @@ def make_agent(monkeypatch, responses):
 
     agent._add_to_memory = MethodType(add_to_memory, agent)
     return agent
+
+
+def test_openai_proxy_builds_provider_specific_target_urls():
+    assert _openai_chat_url("https://api.openai.com") == "https://api.openai.com/v1/chat/completions"
+    assert _openai_chat_url("http://mockserver:8090/v1") == "http://mockserver:8090/v1/chat/completions"
+    assert _anthropic_messages_url("https://xuedingtoken.com") == "https://xuedingtoken.com/v1/messages"
+    assert _anthropic_messages_url("https://xuedingtoken.com/v1") == "https://xuedingtoken.com/v1/messages"
+
+
+def test_openai_proxy_converts_openai_chat_request_to_anthropic_messages():
+    class FakeSettings:
+        model_name = "claude-opus-4-6"
+        max_tokens = 1024
+
+    converted = _openai_to_anthropic_request({
+        "model": "claude-opus-4-6",
+        "stream": True,
+        "messages": [
+            {"role": "system", "content": "Be brief."},
+            {"role": "user", "content": "你好"},
+        ],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Lookup data",
+                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+            },
+        }],
+    }, FakeSettings())
+
+    assert converted["model"] == "claude-opus-4-6"
+    assert converted["max_tokens"] == 1024
+    assert converted["stream"] is True
+    assert converted["system"] == "Be brief."
+    assert converted["messages"] == [{"role": "user", "content": "你好"}]
+    assert converted["tools"][0]["name"] == "lookup"
+    assert converted["tools"][0]["input_schema"]["properties"]["q"]["type"] == "string"
+
+
+def test_openai_proxy_converts_anthropic_response_to_openai_chat_completion():
+    converted = _anthropic_to_openai_response({
+        "id": "msg_123",
+        "model": "claude-opus-4-6",
+        "content": [{"type": "text", "text": "E2E_OK"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 5, "output_tokens": 2},
+    }, "claude-opus-4-6")
+
+    assert converted["object"] == "chat.completion"
+    assert converted["choices"][0]["message"]["role"] == "assistant"
+    assert converted["choices"][0]["message"]["content"] == "E2E_OK"
+    assert converted["choices"][0]["finish_reason"] == "stop"
+    assert converted["usage"]["total_tokens"] == 7
+
+
+def test_openai_proxy_streams_anthropic_tool_use_as_openai_tool_calls():
+    state = {
+        "completion_id": None,
+        "model": "claude-opus-4-6",
+        "tool_blocks": {},
+        "next_tool_index": 0,
+    }
+
+    chunks = []
+    for event in [
+        {"type": "message_start", "message": {"id": "msg_123", "model": "claude-opus-4-6"}},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "browser_open", "input": {}},
+        },
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"url\":"}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "\"https://example.com\"}"}},
+        {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
+        {"type": "message_stop"},
+    ]:
+        chunks.extend(_anthropic_stream_event_to_openai_chunks(event, state))
+
+    tool_start = chunks[1]["choices"][0]["delta"]["tool_calls"][0]
+    first_args = chunks[2]["choices"][0]["delta"]["tool_calls"][0]
+    second_args = chunks[3]["choices"][0]["delta"]["tool_calls"][0]
+
+    assert tool_start["id"] == "toolu_1"
+    assert tool_start["function"]["name"] == "browser_open"
+    assert first_args["index"] == 0
+    assert first_args["function"]["arguments"] == "{\"url\":"
+    assert second_args["function"]["arguments"] == "\"https://example.com\"}"
+    assert chunks[4]["choices"][0]["finish_reason"] == "tool_calls"
+    assert chunks[-1] == "[DONE]"
 
 
 async def test_empty_anthropic_tool_use_response_retries_internally(monkeypatch):
@@ -222,6 +323,320 @@ def test_base_agent_refreshes_stale_system_prompt():
 
     assert agent.memory.messages[0].content == "new runtime prompt"
     assert agent.memory.messages[1].content == "hello"
+
+
+def test_claw_http_base_url_supports_published_host_ports():
+    assert (
+        Claw(
+            id="claw",
+            user_id="user",
+            api_key="key",
+            container_ip="127.0.0.1:49152",
+        ).http_base_url
+        == "http://127.0.0.1:49152"
+    )
+    assert (
+        Claw(
+            id="claw",
+            user_id="user",
+            api_key="key",
+            container_ip="http://localhost:18788",
+        ).http_base_url
+        == "http://localhost:18788"
+    )
+
+
+def test_docker_claw_runtime_prefers_sandbox_backend_url_for_host_backend():
+    class FakeSettings:
+        manus_api_base_url = "http://backend:8000"
+        backend_sandbox_url = "http://host.docker.internal:8127"
+        backend_internal_url = "http://backend:8000"
+        backend_public_url = "http://127.0.0.1:8127"
+
+    runtime = object.__new__(DockerClawRuntime)
+    runtime.settings = FakeSettings()
+
+    assert runtime._container_reachable_backend_url() == "http://host.docker.internal:8127"
+
+
+async def test_stale_creating_claw_is_marked_error():
+    class FakeRepository:
+        def __init__(self):
+            self.claw = Claw(
+                id="claw",
+                user_id="user",
+                api_key="key",
+                status=ClawStatus.CREATING,
+                updated_at=datetime.now(UTC) - timedelta(seconds=120),
+            )
+            self.updated = None
+
+        async def get_by_user_id(self, user_id):
+            return self.claw
+
+        async def update(self, claw):
+            self.updated = claw
+            self.claw = claw
+            return claw
+
+    class FakeRuntime:
+        ready_timeout = 10
+
+    repo = FakeRepository()
+    service = ClawDomainService(repo, FakeRuntime(), claw_client=None)
+
+    claw = await service.get_claw("user")
+
+    assert claw.status == ClawStatus.ERROR
+    assert "timed out" in claw.error_message
+    assert repo.updated.status == ClawStatus.ERROR
+
+
+async def test_running_claw_ignores_legacy_expiry_when_ttl_disabled():
+    class FakeRepository:
+        def __init__(self):
+            self.claw = Claw(
+                id="claw",
+                user_id="user",
+                api_key="key",
+                status=ClawStatus.RUNNING,
+                expires_at=datetime.now(UTC) - timedelta(seconds=1),
+            )
+            self.deleted = False
+            self.updated = None
+
+        async def get_by_user_id(self, user_id):
+            return self.claw
+
+        async def update(self, claw):
+            self.updated = claw
+            self.claw = claw
+            return claw
+
+        async def delete_by_user_id(self, user_id):
+            self.deleted = True
+            return True
+
+    class FakeRuntime:
+        ready_timeout = 10
+
+        def __init__(self):
+            self.destroyed = []
+
+        async def destroy(self, instance_name):
+            self.destroyed.append(instance_name)
+
+    repo = FakeRepository()
+    runtime = FakeRuntime()
+    service = ClawDomainService(repo, runtime, claw_client=None)
+    old_ttl = service.settings.claw_ttl_seconds
+    service.settings.claw_ttl_seconds = 0
+    try:
+        claw = await service.get_claw("user")
+
+        assert claw.status == ClawStatus.RUNNING
+        assert claw.expires_at is None
+        assert repo.updated.expires_at is None
+        assert repo.deleted is False
+        assert runtime.destroyed == []
+    finally:
+        service.settings.claw_ttl_seconds = old_ttl
+
+
+async def test_delete_claw_destroys_runtime_instance(monkeypatch):
+    class FakeRepository:
+        def __init__(self):
+            self.deleted = False
+            self.claw = Claw(
+                id="claw",
+                user_id="user",
+                api_key="key",
+                container_name="manus-claw-test",
+                container_ip="127.0.0.1:49152",
+                status=ClawStatus.RUNNING,
+            )
+
+        async def get_by_user_id(self, user_id):
+            return self.claw
+
+        async def delete_by_user_id(self, user_id):
+            self.deleted = True
+            return True
+
+    class FakeRuntime:
+        ready_timeout = 10
+
+        def __init__(self):
+            self.destroyed = []
+
+        async def destroy(self, instance_name):
+            self.destroyed.append(instance_name)
+
+    repo = FakeRepository()
+    runtime = FakeRuntime()
+    service = ClawDomainService(repo, runtime, claw_client=None)
+
+    assert await service.delete_claw("user") is True
+    assert runtime.destroyed == ["manus-claw-test"]
+    assert repo.deleted is True
+
+
+async def test_claw_capacity_limit_rejects_new_user(monkeypatch):
+    class FakeRepository:
+        async def get_by_user_id(self, user_id):
+            return None
+
+        async def count_by_statuses(self, statuses):
+            return 1
+
+    class FakeRuntime:
+        ready_timeout = 10
+
+    service = ClawDomainService(FakeRepository(), FakeRuntime(), claw_client=None)
+    old_limit = service.settings.claw_max_instances_total
+    service.settings.claw_max_instances_total = 1
+    try:
+        try:
+            await service.prepare_claw_for_creation("new-user")
+        except RuntimeError as exc:
+            assert "capacity" in str(exc)
+        else:
+            raise AssertionError("Expected capacity RuntimeError")
+    finally:
+        service.settings.claw_max_instances_total = old_limit
+
+
+async def test_cleanup_removes_idle_running_claw(monkeypatch):
+    class FakeRepository:
+        def __init__(self):
+            self.deleted = []
+            self.claw = Claw(
+                id="claw",
+                user_id="user",
+                api_key="key",
+                container_name="manus-claw-idle",
+                container_ip="127.0.0.1:49152",
+                status=ClawStatus.RUNNING,
+                last_activity_at=datetime.now(UTC) - timedelta(seconds=120),
+            )
+
+        async def list_by_statuses(self, statuses):
+            return [self.claw]
+
+        async def delete_by_user_id(self, user_id):
+            self.deleted.append(user_id)
+            return True
+
+    class FakeRuntime:
+        ready_timeout = 10
+
+        def __init__(self):
+            self.destroyed = []
+
+        async def destroy(self, instance_name):
+            self.destroyed.append(instance_name)
+
+    repo = FakeRepository()
+    runtime = FakeRuntime()
+    service = ClawDomainService(repo, runtime, claw_client=None)
+    old_timeout = service.settings.claw_idle_timeout_seconds
+    service.settings.claw_idle_timeout_seconds = 30
+    try:
+        result = await service.cleanup_instances()
+
+        assert result == {"removed": 1, "errored": 0}
+        assert runtime.destroyed == ["manus-claw-idle"]
+        assert repo.deleted == ["user"]
+    finally:
+        service.settings.claw_idle_timeout_seconds = old_timeout
+
+
+async def test_cleanup_keeps_idle_running_claw_when_idle_timeout_disabled(monkeypatch):
+    class FakeRepository:
+        def __init__(self):
+            self.deleted = []
+            self.claw = Claw(
+                id="claw",
+                user_id="user",
+                api_key="key",
+                container_name="manus-claw-persistent",
+                container_ip="127.0.0.1:49152",
+                status=ClawStatus.RUNNING,
+                last_activity_at=datetime.now(UTC) - timedelta(days=30),
+            )
+
+        async def list_by_statuses(self, statuses):
+            return [self.claw]
+
+        async def delete_by_user_id(self, user_id):
+            self.deleted.append(user_id)
+            return True
+
+    class FakeRuntime:
+        ready_timeout = 10
+
+        def __init__(self):
+            self.destroyed = []
+
+        async def destroy(self, instance_name):
+            self.destroyed.append(instance_name)
+
+    repo = FakeRepository()
+    runtime = FakeRuntime()
+    service = ClawDomainService(repo, runtime, claw_client=None)
+    old_timeout = service.settings.claw_idle_timeout_seconds
+    service.settings.claw_idle_timeout_seconds = 0
+    try:
+        result = await service.cleanup_instances()
+
+        assert result == {"removed": 0, "errored": 0}
+        assert runtime.destroyed == []
+        assert repo.deleted == []
+    finally:
+        service.settings.claw_idle_timeout_seconds = old_timeout
+
+
+async def test_provision_leaves_running_claw_persistent_when_ttl_disabled(monkeypatch):
+    class FakeRepository:
+        def __init__(self):
+            self.updated = None
+            self.messages = []
+
+        async def update(self, claw):
+            self.updated = claw
+            return claw
+
+        async def append_message(self, user_id, role, content):
+            self.messages.append((user_id, role, content))
+
+    class FakeRuntimeInfo:
+        instance_name = "manus-claw-persistent"
+        address = "127.0.0.1:49152"
+
+    class FakeRuntime:
+        ready_timeout = 10
+
+        async def create(self, claw_id, api_key):
+            return FakeRuntimeInfo()
+
+        async def wait_for_ready(self, base_url):
+            return True
+
+    repo = FakeRepository()
+    service = ClawDomainService(repo, FakeRuntime(), claw_client=None)
+    claw = Claw(
+        id="claw",
+        user_id="user",
+        api_key="key",
+        status=ClawStatus.CREATING,
+        expires_at=datetime.now(UTC) - timedelta(seconds=1),
+    )
+
+    await service.provision_claw_instance(claw, ttl_seconds=0)
+
+    assert repo.updated.status == ClawStatus.RUNNING
+    assert repo.updated.expires_at is None
+    assert repo.messages
 
 
 async def test_missing_markdown_attachment_is_materialized_from_final_message():

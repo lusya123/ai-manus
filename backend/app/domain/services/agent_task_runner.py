@@ -34,6 +34,7 @@ from app.domain.external.task import TaskRunner, Task
 from app.domain.repositories.session_repository import SessionRepository
 from app.domain.repositories.mcp_repository import MCPRepository
 from app.domain.models.session import SessionStatus
+from app.domain.models.agent import Agent
 from app.domain.models.file import FileInfo
 from app.domain.services.tools.mcp import MCPToolkit
 from app.domain.models.tool_result import ToolResult
@@ -79,6 +80,7 @@ class AgentTaskRunner(TaskRunner):
         file_storage: FileStorage,
         mcp_repository: MCPRepository,
         search_engine: Optional[SearchEngine] = None,
+        agent: Optional[Agent] = None,
     ):
         self._session_id = session_id
         self._agent_id = agent_id
@@ -102,6 +104,7 @@ class AgentTaskRunner(TaskRunner):
             self._browser,
             self._mcp_tool,
             self._search_engine,
+            agent=agent,
         )
 
     async def _put_and_add_event(self, task: Task, event: AgentEvent) -> None:

@@ -17,6 +17,30 @@ export default defineConfig({
   optimizeDeps: {
     exclude: ['lucide-vue-next'],
   },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes('node_modules')) {
+            return;
+          }
+          if (id.includes('monaco-editor')) {
+            return 'vendor-monaco';
+          }
+          if (id.includes('lucide-vue-next')) {
+            return 'vendor-icons';
+          }
+          if (id.includes('reka-ui') || id.includes('@floating-ui')) {
+            return 'vendor-ui';
+          }
+          if (id.includes('@vue') || id.includes('vue-router') || id.includes('vue-i18n') || id.includes('pinia')) {
+            return 'vendor-vue';
+          }
+          return 'vendor';
+        },
+      },
+    },
+  },
   server: {
     host: true,
     port: 5173,
@@ -30,4 +54,4 @@ export default defineConfig({
       },
     }),
   },
-}); 
+});

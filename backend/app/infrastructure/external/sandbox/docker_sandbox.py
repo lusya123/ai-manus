@@ -588,7 +588,11 @@ class DockerSandbox(Sandbox):
             )
 
         docker_client = docker.from_env()
-        container = docker_client.containers.get(id)
+        try:
+            container = docker_client.containers.get(id)
+        except docker.errors.NotFound:
+            logger.warning("Sandbox container %s not found", id)
+            return None
         container.reload()
         
         ip_address = cls._get_container_ip(container)

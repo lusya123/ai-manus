@@ -52,19 +52,33 @@ class AgentService:
         self._search_engine = search_engine
         self._sandbox_cls = sandbox_cls
     
-    async def create_session(self, user_id: str) -> Session:
+    async def create_session(self, user_id: str, model_config: Optional[Any] = None) -> Session:
         logger.info(f"Creating new session for user: {user_id}")
-        agent = await self._create_agent()
+        agent = await self._create_agent(model_config)
         session = Session(agent_id=agent.id, user_id=user_id)
         logger.info(f"Created new Session with ID: {session.id} for user: {user_id}")
         await self._session_repository.save(session)
         return session
 
-    async def _create_agent(self) -> Agent:
+    def _model_config_value(self, model_config: Optional[Any], key: str) -> Optional[str]:
+        if not model_config:
+            return None
+        if isinstance(model_config, dict):
+            value = model_config.get(key)
+        elif hasattr(model_config, "model_dump"):
+            value = model_config.model_dump().get(key)
+        else:
+            value = getattr(model_config, key, None)
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    async def _create_agent(self, model_config: Optional[Any] = None) -> Agent:
         logger.info("Creating new agent")
         settings = get_settings()
         agent = Agent(
-            model_name=settings.model_name,
+            model_name=self._model_config_value(model_config, "model_name") or settings.model_name,
+            model_provider=self._model_config_value(model_config, "model_provider") or settings.model_provider,
+            api_base=self._model_config_value(model_config, "api_base") or settings.api_base,
+            api_key=self._model_config_value(model_config, "api_key") or settings.api_key,
             temperature=settings.temperature,
             max_tokens=settings.max_tokens,
         )

@@ -65,7 +65,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { Bot, ChevronLeft } from 'lucide-vue-next'
 import ManusLogoTextIcon from '@/components/icons/ManusLogoTextIcon.vue'
@@ -105,6 +105,12 @@ const { t } = useI18n()
 
 // Active tab state
 const activeTab = ref<string>(props.defaultTab || props.tabs[0]?.id || '')
+
+watch(() => props.defaultTab, (defaultTab) => {
+  if (defaultTab && props.tabs.some((tab) => tab.id === defaultTab)) {
+    activeTab.value = defaultTab
+  }
+})
 
 // Computed active tab title
 const activeTabTitle = computed(() => {

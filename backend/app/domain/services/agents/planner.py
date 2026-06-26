@@ -24,6 +24,7 @@ from app.domain.services.tools.base import BaseToolkit
 from app.domain.services.tools.file import FileToolkit
 from app.domain.services.tools.shell import ShellToolkit
 from app.domain.repositories.agent_repository import AgentRepository
+from app.domain.models.agent import Agent
 
 logger = logging.getLogger(__name__)
 
@@ -43,11 +44,13 @@ class PlannerAgent(BaseAgent):
         agent_repository: AgentRepository,
         tools: List[BaseToolkit],
         runtime_prompt: str = "",
+        agent: Optional[Agent] = None,
     ):
         super().__init__(
             agent_id=agent_id,
             agent_repository=agent_repository,
             tools=tools,
+            agent=agent,
         )
         self.system_prompt = SYSTEM_PROMPT + runtime_prompt + "\n" + PLANNER_SYSTEM_PROMPT
 

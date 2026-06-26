@@ -10,7 +10,7 @@ Join our community: [QQ Group (1005477581)](https://qun.qq.com/universal-share/s
 
 ---
 
-AI Manus is a general-purpose AI Agent system that can be fully privately deployed and supports running various tools and operations in a sandbox environment. Now with deep **Claw** integration (powered by [OpenClaw](https://github.com/anthropics/openclaw)), delivering the Manus × Claw experience: one-click AI assistant deployment, per-user isolated containers, auto-expiry countdown, and full chat history.
+AI Manus is a general-purpose AI Agent system that can be fully privately deployed and supports running various tools and operations in a sandbox environment. Now with deep **Claw** integration (powered by [OpenClaw](https://github.com/anthropics/openclaw)), delivering the Manus × Claw experience: one-click AI assistant deployment, per-user isolated persistent containers, optional expiry policies, and full chat history.
 
 The goal of AI Manus project is to become a fully privately deployable enterprise-level Manus application. Vertical Manus applications have many repetitive engineering tasks, and this project hopes to unify this part, allowing everyone to build vertical Manus applications like building blocks.
 
@@ -26,7 +26,7 @@ Each service and tool in AI Manus includes a Built-in version that can be fully 
 
  * **Deployment:** Only requires one LLM service for deployment, no dependency on other external services.
  * **Tools:** Supports Terminal, Browser, File, Web Search, message tools, with real-time viewing and takeover capabilities.
- * **Claw:** Integrated [OpenClaw](https://github.com/anthropics/openclaw) AI assistant with one-click deployment, per-user isolated containers, auto-expiry countdown, and full chat history.
+ * **Claw:** Integrated [OpenClaw](https://github.com/anthropics/openclaw) AI assistant with one-click deployment, per-user isolated persistent containers, optional expiry policies, and full chat history.
  * **Sandbox:** Each Task is allocated a separate sandbox that runs in a local Docker environment.
  * **Task Sessions:** Manages session history through Mongo/Redis, supports background tasks.
  * **Conversations:** Supports stopping and interruption, supports file upload and download.

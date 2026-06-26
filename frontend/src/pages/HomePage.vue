@@ -26,9 +26,10 @@
               <Github class="size-[18px]" />
               GitHub
             </a>
-            <div class="relative flex items-center" aria-expanded="false" aria-haspopup="dialog"
+            <div ref="userMenuRef" class="relative flex items-center" :aria-expanded="showUserMenu" aria-haspopup="dialog"
               @mouseenter="handleUserMenuEnter" @mouseleave="handleUserMenuLeave">
-              <div class="relative flex items-center justify-center font-bold cursor-pointer flex-shrink-0">
+              <div class="relative flex items-center justify-center font-bold cursor-pointer flex-shrink-0"
+                @click.stop="toggleUserMenu">
                 <div
                   class="relative flex items-center justify-center font-bold flex-shrink-0 rounded-full overflow-hidden"
                   style="width: 32px; height: 32px; font-size: 16px; color: rgba(255, 255, 255, 0.9); background-color: rgb(59, 130, 246);">
@@ -71,7 +72,7 @@
 
 <script setup lang="ts">
 import SimpleBar from '../components/SimpleBar.vue';
-import { ref, onMounted, computed } from 'vue';
+import { ref, onMounted, onUnmounted, computed } from 'vue';
 import { useRouter } from 'vue-router';
 import { useI18n } from 'vue-i18n';
 import ChatBox from '../components/ChatBox.vue';
@@ -105,6 +106,7 @@ const avatarLetter = computed(() => {
 // User menu state
 const showUserMenu = ref(false);
 const userMenuTimeout = ref<ReturnType<typeof setTimeout> | null>(null);
+const userMenuRef = ref<HTMLElement | null>(null);
 
 // Show user menu on hover
 const handleUserMenuEnter = () => {
@@ -122,8 +124,32 @@ const handleUserMenuLeave = () => {
   }, 200); // 200ms delay to allow moving to menu
 };
 
+const toggleUserMenu = () => {
+  if (userMenuTimeout.value) {
+    clearTimeout(userMenuTimeout.value);
+    userMenuTimeout.value = null;
+  }
+  showUserMenu.value = !showUserMenu.value;
+};
+
+const handleDocumentClick = (event: MouseEvent) => {
+  if (!showUserMenu.value) {
+    return;
+  }
+  const target = event.target as Node | null;
+  if (target && userMenuRef.value?.contains(target)) {
+    return;
+  }
+  showUserMenu.value = false;
+};
+
 onMounted(() => {
   hideFilePanel();
+  document.addEventListener('click', handleDocumentClick);
+})
+
+onUnmounted(() => {
+  document.removeEventListener('click', handleDocumentClick);
 })
 
 onMounted(async () => {

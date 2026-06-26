@@ -3,6 +3,8 @@ import { apiClient, API_CONFIG, ApiResponse, createSSEConnection, SSECallbacks }
 import { AgentSSEEvent } from '../types/event';
 import { CreateSessionResponse, GetSessionResponse, ShellViewResponse, FileViewResponse, ListSessionResponse, SignedUrlResponse, ShareSessionResponse, SharedSessionResponse } from '../types/response';
 import type { FileInfo } from './file';
+import { getStoredAgentConfig } from './agentConfig';
+import type { StoredAgentConfig } from './agentConfig';
 
 type ChatAttachment = Pick<FileInfo, 'file_id' | 'filename'>;
 
@@ -10,8 +12,9 @@ type ChatAttachment = Pick<FileInfo, 'file_id' | 'filename'>;
  * Create Session
  * @returns Session
  */
-export async function createSession(): Promise<CreateSessionResponse> {
-  const response = await apiClient.put<ApiResponse<CreateSessionResponse>>('/sessions');
+export async function createSession(modelConfig: StoredAgentConfig | null = getStoredAgentConfig()): Promise<CreateSessionResponse> {
+  const body = modelConfig ? { model_config: modelConfig } : undefined;
+  const response = await apiClient.put<ApiResponse<CreateSessionResponse>>('/sessions', body);
   return response.data.data;
 }
 

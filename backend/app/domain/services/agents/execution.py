@@ -4,6 +4,7 @@ from app.domain.models.file import FileInfo
 from app.domain.models.message import Message
 from app.domain.services.agents.base import BaseAgent
 from app.domain.repositories.agent_repository import AgentRepository
+from app.domain.models.agent import Agent
 from app.domain.services.prompts.system import SYSTEM_PROMPT
 from app.domain.services.prompts.execution import EXECUTION_SYSTEM_PROMPT, EXECUTION_PROMPT, SUMMARIZE_PROMPT
 from app.domain.models.event import (
@@ -38,11 +39,13 @@ class ExecutionAgent(BaseAgent):
         agent_repository: AgentRepository,
         tools: List[BaseToolkit],
         runtime_prompt: str = "",
+        agent: Optional[Agent] = None,
     ):
         super().__init__(
             agent_id=agent_id,
             agent_repository=agent_repository,
-            tools=tools
+            tools=tools,
+            agent=agent,
         )
         self.system_prompt = SYSTEM_PROMPT + runtime_prompt + "\n" + EXECUTION_SYSTEM_PROMPT
     

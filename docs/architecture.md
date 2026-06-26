@@ -25,7 +25,7 @@ Claw 是 AI Manus 深度集成的 [OpenClaw](https://github.com/anthropics/openc
 
 **架构概览：**
 
-- **claw/ 容器镜像：**基于 `ghcr.io/openclaw/openclaw:latest` 构建，内置 `manus-claw` Node 插件，运行 OpenClaw Gateway 并支持 TTL 自动过期。
+- **claw/ 容器镜像：**基于 `ghcr.io/openclaw/openclaw:latest` 构建，内置 `manus-claw` Node 插件，运行 OpenClaw Gateway；生产默认常驻，TTL 作为可选策略显式开启。
 - **Backend 集成：**Server 为每个用户动态创建 Claw Docker 容器（或连接固定开发实例），通过 MongoDB `claws` 集合管理状态，并将 MongoDB 历史与 OpenClaw `.jsonl` 会话文件合并，提供 REST + WebSocket + 文件上传/解析 + OpenAI 兼容 LLM 代理等接口。
 - **Frontend 集成：**当 `claw_enabled` 配置开启时，左侧边栏出现 "Manus Claw" 入口，路由至 `/chat/claw` 页面，通过 WebSocket 实现实时聊天。
 - **manus-claw 插件：**桥接 OpenClaw Gateway 与 Manus 后端，提供 HTTP 服务、`manus_upload_file` 工具、文件解析与会话历史读取等能力。

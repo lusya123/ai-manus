@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, RootModel, field_validator
-from typing import Dict, Any, Literal, Optional, Union, List, get_args
+from typing import ClassVar, Dict, Any, Literal, Optional, Union, List, get_args
 from datetime import datetime
 import time
 import uuid
@@ -111,6 +111,16 @@ class MessageEvent(BaseEvent):
     message: str
     attachments: Optional[List[FileInfo]] = None
 
+    _VISIBLE_CONTENT_TYPES: ClassVar[set[str]] = {"text"}
+    _HIDDEN_CONTENT_TYPES: ClassVar[set[str]] = {
+        "thinking",
+        "reasoning",
+        "redacted_thinking",
+        "reasoning_content",
+        "signature",
+        "tool_use",
+    }
+
     @field_validator("message", mode="before")
     @classmethod
     def normalize_message(cls, value: Any) -> str:
@@ -125,18 +135,34 @@ class MessageEvent(BaseEvent):
                 if isinstance(item, str):
                     parts.append(item)
                 elif isinstance(item, dict):
+                    item_type = item.get("type")
+                    if item_type in cls._HIDDEN_CONTENT_TYPES:
+                        continue
+                    if item_type and item_type not in cls._VISIBLE_CONTENT_TYPES:
+                        continue
                     if isinstance(item.get("text"), str):
                         parts.append(item["text"])
                     elif "content" in item:
                         parts.append(cls.normalize_message(item["content"]))
                     else:
                         parts.append(json.dumps(item, ensure_ascii=False))
-                elif hasattr(item, "text") and isinstance(item.text, str):
-                    parts.append(item.text)
                 else:
-                    parts.append(str(item))
+                    item_type = getattr(item, "type", None)
+                    if item_type in cls._HIDDEN_CONTENT_TYPES:
+                        continue
+                    if item_type and item_type not in cls._VISIBLE_CONTENT_TYPES:
+                        continue
+                    if hasattr(item, "text") and isinstance(item.text, str):
+                        parts.append(item.text)
+                    else:
+                        parts.append(str(item))
             return "\n".join(part for part in parts if part)
         if isinstance(value, dict):
+            value_type = value.get("type")
+            if value_type in cls._HIDDEN_CONTENT_TYPES:
+                return ""
+            if value_type and value_type not in cls._VISIBLE_CONTENT_TYPES:
+                return ""
             if isinstance(value.get("text"), str):
                 return value["text"]
             if "content" in value:

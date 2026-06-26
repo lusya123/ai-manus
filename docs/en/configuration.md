@@ -61,7 +61,7 @@
 | `CLAW_ENABLED` | `true` | No | Enable Claw feature; set to `false` to hide the sidebar entry |
 | `CLAW_IMAGE` | `simpleyyt/manus-claw` | No | Claw Docker image name |
 | `CLAW_NAME_PREFIX` | `manus-claw` | No | Claw container name prefix |
-| `CLAW_TTL_SECONDS` | `3600` | No | Claw container time-to-live in seconds; set to `0` for unlimited |
+| `CLAW_TTL_SECONDS` | `0` | No | Claw container time-to-live in seconds; unlimited by default; use a positive value only for temporary/dev deployments |
 | `CLAW_NETWORK` | - | No | Docker network bridge name for Claw containers |
 | `CLAW_READY_TIMEOUT` | `300` | No | Max seconds to wait for Claw container to become ready (default 5 minutes) |
 | `CLAW_ADDRESS` | - | No | Fixed Claw address (for development; skips Docker container creation) |
@@ -168,4 +168,3 @@ Used only when `AUTH_PROVIDER=password`:
 | Configuration | Default Value | Required | Description |
 |---------------|---------------|----------|-------------|
 | `LOG_LEVEL` | `INFO` | No | Log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) |
-

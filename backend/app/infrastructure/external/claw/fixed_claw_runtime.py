@@ -23,6 +23,10 @@ class FixedClawRuntime:
         self._address = address
         self.settings = get_settings()
 
+    @property
+    def ready_timeout(self) -> int:
+        return self.settings.claw_ready_timeout
+
     async def create(self, claw_id: str, api_key: str) -> ClawInstanceInfo:
         return ClawInstanceInfo(address=self._address)
 

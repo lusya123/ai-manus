@@ -18,12 +18,55 @@ class DockerClawRuntime:
     def __init__(self):
         self.settings = get_settings()
 
+    @property
+    def ready_timeout(self) -> int:
+        return self.settings.claw_ready_timeout
+
+    @staticmethod
+    def _strip_openai_path(base_url: Optional[str]) -> Optional[str]:
+        if not base_url:
+            return None
+        base_url = base_url.rstrip("/")
+        if base_url.endswith("/v1"):
+            return base_url[:-3]
+        return base_url
+
+    def _container_reachable_backend_url(self) -> str:
+        default_compose_url = "http://backend:8000"
+        configured = self._strip_openai_path(self.settings.manus_api_base_url)
+        if configured and configured != default_compose_url:
+            return configured
+
+        for candidate in (
+            self.settings.backend_sandbox_url,
+            self.settings.backend_internal_url,
+            self.settings.backend_public_url,
+            configured,
+        ):
+            candidate = self._strip_openai_path(candidate)
+            if candidate:
+                return candidate
+        return default_compose_url
+
+    def _published_http_address(self, container) -> Optional[str]:
+        ports = (container.attrs.get("NetworkSettings") or {}).get("Ports") or {}
+        bindings = ports.get(f"{self.settings.claw_http_container_port}/tcp") or []
+        if not bindings:
+            return None
+        host_port = bindings[0].get("HostPort")
+        if not host_port:
+            return None
+        host = bindings[0].get("HostIp") or self.settings.claw_host_bind_address
+        if host in ("0.0.0.0", "::"):
+            host = "127.0.0.1"
+        return f"{host}:{host_port}"
+
     async def create(self, claw_id: str, api_key: str) -> ClawInstanceInfo:
         import docker
         docker_client = docker.from_env()
 
         claw_network = self.settings.claw_network
-        manus_api_base_url = self.settings.manus_api_base_url
+        manus_api_base_url = self._container_reachable_backend_url()
         container_name = f"{self.settings.claw_name_prefix}-{claw_id[:8]}"
 
         container_config = {
@@ -31,17 +74,46 @@ class DockerClawRuntime:
             "name": container_name,
             "detach": True,
             "remove": True,
+            "labels": {
+                "ai-manus.kind": "claw",
+                "ai-manus.claw_id": claw_id,
+            },
             "environment": {
                 "CLAW_TTL_SECONDS": str(self.settings.claw_ttl_seconds),
                 "MANUS_API_KEY": api_key,
                 "MANUS_API_BASE_URL": manus_api_base_url,
             },
         }
+        if self.settings.claw_memory_limit:
+            container_config["mem_limit"] = self.settings.claw_memory_limit
+        if self.settings.claw_nano_cpus:
+            container_config["nano_cpus"] = self.settings.claw_nano_cpus
+        if self.settings.claw_pids_limit:
+            container_config["pids_limit"] = self.settings.claw_pids_limit
+        if self.settings.claw_publish_host_ports:
+            container_config["ports"] = {
+                f"{self.settings.claw_http_container_port}/tcp": (
+                    self.settings.claw_host_bind_address,
+                    None,
+                ),
+                f"{self.settings.claw_gateway_container_port}/tcp": (
+                    self.settings.claw_host_bind_address,
+                    None,
+                ),
+            }
         if claw_network:
             container_config["network"] = claw_network
+        if "host.docker.internal" in manus_api_base_url:
+            container_config["extra_hosts"] = {"host.docker.internal": "host-gateway"}
 
         container = docker_client.containers.run(**container_config)
-        container.reload()
+        published_address = None
+        for _ in range(20):
+            container.reload()
+            published_address = self._published_http_address(container)
+            if published_address:
+                break
+            await asyncio.sleep(0.25)
 
         network_settings = container.attrs["NetworkSettings"]
         ip_address = network_settings.get("IPAddress", "")
@@ -51,8 +123,15 @@ class DockerClawRuntime:
                     ip_address = nc["IPAddress"]
                     break
 
-        logger.info(f"Claw container started: {container_name} ip={ip_address}")
-        return ClawInstanceInfo(address=ip_address, instance_name=container_name)
+        address = published_address or ip_address
+        logger.info(
+            "Claw container started: %s address=%s container_ip=%s manus_api_base_url=%s",
+            container_name,
+            address,
+            ip_address,
+            manus_api_base_url,
+        )
+        return ClawInstanceInfo(address=address, instance_name=container_name)
 
     async def destroy(self, instance_name: Optional[str]) -> None:
         if not instance_name:

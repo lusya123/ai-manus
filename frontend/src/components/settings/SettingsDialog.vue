@@ -5,6 +5,7 @@
       <DialogDescription></DialogDescription>
       
       <SettingsTabs 
+        :key="tabsKey"
         :tabs="tabs" 
         :default-tab="defaultTab"
         :current-sub-page="currentSubPage"
@@ -24,6 +25,10 @@
         <template #settings>
           <GeneralSettings />
         </template>
+
+        <template #model>
+          <ModelSettings />
+        </template>
         
       </SettingsTabs>
       
@@ -32,8 +37,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
-import { UserRound, Settings2 } from 'lucide-vue-next'
+import { ref, watch } from 'vue'
+import { BrainCircuit, Settings2, UserRound } from 'lucide-vue-next'
 import {
   Dialog,
   DialogContent,
@@ -44,6 +49,7 @@ import { useSettingsDialog } from '@/composables/useSettingsDialog'
 import SettingsTabs from './SettingsTabs.vue'
 import AccountSettings from './AccountSettings.vue'
 import GeneralSettings from './GeneralSettings.vue'
+import ModelSettings from './ModelSettings.vue'
 import ProfileSettings from './ProfileSettings.vue'
 import type { TabItem, SubPageConfig } from './SettingsTabs.vue'
 
@@ -52,6 +58,14 @@ const { isSettingsDialogOpen, defaultTab } = useSettingsDialog()
 
 // Navigation state for sub-pages
 const currentSubPage = ref<string | null>(null)
+const tabsKey = ref(0)
+
+watch([isSettingsDialogOpen, defaultTab], ([isOpen]) => {
+  if (isOpen) {
+    currentSubPage.value = null
+    tabsKey.value += 1
+  }
+})
 
 // Tab configuration
 const tabs: TabItem[] = [
@@ -64,6 +78,11 @@ const tabs: TabItem[] = [
     id: 'settings',
     label: 'Settings',
     icon: Settings2
+  },
+  {
+    id: 'model',
+    label: 'Model',
+    icon: BrainCircuit
   }
 ]
 

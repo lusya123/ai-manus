@@ -219,7 +219,7 @@ JWT_REFRESH_TOKEN_EXPIRE_DAYS=7
 # Prefix for Claw container names
 #CLAW_NAME_PREFIX=manus-claw
 # Time-to-live for Claw containers in seconds (0 = unlimited)
-#CLAW_TTL_SECONDS=3600
+#CLAW_TTL_SECONDS=0
 # Docker network bridge name for Claw containers
 #CLAW_NETWORK=manus-network
 # Max seconds to wait for Claw container to become ready

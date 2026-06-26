@@ -117,7 +117,7 @@ Return format requirements:
 TypeScript Interface Definition:
 ```typescript
 interface Response {
-  /** Response to user's message and thinking about the task, as detailed as possible */
+  /** User-facing final response. Do not include hidden reasoning, private chain-of-thought, tool JSON, or scratchpad content. */
   message: string;
   /** Array of file paths in sandbox for generated files to be delivered to user */
   attachments: string[];

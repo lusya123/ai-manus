@@ -18,6 +18,19 @@ class ChatRequest(BaseModel):
     event_id: Optional[str] = None
 
 
+class AgentModelConfigRequest(BaseModel):
+    """Per-session model credentials imported from Sub2API."""
+    api_key: Optional[str] = None
+    api_base: Optional[str] = None
+    model_name: Optional[str] = None
+    model_provider: Optional[str] = None
+
+
+class CreateSessionRequest(BaseModel):
+    """Create session request schema"""
+    agent_model_config: Optional[AgentModelConfigRequest] = Field(default=None, alias="model_config")
+
+
 class ShellViewRequest(BaseModel):
     """Shell view request schema"""
     session_id: str

@@ -6,7 +6,7 @@
 
  * [x] Integrated [OpenClaw](https://github.com/anthropics/openclaw) AI assistant
  * [x] One-click deployment with per-user isolated containers
- * [x] Auto-expiry countdown
+ * [x] Persistent containers with optional expiry policy
  * [x] Full chat history (MongoDB + OpenClaw session merge)
  * [x] File upload and download
  * [x] OpenAI-compatible LLM proxy
@@ -43,4 +43,4 @@
  * [ ] Support e2b and other sandbox providers
  * [ ] Support mem0 memory providers
  * [ ] Replace background tasks with celery tasks
- * [ ] Enterprise-level security construction for sandbox 
+ * [ ] Enterprise-level security construction for sandbox

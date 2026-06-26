@@ -90,7 +90,7 @@ class Settings(BaseSettings):
     google_analytics_id: str | None = None
 
     # Auth configuration
-    auth_provider: str = "password"  # "password", "none", "local"
+    auth_provider: str = "none"  # "password", "none", "local", "sub2api"
     show_github_button: bool = True
     github_repository_url: str = "https://github.com/simpleyyt/ai-manus"
     password_salt: str | None = None
@@ -98,6 +98,14 @@ class Settings(BaseSettings):
     password_hash_algorithm: str = "pbkdf2_sha256"
     local_auth_email: str = "admin@example.com"
     local_auth_password: str = "admin"
+    sub2api_base_url: str | None = None
+    sub2api_login_url: str | None = None
+    sub2api_console_url: str | None = None
+    sub2api_marketplace_url: str | None = None
+    sub2api_use_token_url: str | None = None
+    sub2api_auth_me_path: str = "/api/v1/auth/me"
+    sub2api_auth_refresh_path: str = "/api/v1/auth/refresh"
+    sub2api_timeout_seconds: float = 10.0
     
     # Email configuration
     email_host: str | None = None  # "smtp.gmail.com"
@@ -119,12 +127,23 @@ class Settings(BaseSettings):
     claw_enabled: bool = True
     claw_image: str = "simpleyyt/manus-claw"
     claw_name_prefix: str = "manus-claw"
-    claw_ttl_seconds: int = 3600
+    claw_ttl_seconds: int = 0
     claw_network: str | None = None  # Docker network bridge name for claw containers
     claw_ready_timeout: int = 300  # Max seconds to wait for claw container to become ready
     claw_address: str | None = None  # If set, use this fixed host instead of creating Docker containers
     claw_api_key: str | None = None  # Static API key accepted by the LLM proxy (for dev/fixed container)
     manus_api_base_url: str = "http://backend:8000"  # URL of this backend accessible from claw containers
+    claw_publish_host_ports: bool = True
+    claw_host_bind_address: str = "127.0.0.1"
+    claw_http_container_port: int = 18788
+    claw_gateway_container_port: int = 18789
+    claw_max_instances_total: int = 20
+    claw_idle_timeout_seconds: int = 0
+    claw_cleanup_interval_seconds: int = 60
+    claw_destroy_on_delete: bool = True
+    claw_memory_limit: str | None = "1g"
+    claw_nano_cpus: int | None = 1_000_000_000
+    claw_pids_limit: int | None = 256
 
     # MCP configuration
     mcp_config_path: str = "/etc/mcp.json"

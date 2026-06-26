@@ -236,6 +236,8 @@ class EventMapper:
     
     @staticmethod
     async def event_to_sse_event(event: AgentEvent) -> Optional[AgentSSEEvent]:
+        if isinstance(event, (PlanEvent, StepEvent)):
+            return None
         if (
             isinstance(event, ToolEvent)
             and event.tool_name == "message"
@@ -263,6 +265,21 @@ class EventMapper:
     @staticmethod
     async def events_to_sse_events(events: List[AgentEvent]) -> List[AgentSSEEvent]:
         """Create SSE event list from event list"""
+        internal_messages: set[str] = set()
+        for event in events:
+            if isinstance(event, PlanEvent):
+                if event.plan.message:
+                    internal_messages.add(event.plan.message)
+                for step in event.plan.steps:
+                    if step.result:
+                        internal_messages.add(step.result)
+
         return list(filter(lambda x: x is not None, [
-            await EventMapper.event_to_sse_event(event) for event in events if event
+            await EventMapper.event_to_sse_event(event)
+            for event in events
+            if event and not (
+                isinstance(event, MessageEvent)
+                and event.role == "assistant"
+                and event.message in internal_messages
+            )
         ]))

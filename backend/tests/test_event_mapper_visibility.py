@@ -16,7 +16,7 @@ async def test_event_mapper_filters_message_notify_user_tool_events():
     assert await EventMapper.events_to_sse_events([event]) == []
 
 
-async def test_event_mapper_filters_internal_plan_step_and_derived_messages():
+async def test_event_mapper_filters_internal_plan_messages_and_preserves_step_results():
     step = Step(
         id="1",
         description="Internal execution step",
@@ -37,6 +37,7 @@ async def test_event_mapper_filters_internal_plan_step_and_derived_messages():
 
     mapped = await EventMapper.events_to_sse_events(events)
 
-    assert [event.event for event in mapped] == ["message", "message"]
+    assert [event.event for event in mapped] == ["message", "message", "message"]
     assert mapped[0].data.content == "hello"
-    assert mapped[1].data.content == "visible final answer"
+    assert mapped[1].data.content == "internal step result"
+    assert mapped[2].data.content == "visible final answer"

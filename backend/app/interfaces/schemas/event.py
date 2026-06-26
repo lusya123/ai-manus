@@ -270,9 +270,6 @@ class EventMapper:
             if isinstance(event, PlanEvent):
                 if event.plan.message:
                     internal_messages.add(event.plan.message)
-                for step in event.plan.steps:
-                    if step.result:
-                        internal_messages.add(step.result)
 
         return list(filter(lambda x: x is not None, [
             await EventMapper.event_to_sse_event(event)

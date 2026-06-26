@@ -235,7 +235,14 @@ class EventMapper:
         return mapping
     
     @staticmethod
-    async def event_to_sse_event(event: AgentEvent) -> AgentSSEEvent:
+    async def event_to_sse_event(event: AgentEvent) -> Optional[AgentSSEEvent]:
+        if (
+            isinstance(event, ToolEvent)
+            and event.tool_name == "message"
+            and event.function_name == "message_notify_user"
+        ):
+            return None
+
         # Get mapping dynamically
         event_type_mapping = EventMapper._get_event_type_mapping()
         

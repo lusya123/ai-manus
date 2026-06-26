@@ -71,10 +71,10 @@ class ExecutionAgent(BaseAgent):
                 step.result = new_step.result
                 step.attachments = new_step.attachments
                 yield StepEvent(status=StepStatus.COMPLETED, step=step)
-                if step.result:
-                    yield MessageEvent(message=step.result)
                 continue
             elif isinstance(event, ToolEvent):
+                if event.function_name == "message_notify_user":
+                    continue
                 if event.function_name == "message_ask_user":
                     if event.status == ToolStatus.CALLING:
                         yield MessageEvent(message=event.function_args.get("text", ""))

@@ -7,6 +7,7 @@ import { preview } from "vite";
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.SMOKE_PORT || 4173);
 const BASE_URL = `http://${HOST}:${PORT}`;
+const ROUTES_TO_VERIFY = ["/", "/chat", "/chat/claw"];
 
 function findChromeExecutable() {
   const candidates = [
@@ -87,6 +88,36 @@ async function installApiMocks(page) {
       return;
     }
 
+    if (url.pathname === "/api/v1/claw") {
+      if (request.method() === "GET") {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            code: 0,
+            msg: "success",
+            data: {
+              id: "smoke-claw",
+              user_id: "smoke-user",
+              status: "stopped",
+              created_at: "2026-01-01T00:00:00Z",
+              updated_at: "2026-01-01T00:00:00Z",
+            },
+          }),
+        });
+        return;
+      }
+
+      if (request.method() === "DELETE") {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({ code: 0, msg: "success", data: {} }),
+        });
+        return;
+      }
+    }
+
     await route.fulfill({
       status: 404,
       contentType: "application/json",
@@ -107,6 +138,7 @@ async function main() {
   const consoleErrors = [];
   const pageErrors = [];
   const requestFailures = [];
+  const checkedRoutes = [];
   let browser;
 
   try {
@@ -116,46 +148,62 @@ async function main() {
       ...(executablePath ? { executablePath } : {}),
     });
 
-    const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
-    await installApiMocks(page);
+    for (const routePath of ROUTES_TO_VERIFY) {
+      const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+      await installApiMocks(page);
 
-    page.on("console", (message) => {
-      if (message.type() === "error") {
-        consoleErrors.push(message.text());
-      }
-    });
-    page.on("pageerror", (error) => {
-      pageErrors.push(error.stack || error.message);
-    });
-    page.on("requestfailed", (request) => {
-      requestFailures.push(`${request.method()} ${request.url()} ${request.failure()?.errorText || ""}`.trim());
-    });
+      page.on("console", (message) => {
+        if (message.type() === "error") {
+          consoleErrors.push(`[${routePath}] ${message.text()}`);
+        }
+      });
+      page.on("pageerror", (error) => {
+        pageErrors.push(`[${routePath}] ${error.stack || error.message}`);
+      });
+      page.on("requestfailed", (request) => {
+        requestFailures.push(
+          `[${routePath}] ${request.method()} ${request.url()} ${request.failure()?.errorText || ""}`.trim(),
+        );
+      });
 
-    await page.goto(BASE_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
-    await page.waitForFunction(
-      () => {
-        const app = document.querySelector("#app");
-        return Boolean(app && app.childElementCount > 0 && document.body.innerText.trim().length > 0);
-      },
-      { timeout: 20_000 },
-    );
+      await page.goto(`${BASE_URL}${routePath}`, { waitUntil: "domcontentloaded", timeout: 30_000 });
+      await page.waitForFunction(
+        () => {
+          const app = document.querySelector("#app");
+          const bodyText = document.body.innerText.trim();
+          if (!app || app.childElementCount === 0 || bodyText.length === 0) {
+            return false;
+          }
+          if (window.location.pathname === "/chat/claw") {
+            return bodyText.includes("OpenClaw");
+          }
+          return true;
+        },
+        { timeout: 20_000 },
+      );
 
-    const state = await page.evaluate(() => {
-      const app = document.querySelector("#app");
-      return {
-        title: document.title,
-        readyState: document.readyState,
-        bodyText: document.body.innerText.slice(0, 500),
-        appChildCount: app?.childElementCount ?? 0,
-      };
-    });
+      checkedRoutes.push(
+        await page.evaluate(() => {
+          const app = document.querySelector("#app");
+          return {
+            path: window.location.pathname,
+            title: document.title,
+            readyState: document.readyState,
+            bodyText: document.body.innerText.slice(0, 500),
+            appChildCount: app?.childElementCount ?? 0,
+          };
+        }),
+      );
+
+      await page.close();
+    }
 
     if (pageErrors.length || consoleErrors.length || requestFailures.length) {
-      throw new Error(JSON.stringify({ state, pageErrors, consoleErrors, requestFailures }, null, 2));
+      throw new Error(JSON.stringify({ checkedRoutes, pageErrors, consoleErrors, requestFailures }, null, 2));
     }
 
     console.log("Production frontend smoke test passed");
-    console.log(JSON.stringify(state, null, 2));
+    console.log(JSON.stringify(checkedRoutes, null, 2));
   } catch (error) {
     if (browser) {
       const [page] = browser.contexts()[0]?.pages() || [];
@@ -164,7 +212,7 @@ async function main() {
         await page.screenshot({ path: screenshotPath, fullPage: false }).catch(() => {});
         await writeFile(
           join(process.cwd(), "smoke-prod-failure.json"),
-          JSON.stringify({ pageErrors, consoleErrors, requestFailures }, null, 2),
+          JSON.stringify({ checkedRoutes, pageErrors, consoleErrors, requestFailures }, null, 2),
         ).catch(() => {});
         console.error(`Saved smoke failure artifacts to ${screenshotPath}`);
       }

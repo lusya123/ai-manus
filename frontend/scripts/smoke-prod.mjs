@@ -1,0 +1,181 @@
+import { existsSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { chromium } from "playwright-core";
+import { preview } from "vite";
+
+const HOST = "127.0.0.1";
+const PORT = Number(process.env.SMOKE_PORT || 4173);
+const BASE_URL = `http://${HOST}:${PORT}`;
+
+function findChromeExecutable() {
+  const candidates = [
+    process.env.CHROME_PATH,
+    process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/chromium",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+  ].filter(Boolean);
+
+  return candidates.find((candidate) => existsSync(candidate));
+}
+
+function frontendConfigResponse() {
+  return {
+    code: 0,
+    msg: "success",
+    data: {
+      auth_provider: "none",
+      sub2api_login_url: null,
+      sub2api_console_url: null,
+      sub2api_marketplace_url: null,
+      sub2api_use_token_url: null,
+      show_github_button: true,
+      github_repository_url: "https://github.com/simpleyyt/ai-manus",
+      google_analytics_id: null,
+      claw_enabled: true,
+      default_model: {
+        id: "system-default",
+        label: "System Default",
+        model_name: "default",
+        model_provider: "openai",
+        api_base: null,
+      },
+      available_models: [],
+    },
+  };
+}
+
+async function installApiMocks(page) {
+  await page.route("**/api/**", async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+
+    if (url.pathname === "/api/v1/config/frontend") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(frontendConfigResponse()),
+      });
+      return;
+    }
+
+    if (url.pathname === "/api/v1/sessions") {
+      if (request.method() === "GET") {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            code: 0,
+            msg: "success",
+            data: { sessions: [] },
+          }),
+        });
+        return;
+      }
+
+      await route.fulfill({
+        status: 200,
+        contentType: "text/event-stream",
+        body: "event: sessions\ndata: {\"sessions\":[]}\n\n",
+      });
+      return;
+    }
+
+    await route.fulfill({
+      status: 404,
+      contentType: "application/json",
+      body: JSON.stringify({ code: 404, msg: "not mocked", data: null }),
+    });
+  });
+}
+
+async function main() {
+  const server = await preview({
+    preview: {
+      host: HOST,
+      port: PORT,
+      strictPort: true,
+    },
+  });
+
+  const consoleErrors = [];
+  const pageErrors = [];
+  const requestFailures = [];
+  let browser;
+
+  try {
+    const executablePath = findChromeExecutable();
+    browser = await chromium.launch({
+      headless: true,
+      ...(executablePath ? { executablePath } : {}),
+    });
+
+    const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+    await installApiMocks(page);
+
+    page.on("console", (message) => {
+      if (message.type() === "error") {
+        consoleErrors.push(message.text());
+      }
+    });
+    page.on("pageerror", (error) => {
+      pageErrors.push(error.stack || error.message);
+    });
+    page.on("requestfailed", (request) => {
+      requestFailures.push(`${request.method()} ${request.url()} ${request.failure()?.errorText || ""}`.trim());
+    });
+
+    await page.goto(BASE_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    await page.waitForFunction(
+      () => {
+        const app = document.querySelector("#app");
+        return Boolean(app && app.childElementCount > 0 && document.body.innerText.trim().length > 0);
+      },
+      { timeout: 20_000 },
+    );
+
+    const state = await page.evaluate(() => {
+      const app = document.querySelector("#app");
+      return {
+        title: document.title,
+        readyState: document.readyState,
+        bodyText: document.body.innerText.slice(0, 500),
+        appChildCount: app?.childElementCount ?? 0,
+      };
+    });
+
+    if (pageErrors.length || consoleErrors.length || requestFailures.length) {
+      throw new Error(JSON.stringify({ state, pageErrors, consoleErrors, requestFailures }, null, 2));
+    }
+
+    console.log("Production frontend smoke test passed");
+    console.log(JSON.stringify(state, null, 2));
+  } catch (error) {
+    if (browser) {
+      const [page] = browser.contexts()[0]?.pages() || [];
+      if (page) {
+        const screenshotPath = join(process.cwd(), "smoke-prod-failure.png");
+        await page.screenshot({ path: screenshotPath, fullPage: false }).catch(() => {});
+        await writeFile(
+          join(process.cwd(), "smoke-prod-failure.json"),
+          JSON.stringify({ pageErrors, consoleErrors, requestFailures }, null, 2),
+        ).catch(() => {});
+        console.error(`Saved smoke failure artifacts to ${screenshotPath}`);
+      }
+    }
+    throw error;
+  } finally {
+    if (browser) {
+      await browser.close();
+    }
+    await new Promise((resolve) => server.httpServer.close(resolve));
+  }
+}
+
+await main();

@@ -50,7 +50,7 @@ export interface ClawChatMessage {
 // ---- REST endpoints ----
 
 export async function getClaw(): Promise<Claw> {
-  const response = await apiClient.get<ApiResponse<Claw>>('/claw');
+  const response = await apiClient.get<ApiResponse<Claw>>('/claw', { __suppressErrorLog: true } as any);
   return response.data.data;
 }
 

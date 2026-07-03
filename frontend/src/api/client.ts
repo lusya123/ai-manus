@@ -232,7 +232,9 @@ apiClient.interceptors.response.use(
       apiError.message = 'Network error, please check your connection';
     }
 
-    console.error('API Error:', apiError);
+    if (!originalRequest.__suppressErrorLog) {
+      console.error('API Error:', apiError);
+    }
     return Promise.reject(apiError);
   }
 ); 

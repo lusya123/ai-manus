@@ -24,7 +24,7 @@
                     <button v-if="!isRunning || sendEnabled || hideStopButton"
                         class="whitespace-nowrap text-sm font-medium focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 text-primary-foreground hover:bg-primary/90 p-0 w-8 h-8 rounded-full flex items-center justify-center transition-colors hover:opacity-90"
                         :class="!sendEnabled ? 'cursor-not-allowed bg-[var(--fill-tsp-white-dark)]' : 'cursor-pointer bg-[var(--Button-primary-black)]'"
-                        @click="handleSubmit">
+                        @click="handleSubmit()">
                         <SendIcon :disabled="!sendEnabled" />
                     </button>
                     <button v-else-if="!hideStopButton" @click="handleStop"
@@ -39,7 +39,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch, computed } from 'vue';
+import { ref, computed } from 'vue';
 import SendIcon from './icons/SendIcon.vue';
 import { useI18n } from 'vue-i18n';
 import ChatBoxFiles from './ChatBoxFiles.vue';
@@ -47,7 +47,6 @@ import { Paperclip } from 'lucide-vue-next';
 import type { FileInfo } from '../api/file';
 
 const { t } = useI18n();
-const hasTextInput = ref(false);
 const isComposing = ref(false);
 const chatBoxFileListRef = ref();
 
@@ -60,14 +59,17 @@ const props = defineProps<{
     allowSendFilesOnly?: boolean;
 }>();
 
-const sendEnabled = computed(() => {
+const canSubmit = (draftValue = props.modelValue) => {
+    const hasTextInput = draftValue.trim() !== '';
     const hasFiles = (props.attachments?.length ?? 0) > 0;
     const allUploaded = chatBoxFileListRef.value?.isAllUploaded ?? true;
     if (props.allowSendFilesOnly) {
-        return hasTextInput.value || (hasFiles && allUploaded);
+        return hasTextInput || (hasFiles && allUploaded);
     }
-    return hasTextInput.value && (!hasFiles || allUploaded);
-});
+    return hasTextInput && (!hasFiles || allUploaded);
+};
+
+const sendEnabled = computed(() => canSubmit());
 
 const emit = defineEmits<{
     (e: 'update:modelValue', value: string): void;
@@ -76,20 +78,23 @@ const emit = defineEmits<{
 }>();
 
 const handleEnterKeydown = (event: KeyboardEvent) => {
-    if (isComposing.value) {
+    if (isComposing.value || event.isComposing) {
         // If in input method composition state, do nothing and allow default behavior
         return;
     }
 
+    const currentValue = (event.currentTarget as HTMLTextAreaElement | null)?.value ?? props.modelValue;
+
     // Not in input method composition state and has text input, prevent default behavior and submit
-    if (sendEnabled.value) {
+    if (canSubmit(currentValue)) {
         event.preventDefault();
-        handleSubmit();
+        emit('update:modelValue', currentValue);
+        handleSubmit(currentValue);
     }
 };
 
-const handleSubmit = () => {
-    if (!sendEnabled.value) return;
+const handleSubmit = (draftValue = props.modelValue) => {
+    if (!canSubmit(draftValue)) return;
     emit('submit');
 };
 
@@ -101,7 +106,4 @@ const uploadFile = () => {
     chatBoxFileListRef.value?.uploadFile();
 };
 
-watch(() => props.modelValue, (value) => {
-    hasTextInput.value = value.trim() !== '';
-});
 </script>

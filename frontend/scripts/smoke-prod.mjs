@@ -80,10 +80,32 @@ async function installApiMocks(page) {
         return;
       }
 
+      if (request.method() === "PUT") {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            code: 0,
+            msg: "success",
+            data: { session_id: "smoke-session" },
+          }),
+        });
+        return;
+      }
+
       await route.fulfill({
         status: 200,
         contentType: "text/event-stream",
         body: "event: sessions\ndata: {\"sessions\":[]}\n\n",
+      });
+      return;
+    }
+
+    if (url.pathname === "/api/v1/sessions/smoke-session/chat" && request.method() === "POST") {
+      await route.fulfill({
+        status: 200,
+        contentType: "text/event-stream",
+        body: "",
       });
       return;
     }
@@ -124,6 +146,44 @@ async function installApiMocks(page) {
       body: JSON.stringify({ code: 404, msg: "not mocked", data: null }),
     });
   });
+}
+
+async function verifyEnterSubmits(browser, consoleErrors, pageErrors, requestFailures) {
+  const routePath = "/ enter-submit";
+  const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+  await installApiMocks(page);
+
+  page.on("console", (message) => {
+    if (message.type() === "error") {
+      consoleErrors.push(`[${routePath}] ${message.text()}`);
+    }
+  });
+  page.on("pageerror", (error) => {
+    pageErrors.push(`[${routePath}] ${error.stack || error.message}`);
+  });
+  page.on("requestfailed", (request) => {
+    requestFailures.push(
+      `[${routePath}] ${request.method()} ${request.url()} ${request.failure()?.errorText || ""}`.trim(),
+    );
+  });
+
+  const draft = "smoke enter submit";
+  await page.goto(BASE_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
+  await page.locator("textarea").fill(draft);
+  await page.locator("textarea").press("Enter");
+  await page.waitForURL(`${BASE_URL}/chat/smoke-session`, { timeout: 20_000 });
+  await page.waitForFunction(
+    (expectedText) => document.body.innerText.includes(expectedText),
+    draft,
+    { timeout: 20_000 },
+  );
+
+  const state = await page.evaluate(() => ({
+    path: window.location.pathname,
+    bodyText: document.body.innerText.slice(0, 500),
+  }));
+  await page.close();
+  return state;
 }
 
 async function main() {
@@ -197,6 +257,8 @@ async function main() {
 
       await page.close();
     }
+
+    checkedRoutes.push(await verifyEnterSubmits(browser, consoleErrors, pageErrors, requestFailures));
 
     if (pageErrors.length || consoleErrors.length || requestFailures.length) {
       throw new Error(JSON.stringify({ checkedRoutes, pageErrors, consoleErrors, requestFailures }, null, 2));

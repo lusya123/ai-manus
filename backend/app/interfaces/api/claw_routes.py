@@ -238,6 +238,10 @@ async def claw_ws(websocket: WebSocket, token: str | None = None):
             pending = claw_service.get_pending_content(user.id)
             if pending:
                 await websocket.send_json({"type": "catchup", "content": pending})
+            else:
+                pending_thinking = claw_service.get_pending_thinking_content(user.id)
+                if pending_thinking:
+                    await websocket.send_json({"type": "thinking", "content": pending_thinking})
 
             while True:
                 try:

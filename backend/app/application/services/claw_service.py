@@ -288,6 +288,13 @@ class ClawService:
             return state.pending_text
         return None
 
+    def get_pending_thinking_content(self, user_id: str) -> Optional[str]:
+        """Return accumulated thinking text when no final answer is visible yet."""
+        state = self._chat_states.get(user_id)
+        if state and not state.pending_text and state.pending_thinking:
+            return state.pending_thinking
+        return None
+
     def is_processing(self, user_id: str) -> bool:
         return user_id in self._chat_states
 

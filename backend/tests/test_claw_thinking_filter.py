@@ -1,4 +1,4 @@
-from app.application.services.claw_service import ClawService
+from app.application.services.claw_service import ClawService, _ChatState
 from app.domain.models.claw import ClawMessage
 from app.domain.services.claw_domain_service import ClawDomainService
 
@@ -35,6 +35,17 @@ async def test_claw_stream_sends_temporary_thinking_then_visible_text():
         {"type": "text", "content": " answer"},
         {"type": "done", "stop_reason": "end_turn"},
     ]
+
+
+def test_claw_service_exposes_pending_thinking_before_visible_answer():
+    service = ClawService(FakeDomain())
+    state = service._chat_states["user-1"] = _ChatState()
+    state.pending_thinking = "private"
+
+    assert service.get_pending_thinking_content("user-1") == "private"
+
+    state.pending_text = "visible"
+    assert service.get_pending_thinking_content("user-1") is None
 
 
 def test_claw_history_sanitizes_stored_thinking_messages():

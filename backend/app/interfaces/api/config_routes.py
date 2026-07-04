@@ -2,7 +2,7 @@ from fastapi import APIRouter
 
 from app.core.config import get_settings
 from app.interfaces.schemas.base import APIResponse
-from app.interfaces.schemas.config import ClientConfigResponse
+from app.interfaces.schemas.config import ClientConfigResponse, ModelOptionResponse
 
 router = APIRouter(prefix="/config", tags=["config"])
 
@@ -24,5 +24,22 @@ async def get_frontend_config() -> APIResponse[ClientConfigResponse]:
             github_repository_url=settings.github_repository_url,
             google_analytics_id=settings.google_analytics_id,
             claw_enabled=settings.claw_enabled,
+            default_model=ModelOptionResponse(
+                id="system-default",
+                label=settings.model_name,
+                model_name=settings.model_name,
+                model_provider=settings.model_provider,
+                api_base=settings.api_base,
+            ),
+            available_models=[
+                ModelOptionResponse(
+                    id=model.id,
+                    label=model.label,
+                    model_name=model.model_name,
+                    model_provider=model.model_provider,
+                    api_base=model.api_base,
+                )
+                for model in settings.available_models
+            ],
         )
     )

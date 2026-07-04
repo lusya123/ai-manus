@@ -93,6 +93,12 @@
                 class="p-[5px] flex items-center justify-center hover:bg-[var(--fill-tsp-white-dark)] rounded-lg cursor-pointer">
                 <FileSearch class="text-[var(--icon-secondary)]" :size="18" />
               </button>
+              <button @click="handleWorkspaceShow"
+                class="h-8 px-2 sm:px-3 rounded-lg inline-flex items-center gap-1.5 hover:bg-[var(--fill-tsp-white-dark)] cursor-pointer border border-[var(--border-btn-main)] bg-[var(--background-white-main)]"
+                :title="t('Open Manus workspace')">
+                <Monitor class="text-[var(--icon-secondary)]" :size="18" />
+                <span class="text-[var(--text-secondary)] text-sm font-medium whitespace-nowrap">{{ t('Workspace') }}</span>
+              </button>
             </div>
           </div>
           <div class="w-full flex justify-between items-center">
@@ -116,8 +122,18 @@
             <ArrowDown class="text-[var(--icon-primary)]" :size="20" />
           </button>
           <PlanPanel v-if="plan && plan.steps.length > 0" :plan="plan" />
-          <ChatBox v-model="inputMessage" :rows="1" @submit="handleSubmit" :isRunning="isLoading" @stop="handleStop"
-            :attachments="attachments" />
+          <ChatBox
+            v-model="inputMessage"
+            :rows="1"
+            :selected-model-id="selectedModelId"
+            :model-options="modelOptions"
+            show-model-picker
+            model-picker-disabled
+            @submit="handleSubmit"
+            :isRunning="isLoading"
+            @stop="handleStop"
+            :attachments="attachments"
+          />
         </div>
       </div>
     </div>
@@ -147,9 +163,9 @@ import {
 } from '../types/event';
 import ToolPanel from '../components/ToolPanel.vue'
 import PlanPanel from '../components/PlanPanel.vue';
-import { ArrowDown, FileSearch, PanelLeft, Lock, Globe, Link, Check } from 'lucide-vue-next';
+import { ArrowDown, FileSearch, PanelLeft, Lock, Globe, Link, Check, Monitor } from 'lucide-vue-next';
 import ShareIcon from '@/components/icons/ShareIcon.vue';
-import { showErrorToast, showSuccessToast } from '../utils/toast';
+import { showErrorToast, showInfoToast, showSuccessToast } from '../utils/toast';
 import type { FileInfo } from '../api/file';
 import { useLeftPanel } from '../composables/useLeftPanel'
 import { useSessionFileList } from '../composables/useSessionFileList'
@@ -158,6 +174,21 @@ import { copyToClipboard } from '../utils/dom'
 import { SessionStatus } from '../types/response';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import LoadingIndicator from '@/components/ui/LoadingIndicator.vue';
+import { getCachedClientConfig } from '@/api/config';
+import {
+  buildChatModelOptions,
+  CURRENT_SESSION_MODEL_ID,
+  resolveModelIdForConfig,
+  SYSTEM_MODEL_ID,
+} from '@/api/agentConfig';
+import type { ChatModelOption } from '@/api/agentConfig';
+
+type SessionModelDisplayConfig = {
+  model_id?: string | null;
+  api_base?: string | null;
+  model_name?: string | null;
+  model_provider?: string | null;
+};
 
 const router = useRouter()
 const { t } = useI18n()
@@ -216,6 +247,37 @@ const toolPanel = ref<InstanceType<typeof ToolPanel>>()
 const simpleBarRef = ref<InstanceType<typeof SimpleBar>>();
 const observerRef = ref<HTMLDivElement>();
 const chatContainerRef = ref<HTMLDivElement>();
+const modelOptions = ref<ChatModelOption[]>([]);
+const selectedModelId = ref(SYSTEM_MODEL_ID);
+
+const loadModelOptions = async () => {
+  const clientConfig = await getCachedClientConfig();
+  modelOptions.value = buildChatModelOptions(clientConfig);
+};
+
+const addCurrentSessionModelOption = (modelConfig: SessionModelDisplayConfig | null | undefined) => {
+  if (!modelConfig?.model_name) {
+    return;
+  }
+  if (modelOptions.value.some((option) => option.id === CURRENT_SESSION_MODEL_ID)) {
+    return;
+  }
+  modelOptions.value.push({
+    id: CURRENT_SESSION_MODEL_ID,
+    label: modelConfig.model_name,
+    model_name: modelConfig.model_name,
+    model_provider: modelConfig.model_provider || '',
+    api_base: modelConfig.api_base || null,
+  });
+};
+
+const syncSelectedSessionModel = (modelConfig: SessionModelDisplayConfig | null | undefined) => {
+  const nextModelId = resolveModelIdForConfig(modelConfig, modelOptions.value);
+  if (nextModelId === CURRENT_SESSION_MODEL_ID) {
+    addCurrentSessionModelOption(modelConfig);
+  }
+  selectedModelId.value = nextModelId;
+};
 
 // Reset all refs to their initial values
 const resetState = () => {
@@ -448,6 +510,7 @@ const restoreSession = async () => {
     return;
   }
   const session = await agentApi.getSession(sessionId.value);
+  syncSelectedSessionModel(session.model_config);
   // Initialize share mode based on session state
   shareMode.value = session.is_shared ? 'public' : 'private';
   realTime.value = false;
@@ -483,8 +546,13 @@ onBeforeRouteUpdate((to, _, next) => {
 })
 
 // Initialize active conversation
-onMounted(() => {
+onMounted(async () => {
   hideFilePanel();
+  const initialModelId = history.state?.modelId;
+  await loadModelOptions();
+  if (typeof initialModelId === 'string') {
+    selectedModelId.value = initialModelId;
+  }
   const routeParams = router.currentRoute.value.params;
   if (routeParams.sessionId) {
     // If sessionId is included in URL, use it directly
@@ -558,6 +626,16 @@ const handleStop = () => {
 
 const handleFileListShow = () => {
   showSessionFileList()
+}
+
+const handleWorkspaceShow = () => {
+  if (!lastNoMessageTool.value) {
+    showInfoToast(t('No Manus workspace yet'));
+    return;
+  }
+  const live = isLiveTool(lastNoMessageTool.value);
+  realTime.value = live;
+  toolPanel.value?.showToolPanel(lastNoMessageTool.value, live);
 }
 
 // Share functionality handlers

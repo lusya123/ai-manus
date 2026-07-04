@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, RootModel, field_validator
+from pydantic import BaseModel, Field, RootModel, model_validator
 from typing import ClassVar, Dict, Any, Literal, Optional, Union, List, get_args
 from datetime import datetime
 import time
@@ -6,8 +6,12 @@ import uuid
 from enum import Enum
 from app.domain.models.plan import Plan, Step
 from app.domain.models.file import FileInfo
-import json
 from app.domain.models.search import SearchResultItem
+from app.domain.utils.model_output import (
+    HIDDEN_CONTENT_TYPES,
+    VISIBLE_CONTENT_TYPES,
+    normalize_model_content,
+)
 
 
 class PlanStatus(str, Enum):
@@ -111,64 +115,25 @@ class MessageEvent(BaseEvent):
     message: str
     attachments: Optional[List[FileInfo]] = None
 
-    _VISIBLE_CONTENT_TYPES: ClassVar[set[str]] = {"text"}
-    _HIDDEN_CONTENT_TYPES: ClassVar[set[str]] = {
-        "thinking",
-        "reasoning",
-        "redacted_thinking",
-        "reasoning_content",
-        "signature",
-        "tool_use",
-    }
+    _VISIBLE_CONTENT_TYPES: ClassVar[set[str]] = VISIBLE_CONTENT_TYPES
+    _HIDDEN_CONTENT_TYPES: ClassVar[set[str]] = HIDDEN_CONTENT_TYPES
 
-    @field_validator("message", mode="before")
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_event_message(cls, data: Any) -> Any:
+        if not isinstance(data, dict) or "message" not in data:
+            return data
+        if data.get("role") == "user" and isinstance(data["message"], str):
+            return data
+        return {
+            **data,
+            "message": cls.normalize_message(data["message"]),
+        }
+
     @classmethod
     def normalize_message(cls, value: Any) -> str:
         """Normalize model content blocks to plain text for SSE/storage events."""
-        if value is None:
-            return ""
-        if isinstance(value, str):
-            return value
-        if isinstance(value, list):
-            parts: list[str] = []
-            for item in value:
-                if isinstance(item, str):
-                    parts.append(item)
-                elif isinstance(item, dict):
-                    item_type = item.get("type")
-                    if item_type in cls._HIDDEN_CONTENT_TYPES:
-                        continue
-                    if item_type and item_type not in cls._VISIBLE_CONTENT_TYPES:
-                        continue
-                    if isinstance(item.get("text"), str):
-                        parts.append(item["text"])
-                    elif "content" in item:
-                        parts.append(cls.normalize_message(item["content"]))
-                    else:
-                        parts.append(json.dumps(item, ensure_ascii=False))
-                else:
-                    item_type = getattr(item, "type", None)
-                    if item_type in cls._HIDDEN_CONTENT_TYPES:
-                        continue
-                    if item_type and item_type not in cls._VISIBLE_CONTENT_TYPES:
-                        continue
-                    if hasattr(item, "text") and isinstance(item.text, str):
-                        parts.append(item.text)
-                    else:
-                        parts.append(str(item))
-            return "\n".join(part for part in parts if part)
-        if isinstance(value, dict):
-            value_type = value.get("type")
-            if value_type in cls._HIDDEN_CONTENT_TYPES:
-                return ""
-            if value_type and value_type not in cls._VISIBLE_CONTENT_TYPES:
-                return ""
-            if isinstance(value.get("text"), str):
-                return value["text"]
-            if "content" in value:
-                return cls.normalize_message(value["content"])
-            return json.dumps(value, ensure_ascii=False)
-        return str(value)
+        return normalize_model_content(value)
 
 class DoneEvent(BaseEvent):
     """Done event"""

@@ -27,6 +27,12 @@ export default {
   'Manus Computer': 'Manus 的电脑',
   'Manus is using': 'Manus 正在使用',
   'Jump to live': '跳到实时',
+  'Workspace': '工作台',
+  'Open workspace': '打开工作台',
+  'Open Manus workspace': '打开 Manus 工作台',
+  'Hide workspace': '收起工作台',
+  'No Manus workspace yet': '还没有可打开的 Manus 工作台，等 Manus 使用工具后就能点这里打开',
+  'Open file': '打开文件',
   'Failed to load file content': '加载文件内容失败',
   'Give Manus a task to work on...': '给 Manus 一个任务...',
   // Shell tools

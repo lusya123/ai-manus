@@ -10,6 +10,16 @@ export interface ClientConfigResponse {
   github_repository_url: string
   google_analytics_id: string | null
   claw_enabled: boolean
+  default_model: ModelOptionResponse
+  available_models: ModelOptionResponse[]
+}
+
+export interface ModelOptionResponse {
+  id: string
+  label: string
+  model_name: string
+  model_provider: string
+  api_base: string | null
 }
 
 let clientConfigCache: ClientConfigResponse | null = null

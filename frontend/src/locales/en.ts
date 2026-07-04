@@ -27,6 +27,12 @@ export default {
   'Manus Computer': 'Manus Computer',
   'Manus is using': 'Manus is using',
   'Jump to live': 'Jump to live',
+  'Workspace': 'Workspace',
+  'Open workspace': 'Open workspace',
+  'Open Manus workspace': 'Open Manus workspace',
+  'Hide workspace': 'Hide workspace',
+  'No Manus workspace yet': 'No Manus workspace is available yet. It will appear here after Manus uses a tool.',
+  'Open file': 'Open file',
   'Failed to load file content': 'Failed to load file content',
   'Give Manus a task to work on...': 'Give Manus a task to work on...',
   // Shell tools

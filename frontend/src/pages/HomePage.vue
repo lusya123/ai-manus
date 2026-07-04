@@ -62,7 +62,17 @@
           <div class="flex flex-col bg-[var(--background-gray-main)] w-full">
             <div class="[&amp;:not(:empty)]:pb-2 bg-[var(--background-gray-main)] rounded-[22px_22px_0px_0px]">
             </div>
-            <ChatBox :rows="2" v-model="message" @submit="handleSubmit" :isRunning="false" :attachments="attachments" />
+            <ChatBox
+              :rows="2"
+              v-model="message"
+              :selected-model-id="selectedModelId"
+              :model-options="modelOptions"
+              show-model-picker
+              @update:selectedModelId="handleModelChange"
+              @submit="handleSubmit"
+              :isRunning="false"
+              :attachments="attachments"
+            />
           </div>
         </div>
       </div>
@@ -86,6 +96,15 @@ import { useFilePanel } from '../composables/useFilePanel';
 import { useAuth } from '../composables/useAuth';
 import { getCachedClientConfig } from '../api/config';
 import UserMenu from '../components/UserMenu.vue';
+import {
+  buildChatModelOptions,
+  ensureSelectedModelId,
+  getModelConfigForSelection,
+  getSavedSelectedModelId,
+  getStoredAgentConfig,
+  saveSelectedModelId,
+} from '../api/agentConfig';
+import type { ChatModelOption } from '../api/agentConfig';
 
 const { t } = useI18n();
 const router = useRouter();
@@ -97,6 +116,8 @@ const { hideFilePanel } = useFilePanel();
 const { currentUser } = useAuth();
 const showGithubButton = ref(false);
 const githubRepositoryUrl = ref('https://github.com/simpleyyt/ai-manus');
+const modelOptions = ref<ChatModelOption[]>([]);
+const selectedModelId = ref(getSavedSelectedModelId());
 
 // Get first letter of user's fullname for avatar display
 const avatarLetter = computed(() => {
@@ -158,7 +179,15 @@ onMounted(async () => {
     showGithubButton.value = clientConfig.show_github_button;
     githubRepositoryUrl.value = clientConfig.github_repository_url;
   }
+  modelOptions.value = buildChatModelOptions(clientConfig);
+  const storedModelId = getStoredAgentConfig()?.model_id;
+  selectedModelId.value = ensureSelectedModelId(storedModelId || selectedModelId.value, modelOptions.value);
 });
+
+const handleModelChange = (modelId: string) => {
+  selectedModelId.value = ensureSelectedModelId(modelId, modelOptions.value);
+  saveSelectedModelId(selectedModelId.value);
+};
 
 const handleSubmit = async () => {
   if (message.value.trim() && !isSubmitting.value) {
@@ -166,13 +195,14 @@ const handleSubmit = async () => {
 
     try {
       // Create new Agent
-      const session = await createSession();
+      const session = await createSession(getModelConfigForSelection(selectedModelId.value, modelOptions.value));
       const sessionId = session.session_id;
 
       // Navigate to new route with session_id, passing initial message via state
       router.push({
         path: `/chat/${sessionId}`,
         state: {
+          modelId: selectedModelId.value,
           message: message.value, files: attachments.value.map((file: FileInfo) => ({
             file_id: file.file_id,
             filename: file.filename,

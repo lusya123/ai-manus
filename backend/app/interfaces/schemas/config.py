@@ -1,6 +1,15 @@
 from pydantic import BaseModel
 
 
+class ModelOptionResponse(BaseModel):
+    """Model option exposed to the frontend model picker."""
+    id: str
+    label: str
+    model_name: str
+    model_provider: str
+    api_base: str | None = None
+
+
 class ClientConfigResponse(BaseModel):
     """Client runtime configuration response schema"""
     auth_provider: str
@@ -12,3 +21,5 @@ class ClientConfigResponse(BaseModel):
     github_repository_url: str
     google_analytics_id: str | None = None
     claw_enabled: bool
+    default_model: ModelOptionResponse
+    available_models: list[ModelOptionResponse]

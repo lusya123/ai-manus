@@ -14,13 +14,14 @@ from app.interfaces.dependencies import get_file_service
 from app.application.services.agent_service import AgentService
 from app.application.services.token_service import TokenService
 from app.application.errors.exceptions import NotFoundError, UnauthorizedError
+from app.core.config import get_settings
 from app.interfaces.dependencies import get_agent_service, get_current_user, get_optional_current_user, get_token_service, verify_signature_websocket
 from app.interfaces.schemas.base import APIResponse
 from app.interfaces.schemas.session import (
     ChatRequest, ShellViewRequest, CreateSessionResponse, GetSessionResponse,
     ListSessionItem, ListSessionResponse, ShellViewResponse,
     ShareSessionResponse, SharedSessionResponse, PreviewUrlRequest,
-    CreateSessionRequest
+    CreateSessionRequest, AgentModelConfigResponse
 )
 from app.interfaces.schemas.file import FileViewRequest, FileViewResponse
 from app.interfaces.schemas.resource import AccessTokenRequest, SignedUrlResponse
@@ -34,6 +35,18 @@ SESSION_POLL_INTERVAL = 5
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 
 LOCAL_PREVIEW_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+
+
+def _model_id_for_agent(model_name: str, model_provider: str, api_base: Optional[str]) -> Optional[str]:
+    settings = get_settings()
+    for model in settings.available_models:
+        if (
+            model.model_name == model_name
+            and model.model_provider == model_provider
+            and (model.api_base or settings.api_base) == api_base
+        ):
+            return model.id
+    return None
 
 
 def _rewrite_preview_content(content: bytes, content_type: str, prefix: str) -> bytes:
@@ -96,12 +109,22 @@ async def get_session(
     session = await agent_service.get_session(session_id, current_user.id)
     if not session:
         raise NotFoundError("Session not found")
+    agent = await agent_service.get_agent(session.agent_id)
+    model_config = None
+    if agent:
+        model_config = AgentModelConfigResponse(
+            model_id=_model_id_for_agent(agent.model_name, agent.model_provider, agent.api_base),
+            model_name=agent.model_name,
+            model_provider=agent.model_provider,
+            api_base=agent.api_base,
+        )
     return APIResponse.success(GetSessionResponse(
         session_id=session.id,
         title=session.title,
         status=session.status,
         events=await EventMapper.events_to_sse_events(session.events),
-        is_shared=session.is_shared
+        is_shared=session.is_shared,
+        agent_model_config=model_config,
     ))
 
 @router.delete("/{session_id}", response_model=APIResponse[None])

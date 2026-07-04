@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Optional, List
 from app.interfaces.schemas.event import AgentSSEEvent
 from app.domain.models.session import SessionStatus
@@ -20,7 +20,16 @@ class ChatRequest(BaseModel):
 
 class AgentModelConfigRequest(BaseModel):
     """Per-session model credentials imported from Sub2API."""
+    model_id: Optional[str] = None
     api_key: Optional[str] = None
+    api_base: Optional[str] = None
+    model_name: Optional[str] = None
+    model_provider: Optional[str] = None
+
+
+class AgentModelConfigResponse(BaseModel):
+    """Per-session model metadata exposed to the frontend."""
+    model_id: Optional[str] = None
     api_base: Optional[str] = None
     model_name: Optional[str] = None
     model_provider: Optional[str] = None
@@ -48,11 +57,14 @@ class CreateSessionResponse(BaseModel):
 
 class GetSessionResponse(BaseModel):
     """Get session response schema"""
+    model_config = ConfigDict(populate_by_name=True)
+
     session_id: str
     title: Optional[str] = None
     status: SessionStatus
     events: List[AgentSSEEvent] = Field(default_factory=list)
     is_shared: bool = False
+    agent_model_config: Optional[AgentModelConfigResponse] = Field(default=None, alias="model_config")
 
 
 class ListSessionItem(BaseModel):

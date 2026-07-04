@@ -42,11 +42,20 @@
       </div>
     </div>
   </div>
+  <button
+    v-if="visible && !isShow && fileInfo"
+    @click="showFilePanel(fileInfo)"
+    class="fixed right-4 bottom-24 z-40 h-10 px-3 rounded-full inline-flex items-center gap-2 bg-[var(--background-white-main)] text-[var(--text-primary)] border border-[var(--border-main)] shadow-[0px_5px_16px_0px_var(--shadow-S),0px_0px_1.25px_0px_var(--shadow-S)] hover:bg-[var(--background-gray-main)] cursor-pointer"
+    :title="$t('Open file')">
+    <FileText class="size-4 text-[var(--icon-secondary)]" />
+    <span class="text-sm font-medium max-w-[160px] truncate">{{ $t('Open file') }}</span>
+  </button>
 </template>
 
 <script setup lang="ts">
-import { computed, ref, onMounted, onUnmounted } from 'vue'
-import { Download, X } from 'lucide-vue-next'
+import { computed, ref, onMounted, onUnmounted, watch } from 'vue'
+import { useRoute } from 'vue-router'
+import { Download, FileText, X } from 'lucide-vue-next'
 import { useFilePanel } from '../composables/useFilePanel'
 import { getFileDownloadUrl } from '../api/file'
 import { getFileType } from '../utils/fileType'
@@ -62,6 +71,8 @@ const {
   showFilePanel,
   hideFilePanel
 } = useFilePanel()
+
+const route = useRoute()
 
 const filePanelRef = ref<HTMLElement>()
 const { size: parentSize } = useResizeObserver(filePanelRef, {
@@ -80,19 +91,32 @@ const download = async () => {
   window.open(url, '_blank')
 }
 
+const handleToolPanelShown = () => {
+  visible.value = false
+}
+
+const clearFilePanel = () => {
+  isShow.value = false
+  visible.value = true
+  fileInfo.value = undefined
+}
+
 onMounted(() => {
-  eventBus.on(EVENT_SHOW_TOOL_PANEL, () => {
-    visible.value = false
-  })
+  eventBus.on(EVENT_SHOW_TOOL_PANEL, handleToolPanelShown)
 })
 
 onUnmounted(() => {
-  eventBus.off(EVENT_SHOW_TOOL_PANEL)
+  eventBus.off(EVENT_SHOW_TOOL_PANEL, handleToolPanelShown)
+})
+
+watch(() => route.fullPath, () => {
+  clearFilePanel()
 })
 
 defineExpose({
   showFilePanel,
   hideFilePanel,
+  clearFilePanel,
   isShow
 })
 </script>

@@ -19,6 +19,13 @@
                         aria-expanded="false" aria-haspopup="dialog">
                         <Paperclip :size="16" />
                     </button>
+                    <ModelPicker
+                        v-if="showModelPicker && modelOptions.length > 0"
+                        :options="modelOptions"
+                        :selected-model-id="selectedModelId"
+                        :disabled="modelPickerDisabled"
+                        @update:selectedModelId="$emit('update:selectedModelId', $event)"
+                    />
                 </div>
                 <div class="flex gap-2">
                     <button v-if="!isRunning || sendEnabled || hideStopButton"
@@ -43,21 +50,33 @@ import { ref, computed } from 'vue';
 import SendIcon from './icons/SendIcon.vue';
 import { useI18n } from 'vue-i18n';
 import ChatBoxFiles from './ChatBoxFiles.vue';
+import ModelPicker from './ModelPicker.vue';
 import { Paperclip } from 'lucide-vue-next';
 import type { FileInfo } from '../api/file';
+import type { ChatModelOption } from '../api/agentConfig';
+import { SYSTEM_MODEL_ID } from '../api/agentConfig';
 
 const { t } = useI18n();
 const isComposing = ref(false);
 const chatBoxFileListRef = ref();
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
     modelValue: string;
     rows: number;
     isRunning: boolean;
     attachments: FileInfo[];
     hideStopButton?: boolean;
     allowSendFilesOnly?: boolean;
-}>();
+    showModelPicker?: boolean;
+    modelOptions?: ChatModelOption[];
+    selectedModelId?: string;
+    modelPickerDisabled?: boolean;
+}>(), {
+    showModelPicker: false,
+    modelOptions: () => [],
+    selectedModelId: SYSTEM_MODEL_ID,
+    modelPickerDisabled: false,
+});
 
 const canSubmit = (draftValue = props.modelValue) => {
     const hasTextInput = draftValue.trim() !== '';
@@ -73,6 +92,7 @@ const sendEnabled = computed(() => canSubmit());
 
 const emit = defineEmits<{
     (e: 'update:modelValue', value: string): void;
+    (e: 'update:selectedModelId', value: string): void;
     (e: 'submit'): void;
     (e: 'stop'): void;
 }>();
@@ -105,5 +125,4 @@ const handleStop = () => {
 const uploadFile = () => {
     chatBoxFileListRef.value?.uploadFile();
 };
-
 </script>

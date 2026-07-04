@@ -7,6 +7,7 @@ from typing import Optional, List
 
 from app.domain.models.claw import Claw, ClawMessage, ClawStatus
 from app.domain.services.claw_domain_service import ClawDomainService
+from app.domain.utils.model_output import sanitize_model_text
 from app.core.config import get_settings
 from app.infrastructure.storage.redis import get_redis
 
@@ -91,10 +92,11 @@ class ClawEventBus:
 
 class _ChatState:
     """Tracks an in-progress response so new SSE clients can catch up."""
-    __slots__ = ("pending_text",)
+    __slots__ = ("pending_text", "raw_text")
 
     def __init__(self):
         self.pending_text = ""
+        self.raw_text = ""
 
 
 class ClawService:
@@ -242,11 +244,21 @@ class ClawService:
             async for chunk in self.domain.process_chat_stream(
                 user_id, base_url, message, session_id,
             ):
+                outbound = chunk
                 if chunk.get("type") == "text" and chunk.get("content"):
-                    state.pending_text += chunk["content"]
+                    state.raw_text += chunk["content"]
+                    visible_text = sanitize_model_text(state.raw_text)
+                    if visible_text.startswith(state.pending_text):
+                        visible_delta = visible_text[len(state.pending_text):]
+                    else:
+                        visible_delta = visible_text
+                    state.pending_text = visible_text
+                    if not visible_delta:
+                        continue
+                    outbound = {**chunk, "content": visible_delta}
 
                 if chunk.get("type") != "done":
-                    await self.event_bus.publish(user_id, chunk)
+                    await self.event_bus.publish(user_id, outbound)
 
         except Exception as e:
             logger.error(f"[claw-chat] background processing error for user={user_id}: {e}")

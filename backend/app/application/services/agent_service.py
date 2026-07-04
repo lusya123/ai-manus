@@ -19,6 +19,7 @@ from app.domain.repositories.agent_repository import AgentRepository
 from app.domain.external.task import Task
 from app.domain.models.file import FileInfo
 from app.core.config import get_settings
+from app.application.errors.exceptions import BadRequestError
 from app.domain.repositories.mcp_repository import MCPRepository
 from app.domain.models.session import SessionStatus
 
@@ -71,14 +72,43 @@ class AgentService:
             value = getattr(model_config, key, None)
         return value.strip() if isinstance(value, str) and value.strip() else None
 
+    def _resolve_model_config(self, model_config: Optional[Any]) -> dict[str, Optional[str]]:
+        settings = get_settings()
+        resolved = {
+            "model_name": settings.model_name,
+            "model_provider": settings.model_provider,
+            "api_base": settings.api_base,
+            "api_key": settings.api_key,
+        }
+
+        model_id = self._model_config_value(model_config, "model_id")
+        if model_id:
+            selected_model = next((model for model in settings.available_models if model.id == model_id), None)
+            if not selected_model:
+                raise BadRequestError(f"Unknown model option: {model_id}")
+            resolved.update(
+                model_name=selected_model.model_name,
+                model_provider=selected_model.model_provider,
+                api_base=selected_model.api_base or settings.api_base,
+                api_key=selected_model.api_key or settings.api_key,
+            )
+
+        for key in ("model_name", "model_provider", "api_base", "api_key"):
+            value = self._model_config_value(model_config, key)
+            if value:
+                resolved[key] = value
+
+        return resolved
+
     async def _create_agent(self, model_config: Optional[Any] = None) -> Agent:
         logger.info("Creating new agent")
         settings = get_settings()
+        resolved_model_config = self._resolve_model_config(model_config)
         agent = Agent(
-            model_name=self._model_config_value(model_config, "model_name") or settings.model_name,
-            model_provider=self._model_config_value(model_config, "model_provider") or settings.model_provider,
-            api_base=self._model_config_value(model_config, "api_base") or settings.api_base,
-            api_key=self._model_config_value(model_config, "api_key") or settings.api_key,
+            model_name=resolved_model_config["model_name"] or settings.model_name,
+            model_provider=resolved_model_config["model_provider"] or settings.model_provider,
+            api_base=resolved_model_config["api_base"] or settings.api_base,
+            api_key=resolved_model_config["api_key"] or settings.api_key,
             temperature=settings.temperature,
             max_tokens=settings.max_tokens,
         )
@@ -117,6 +147,10 @@ class AgentService:
         if not session:
             logger.error(f"Session {session_id} not found for user {user_id}")
         return session
+
+    async def get_agent(self, agent_id: str) -> Optional[Agent]:
+        """Get an agent by ID."""
+        return await self._agent_repository.find_by_id(agent_id)
     
     async def get_all_sessions(self, user_id: str) -> List[SessionSummary]:
         """Get all sessions for a specific user (lightweight summaries)"""

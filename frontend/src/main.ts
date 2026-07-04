@@ -27,6 +27,7 @@ const EXTERNAL_AUTH_QUERY_KEYS = new Set([
   'refresh_token',
   'token_type',
   'expires_in',
+  'manus_model_id',
   'manus_api_key',
   'manus_api_base',
   'manus_model',

@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 
@@ -21,6 +22,57 @@ def _parse_extra_headers() -> dict | None:
     return None
 
 
+class ConfiguredModelOption(BaseModel):
+    """Model option that can be selected when creating a new chat."""
+    id: str
+    label: str
+    model_name: str
+    model_provider: str = "openai"
+    api_base: str | None = None
+    api_key: str | None = None
+
+
+def _default_available_models() -> list[ConfiguredModelOption]:
+    return [
+        ConfiguredModelOption(
+            id="claude-sonnet-4-6",
+            label="Claude Sonnet 4.6",
+            model_name="claude-sonnet-4-6",
+            model_provider="anthropic",
+        ),
+        ConfiguredModelOption(
+            id="claude-opus-4-6",
+            label="Claude Opus 4.6",
+            model_name="claude-opus-4-6",
+            model_provider="anthropic",
+        ),
+        ConfiguredModelOption(
+            id="claude-opus-4-7",
+            label="Claude Opus 4.7",
+            model_name="claude-opus-4-7",
+            model_provider="anthropic",
+        ),
+        ConfiguredModelOption(
+            id="claude-opus-4-8",
+            label="Claude Opus 4.8",
+            model_name="claude-opus-4-8",
+            model_provider="anthropic",
+        ),
+        ConfiguredModelOption(
+            id="gpt-4o",
+            label="GPT-4o",
+            model_name="gpt-4o",
+            model_provider="openai",
+        ),
+        ConfiguredModelOption(
+            id="gpt-4o-mini",
+            label="GPT-4o mini",
+            model_name="gpt-4o-mini",
+            model_provider="openai",
+        ),
+    ]
+
+
 class Settings(BaseSettings):
     
     # Model provider configuration
@@ -30,6 +82,7 @@ class Settings(BaseSettings):
     # Model configuration
     model_name: str = "gpt-4o"
     model_provider: str = "openai"
+    available_models: list[ConfiguredModelOption] = Field(default_factory=_default_available_models)
     temperature: float = 0.7
     max_tokens: int = 2000
     

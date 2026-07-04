@@ -10,6 +10,7 @@ import httpx
 from app.domain.models.claw import Claw, ClawStatus, ClawMessage, ClawAttachment
 from app.domain.external.claw import ClawRuntime, ClawClient
 from app.domain.repositories.claw_repository import ClawRepository
+from app.domain.utils.model_output import sanitize_model_text
 from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -251,7 +252,11 @@ class ClawDomainService:
 
     async def get_history(self, user_id: str) -> List[ClawMessage]:
         """Merge MongoDB messages with OpenClaw's native session history."""
-        db_msgs = await self.claw_repository.get_messages(user_id)
+        db_msgs = []
+        for message in await self.claw_repository.get_messages(user_id):
+            sanitized = self._sanitize_message(message)
+            if sanitized.role == "attachments" or sanitized.content:
+                db_msgs.append(sanitized)
 
         claw_msgs: List[ClawMessage] = []
         try:
@@ -281,11 +286,20 @@ class ClawDomainService:
         return re.sub(r'^\[.*?\]\s*', '', text)
 
     @classmethod
-    def _normalize_content(cls, text: str) -> str:
+    def _normalize_content(cls, text: str, sanitize_reasoning: bool = True) -> str:
         """Normalize message text for dedup comparison."""
         text = cls._strip_openclaw_prefix(text)
         text = re.sub(r'<MANUS_FILE\b[^>]*/>', '', text)
+        if sanitize_reasoning:
+            text = sanitize_model_text(text)
         return text.strip()
+
+    @classmethod
+    def _sanitize_message(cls, message: ClawMessage) -> ClawMessage:
+        if message.role != "assistant":
+            return message
+        content = cls._normalize_content(message.content or "")
+        return message.model_copy(update={"content": content})
 
     @classmethod
     def _merge_histories(
@@ -311,14 +325,20 @@ class ClawDomainService:
         db_fingerprints: list[tuple[str, int, str, bool]] = []
         for m in db_msgs:
             if m.role != "attachments":
-                norm = cls._normalize_content(m.content or "")
+                norm = cls._normalize_content(
+                    m.content or "",
+                    sanitize_reasoning=m.role == "assistant",
+                )
                 db_fingerprints.append((m.role, m.timestamp or 0, norm[:120], False))
 
         merged: List[ClawMessage] = list(db_msgs)
 
         for m in claw_msgs:
             ts = cls._normalize_ts(m.timestamp or 0)
-            content = cls._normalize_content(m.content or "")
+            content = cls._normalize_content(
+                m.content or "",
+                sanitize_reasoning=m.role == "assistant",
+            )
 
             if m.attachments:
                 new_atts = [a for a in m.attachments if a.file_id and a.file_id not in seen_file_ids]
@@ -393,9 +413,11 @@ class ClawDomainService:
                     user_id, "attachments", "assistant", attachments=file_attachments,
                 )
             if assistant_content:
-                await self.claw_repository.append_message(
-                    user_id, "assistant", "".join(assistant_content),
-                )
+                content = sanitize_model_text("".join(assistant_content))
+                if content:
+                    await self.claw_repository.append_message(
+                        user_id, "assistant", content,
+                    )
 
     async def validate_claw_for_chat(self, user_id: str) -> Claw:
         """Validate that a user has a running claw instance ready for chat.

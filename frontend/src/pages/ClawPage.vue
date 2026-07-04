@@ -122,7 +122,7 @@
             />
 
             <!-- Loading indicator while waiting for response -->
-            <LoadingIndicator v-if="isWaitingResponse && !hasStreamingContent" :text="$t('Thinking')" />
+            <LoadingIndicator v-if="isWaitingResponse && !hasStreamingContent && !hasThinkingContent" :text="$t('Thinking')" />
 
           </div>
 
@@ -194,6 +194,7 @@ let clawWS: ClawWebSocket | null = null;
 let statusPollingTimer: number | null = null;
 let expiryTimer: number | null = null;
 const streamingAssistantIdx = ref(-1);
+const thinkingMessageIdx = ref(-1);
 const remainingSeconds = ref<number | null>(null);
 
 const formattedCountdown = computed(() => {
@@ -234,6 +235,7 @@ const handleExpired = async () => {
   clawWS = null;
   isWaitingResponse.value = false;
   streamingAssistantIdx.value = -1;
+  thinkingMessageIdx.value = -1;
   stopStatusPolling();
   try { await deleteClaw(); } catch {}
   clawData.value = null;
@@ -303,6 +305,7 @@ const setupWebSocket = () => {
 
 const handleWSEvent = (chunk: ClawEvent) => {
   if (chunk.type === 'catchup') {
+    removeThinkingMessage();
     // Reconnected while a response was in progress
     if (streamingAssistantIdx.value < 0) {
       streamingAssistantIdx.value = messages.value.length;
@@ -319,6 +322,7 @@ const handleWSEvent = (chunk: ClawEvent) => {
   }
 
   if (chunk.type === 'text') {
+    removeThinkingMessage();
     if (streamingAssistantIdx.value < 0) {
       streamingAssistantIdx.value = messages.value.length;
       messages.value.push({
@@ -328,6 +332,24 @@ const handleWSEvent = (chunk: ClawEvent) => {
     }
     if (chunk.content && streamingAssistantIdx.value >= 0) {
       (messages.value[streamingAssistantIdx.value].content as MessageContent).content += chunk.content;
+    }
+    return;
+  }
+
+  if (chunk.type === 'thinking') {
+    if (streamingAssistantIdx.value >= 0 || !chunk.content) {
+      return;
+    }
+    if (thinkingMessageIdx.value < 0) {
+      thinkingMessageIdx.value = messages.value.length;
+      messages.value.push({
+        type: 'thinking',
+        content: { content: '', timestamp: Math.floor(Date.now() / 1000) } as MessageContent,
+      });
+    }
+    const thinkingMessage = messages.value[thinkingMessageIdx.value];
+    if (thinkingMessage) {
+      (thinkingMessage.content as MessageContent).content += chunk.content;
     }
     return;
   }
@@ -354,6 +376,7 @@ const handleWSEvent = (chunk: ClawEvent) => {
 
   if (chunk.type === 'done') {
     streamingAssistantIdx.value = -1;
+    removeThinkingMessage();
     isWaitingResponse.value = false;
     return;
   }
@@ -363,6 +386,7 @@ const handleWSEvent = (chunk: ClawEvent) => {
     clawStatus.value = newStatus;
     if (newStatus === 'stopped' || newStatus === 'error') {
       streamingAssistantIdx.value = -1;
+      removeThinkingMessage();
       isWaitingResponse.value = false;
     }
     return;
@@ -379,6 +403,7 @@ const handleWSEvent = (chunk: ClawEvent) => {
       });
     }
     streamingAssistantIdx.value = -1;
+    removeThinkingMessage();
     isWaitingResponse.value = false;
   }
 };
@@ -405,6 +430,24 @@ const hasStreamingContent = computed(() => {
   const msg = messages.value[streamingAssistantIdx.value];
   return msg && (msg.content as MessageContent).content.length > 0;
 });
+
+const hasThinkingContent = computed(() => {
+  if (thinkingMessageIdx.value < 0) return false;
+  const msg = messages.value[thinkingMessageIdx.value];
+  return msg && msg.type === 'thinking' && (msg.content as MessageContent).content.length > 0;
+});
+
+const removeThinkingMessage = () => {
+  const index = thinkingMessageIdx.value;
+  if (index < 0) return;
+  if (messages.value[index]?.type === 'thinking') {
+    messages.value.splice(index, 1);
+    if (streamingAssistantIdx.value > index) {
+      streamingAssistantIdx.value -= 1;
+    }
+  }
+  thinkingMessageIdx.value = -1;
+};
 
 const handleScroll = () => {
   follow.value = simpleBarRef.value?.isScrolledToBottom() ?? false;
@@ -547,6 +590,7 @@ const handleDeleteClaw = () => {
       clawWS = null;
       isWaitingResponse.value = false;
       streamingAssistantIdx.value = -1;
+      thinkingMessageIdx.value = -1;
       stopStatusPolling();
       stopExpiryCountdown();
       try {

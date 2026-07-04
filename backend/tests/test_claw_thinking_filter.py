@@ -22,7 +22,7 @@ class FakeDomain:
         yield {"type": "done", "stop_reason": "end_turn"}
 
 
-async def test_claw_stream_filters_thinking_across_split_chunks():
+async def test_claw_stream_sends_temporary_thinking_then_visible_text():
     service = ClawService(FakeDomain())
     event_bus = FakeEventBus()
     service.event_bus = event_bus
@@ -30,6 +30,7 @@ async def test_claw_stream_filters_thinking_across_split_chunks():
     await service._process_chat("user-1", "http://claw", "hello", "default")
 
     assert [event for _, event in event_bus.events] == [
+        {"type": "thinking", "content": "private"},
         {"type": "text", "content": "visible"},
         {"type": "text", "content": " answer"},
         {"type": "done", "stop_reason": "end_turn"},

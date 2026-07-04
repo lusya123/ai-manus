@@ -19,7 +19,7 @@ export interface ClawApiKey {
 }
 
 export interface ClawEvent {
-  type: 'text' | 'done' | 'error' | 'file' | 'catchup' | 'heartbeat' | 'status';
+  type: 'text' | 'thinking' | 'done' | 'error' | 'file' | 'catchup' | 'heartbeat' | 'status';
   content?: string;
   stop_reason?: string;
   error?: string;

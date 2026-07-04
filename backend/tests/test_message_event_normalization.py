@@ -1,4 +1,5 @@
 from app.domain.models.event import MessageEvent
+from app.domain.utils.model_output import extract_model_thinking_text
 
 
 class ContentBlock:
@@ -81,3 +82,18 @@ def test_message_event_normalizes_object_content_blocks():
     )
 
     assert event.message == "visible answer"
+
+
+def test_extract_model_thinking_text_from_split_ready_tag():
+    assert extract_model_thinking_text("<think>private reasoning") == "private reasoning"
+    assert (
+        extract_model_thinking_text("<think>private reasoning</think>visible answer")
+        == "private reasoning"
+    )
+
+
+def test_extract_model_thinking_text_from_reasoning_fence():
+    assert (
+        extract_model_thinking_text("```reasoning\nprivate reasoning\n```visible")
+        == "private reasoning"
+    )

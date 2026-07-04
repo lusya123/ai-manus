@@ -19,12 +19,25 @@ _HIDDEN_TAG_RE = re.compile(
     r"<(?:think|thinking|reasoning)\b[^>]*>.*?(?:</(?:think|thinking|reasoning)>|$)",
     re.IGNORECASE | re.DOTALL,
 )
+_HIDDEN_TAG_BODY_RE = re.compile(
+    r"<(?P<tag>think|thinking|reasoning)\b[^>]*>(?P<body>.*?)(?:</(?P=tag)>|$)",
+    re.IGNORECASE | re.DOTALL,
+)
 _HIDDEN_FENCE_RE = re.compile(
     r"```(?:think|thinking|thought|reasoning)\s*\n.*?(?:```|$)",
     re.IGNORECASE | re.DOTALL,
 )
+_HIDDEN_FENCE_BODY_RE = re.compile(
+    r"```(?:think|thinking|thought|reasoning)\s*\n(?P<body>.*?)(?:```|$)",
+    re.IGNORECASE | re.DOTALL,
+)
 _HIDDEN_TOKEN_RE = re.compile(
     r"<\|(?:begin|start)_of_(?:thinking|thought|reasoning)\|>.*?"
+    r"(?:<\|(?:end|stop)_of_(?:thinking|thought|reasoning)\|>|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+_HIDDEN_TOKEN_BODY_RE = re.compile(
+    r"<\|(?:begin|start)_of_(?:thinking|thought|reasoning)\|>(?P<body>.*?)"
     r"(?:<\|(?:end|stop)_of_(?:thinking|thought|reasoning)\|>|$)",
     re.IGNORECASE | re.DOTALL,
 )
@@ -44,6 +57,20 @@ def sanitize_model_text(text: str) -> str:
 
     text = _remove_trailing_hidden_tag_prefix(text)
     return text.strip()
+
+
+def extract_model_thinking_text(text: str) -> str:
+    """Return model-produced private reasoning from explicit thinking wrappers."""
+    if not text:
+        return ""
+
+    parts: list[str] = []
+    for pattern in (_HIDDEN_TOKEN_BODY_RE, _HIDDEN_FENCE_BODY_RE, _HIDDEN_TAG_BODY_RE):
+        for match in pattern.finditer(text):
+            body = match.group("body").strip()
+            if body:
+                parts.append(body)
+    return "\n\n".join(parts)
 
 
 def normalize_model_content(value: Any) -> str:

@@ -7,7 +7,7 @@ from typing import Optional, List
 
 from app.domain.models.claw import Claw, ClawMessage, ClawStatus
 from app.domain.services.claw_domain_service import ClawDomainService
-from app.domain.utils.model_output import sanitize_model_text
+from app.domain.utils.model_output import extract_model_thinking_text, sanitize_model_text
 from app.core.config import get_settings
 from app.infrastructure.storage.redis import get_redis
 
@@ -92,10 +92,11 @@ class ClawEventBus:
 
 class _ChatState:
     """Tracks an in-progress response so new SSE clients can catch up."""
-    __slots__ = ("pending_text", "raw_text")
+    __slots__ = ("pending_text", "pending_thinking", "raw_text")
 
     def __init__(self):
         self.pending_text = ""
+        self.pending_thinking = ""
         self.raw_text = ""
 
 
@@ -247,7 +248,20 @@ class ClawService:
                 outbound = chunk
                 if chunk.get("type") == "text" and chunk.get("content"):
                     state.raw_text += chunk["content"]
+                    thinking_text = extract_model_thinking_text(state.raw_text)
                     visible_text = sanitize_model_text(state.raw_text)
+
+                    if not visible_text and thinking_text.startswith(state.pending_thinking):
+                        thinking_delta = thinking_text[len(state.pending_thinking):]
+                        state.pending_thinking = thinking_text
+                        if thinking_delta:
+                            await self.event_bus.publish(
+                                user_id,
+                                {"type": "thinking", "content": thinking_delta},
+                            )
+                    elif thinking_text:
+                        state.pending_thinking = thinking_text
+
                     if visible_text.startswith(state.pending_text):
                         visible_delta = visible_text[len(state.pending_text):]
                     else:

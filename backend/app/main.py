@@ -87,6 +87,12 @@ app.add_middleware(
 # Register exception handlers
 register_exception_handlers(app)
 
+
+@app.get("/health", include_in_schema=False)
+async def health_check():
+    return {"status": "ok"}
+
+
 # Register routes
 app.include_router(router, prefix="/api/v1")
 # OpenAI-compatible proxy (used by OpenClaw containers for LLM requests)

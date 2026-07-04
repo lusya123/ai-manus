@@ -59,35 +59,42 @@ class ClawEventBus:
             logger.warning("[claw-bus] redis publish failed: %s", e)
 
     async def _redis_subscribe(self, user_id: str, queue: asyncio.Queue) -> None:
-        pubsub = get_redis().client.pubsub()
-        try:
-            await pubsub.subscribe(self._channel(user_id))
-            async for message in pubsub.listen():
-                if message.get("type") != "message":
-                    continue
-                try:
-                    payload = json.loads(message.get("data") or "{}")
-                except Exception:
-                    continue
-                if payload.get("origin") == self._origin:
-                    continue
-                event = payload.get("event")
-                if not isinstance(event, dict):
-                    continue
-                try:
-                    queue.put_nowait(event)
-                except asyncio.QueueFull:
-                    pass
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.warning("[claw-bus] redis subscribe failed: %s", e)
-        finally:
+        channel = self._channel(user_id)
+        while True:
+            pubsub = None
             try:
-                await pubsub.unsubscribe(self._channel(user_id))
-                await pubsub.close()
-            except Exception:
-                pass
+                pubsub = get_redis().client.pubsub()
+                await pubsub.subscribe(channel)
+                async for message in pubsub.listen():
+                    if message.get("type") != "message":
+                        continue
+                    try:
+                        payload = json.loads(message.get("data") or "{}")
+                    except Exception:
+                        continue
+                    if payload.get("origin") == self._origin:
+                        continue
+                    event = payload.get("event")
+                    if not isinstance(event, dict):
+                        continue
+                    try:
+                        queue.put_nowait(event)
+                    except asyncio.QueueFull:
+                        pass
+                logger.warning("[claw-bus] redis subscribe ended; retrying")
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("[claw-bus] redis subscribe failed; retrying: %s", e)
+                await asyncio.sleep(1)
+            finally:
+                if pubsub is not None:
+                    try:
+                        await pubsub.unsubscribe(channel)
+                        await pubsub.close()
+                    except Exception:
+                        pass
 
 
 class _ChatState:

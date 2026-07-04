@@ -192,6 +192,18 @@ jobs:
 
             echo "$GHCR_TOKEN" | docker login "$REGISTRY" -u "$GHCR_USER" --password-stdin
             docker compose -p ai-manus -f docker-compose.yml -f docker-compose.deploy.yml pull frontend backend sandbox claw mockserver
-            docker compose -p ai-manus -f docker-compose.yml -f docker-compose.deploy.yml up -d --remove-orphans frontend backend mongodb redis mockserver
+            docker compose -p ai-manus -f docker-compose.yml -f docker-compose.deploy.yml up -d --remove-orphans backend mongodb redis mockserver
+            for i in $(seq 1 60); do
+              if docker compose -p ai-manus -f docker-compose.yml -f docker-compose.deploy.yml exec -T backend \
+                python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)" >/dev/null 2>&1; then
+                break
+              fi
+              if [ "$i" -eq 60 ]; then
+                docker compose -p ai-manus -f docker-compose.yml -f docker-compose.deploy.yml logs --tail=120 backend
+                exit 1
+              fi
+              sleep 2
+            done
+            docker compose -p ai-manus -f docker-compose.yml -f docker-compose.deploy.yml up -d --remove-orphans frontend
             docker compose -p ai-manus -f docker-compose.yml -f docker-compose.deploy.yml up --no-start sandbox claw
             docker image prune -f

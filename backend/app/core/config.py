@@ -97,6 +97,10 @@ class Settings(BaseSettings):
     redis_port: int = 6379
     redis_db: int = 0
     redis_password: str | None = None
+    redis_socket_connect_timeout: float = 5.0
+    redis_health_check_interval: int = 30
+    redis_max_connections: int = 100
+    redis_retry_attempts: int = 3
     
     # Sandbox configuration
     sandbox_address: str | None = None

@@ -66,7 +66,7 @@ uv sync
 Create a `.env` file and set the following environment variables (see `app/core/config.py` or the root [.env.example](https://github.com/simpleyyt/ai-manus/blob/main/.env.example) for the full list):
 ```
 # Model provider configuration
-API_KEY=your_api_key_here                # API key for model providers (required)
+API_KEY=                                 # Inject the model-provider key (required)
 API_BASE=https://api.openai.com/v1       # Base URL for model API (optional for some providers)
 
 # Model configuration
@@ -82,30 +82,63 @@ GOOGLE_SEARCH_API_KEY=                   # Google Search API key (SEARCH_PROVIDE
 GOOGLE_SEARCH_ENGINE_ID=                 # Google custom search engine ID (SEARCH_PROVIDER=google)
 
 # Sandbox configuration
+SANDBOX_PROVIDER=docker                   # docker or agentbay
 SANDBOX_ADDRESS=                         # Fixed sandbox address (dev); when unset, containers are created per session
 SANDBOX_IMAGE=simpleyyt/manus-sandbox    # Sandbox environment Docker image
 SANDBOX_NAME_PREFIX=sandbox              # Sandbox container name prefix
 SANDBOX_TTL_MINUTES=30                   # Sandbox container time-to-live (minutes)
-SANDBOX_NETWORK=manus-network            # Docker network name for communication between sandbox containers
+SANDBOX_NETWORK=manus-network            # Runtime-only network; never attach sandbox/Claw to the data network
+SANDBOX_MEMORY_LIMIT=2g                  # Hard memory limit per local Docker sandbox
+SANDBOX_CPU_LIMIT=2.0                    # CPU-core limit per local Docker sandbox
+SANDBOX_PIDS_LIMIT=512                   # Process-count limit per local Docker sandbox
+# AgentBay only: inject both values from a secret manager / provider console
+#AGENTBAY_API_KEY=
+#AGENTBAY_IMAGE_ID=
+#AGENTBAY_DEPLOYMENT_ID=
 
 # Authentication configuration
-AUTH_PROVIDER=password                   # password / local / none
-JWT_SECRET_KEY=your-secret-key-here      # JWT signing key (set in production)
+AUTH_PROVIDER=password                   # password / local / none / sub2api
+REGISTRATION_ENABLED=false               # Public registration is closed by default
+DEPLOYMENT_ENVIRONMENT=production         # Select production validation/default behavior
+JWT_SECRET_KEY=                          # Generate a unique value with: openssl rand -hex 32
+CORS_ALLOWED_ORIGINS=https://manus.example.com  # Exact origins only; never '*'
+PASSWORD_HASH_ROUNDS=600000               # PBKDF2-SHA256; new users get random per-user salts
+# Redis-backed defaults: account/IP login 10/30 per 300s, registration 5/hour,
+# password reset 5/hour, refresh 60/minute (see root .env.example to override)
+# Independent BYOK keyring; generate every JSON-array entry with openssl rand -hex 32
+#MODEL_CREDENTIAL_ENCRYPTION_KEYS=[]
 
 # Claw (OpenClaw) configuration
 CLAW_ENABLED=false                       # Enable the Claw integration
 CLAW_IMAGE=simpleyyt/manus-claw          # Claw container Docker image
-CLAW_TTL_SECONDS=3600                    # Claw container time-to-live (seconds)
+CLAW_TTL_SECONDS=0                       # Persistent by default; positive only for temporary runtimes
+CLAW_PROXY_MAX_INPUT_BYTES=131072         # Per-request prompt/schema budget
+CLAW_PROXY_REQUESTS_PER_MINUTE=30         # Per-running-Claw request budget
+CLAW_PROXY_MAX_CONCURRENT_REQUESTS=2      # Per-running-Claw concurrency budget
+CLAW_CHAT_TURN_LEASE_SECONDS=300           # Cross-replica single-turn lease
+CLAW_CHAT_MAX_MESSAGE_BYTES=65536          # WebSocket chat message budget
+CLAW_CHAT_MAX_ATTACHMENTS=10               # Attachments per chat turn
+CLAW_CHAT_MAX_ATTACHMENT_BYTES=26214400    # Per-attachment chat cap
+CLAW_CHAT_MAX_TOTAL_ATTACHMENT_BYTES=52428800 # Per-turn aggregate attachment cap
+CLAW_UPLOAD_MAX_BYTES=26214400             # Runtime-capability upload cap
+CLAW_HISTORY_MAX_MESSAGES=128              # Atomic bounded history retention
+CLAW_API_KEY_HMAC_KEYS=                  # Independent current,previous HMAC keyring; generate each entry
+MULTIPART_UPLOAD_MAX_BODY_BYTES=27262976    # Pre-parser HTTP upload-body cap
+FILE_UPLOAD_MAX_BYTES=26214400             # GridFS per-file cap
+FILE_STORAGE_MAX_BYTES_PER_USER=1073741824 # Per-user cumulative byte cap
+FILE_STORAGE_MAX_FILES_PER_USER=1000       # Per-user file-count cap
 
 # MCP configuration
 MCP_CONFIG_PATH=/etc/mcp.json            # Path to external MCP servers config
 
 # Task backend configuration
 TASK_BACKEND=local                       # local (in-process asyncio) or celery (distributed workers)
+BACKEND_REPLICA_COUNT=1                  # Values >1 require TASK_BACKEND=celery
 
 # Database configuration
 MONGODB_URI=mongodb://localhost:27017    # MongoDB connection URL
 MONGODB_DATABASE=manus                   # MongoDB database name
+# Production Redis needs durable storage; bundled Compose uses AOF everysec + noeviction + a named volume
 REDIS_HOST=localhost                     # Redis host
 REDIS_PORT=6379                          # Redis port
 REDIS_DB=0                               # Redis DB index
@@ -114,12 +147,25 @@ REDIS_DB=0                               # Redis DB index
 LOG_LEVEL=INFO                           # Log level, options: DEBUG, INFO, WARNING, ERROR, CRITICAL
 ```
 
+### Security and Deployment Invariants
+
+- Authentication-enabled and staging/production deployments require a unique `JWT_SECRET_KEY` of at least 32 bytes. `REGISTRATION_ENABLED` defaults to `false`. Password accounts use PBKDF2-SHA256 with at least 600,000 rounds and a fresh random salt per user; `PASSWORD_SALT` and `PASSWORD_LEGACY_HASH_ROUNDS` exist only to upgrade old hashes after a successful login.
+- Authentication limits and token revocation are Redis-authoritative. Refresh tokens are single-use and rotate the access/refresh pair inside one revocable family; logout revokes that family. Sub2API handoff uses a one-time random `state`, accepts credentials only from a scrubbed URL fragment after `/auth/me` verification, and applies the same refresh-family/logout protection to opaque external tokens.
+- Production Redis must be durable and non-evicting. Retain the bundled AOF `everysec`, `noeviction`, and named-volume configuration, or provide equivalent persistence, backups, and high availability externally. A host crash can still lose roughly the last second of AOF writes, so Redis is not the AgentBay hard billing ledger; an ephemeral Redis can also lose rate-limit, used-refresh, and revoked-family state.
+- `CORS_ALLOWED_ORIGINS` is a comma-separated exact-origin list; wildcards, paths, queries, fragments, and embedded credentials are rejected. Set it explicitly outside local development.
+- Production BYOK requires an independent `MODEL_CREDENTIAL_ENCRYPTION_KEYS` JSON keyring. The first key writes, later keys only decrypt during rotation. Run `scripts/rotate_model_credential_keys.py` first without arguments and then with `--apply`; confirm a second dry run reports zero pending records before removing an old key.
+- To migrate pre-marker plaintext agent credentials, temporarily provide every historical deployment/catalog key in `LEGACY_SYSTEM_API_KEYS` (JSON array), dry-run `scripts/migrate_agent_credentials.py`, verify the classifications, then rerun with `--apply` and remove the historical keys from configuration.
+- Generate every `CLAW_API_KEY_HMAC_KEYS` entry independently. Claw enforces distributed proxy/turn leases, WebSocket message and attachment limits, upload limits, and an atomic history hard cap of 128. A previous HMAC key can remain during lazy rotation.
+- `/files` and `/claw/upload` are limited before multipart parsing, and GridFS separately enforces a per-file cap plus atomic per-user byte/file quotas. Keep the edge proxy body limit aligned.
+- `TASK_BACKEND=local` is safe for exactly one backend Python process. Set `BACKEND_REPLICA_COUNT` to the real process/replica count; values above one must use Celery and startup validation rejects the unsafe combination.
+- AgentBay creation/deletion is fail-safe: failed endpoint resolution is rolled back, unconfirmed cleanup preserves the provider session ID for retry, and deletion waits for task-cancellation acknowledgement. Signed AgentBay gateway links are bearer capabilities and must never be logged; the adapter disables the SDK's console and file logging.
+
 ## Running the Service
 
 ### Development Environment
 ```bash
 # Start the development server (with hot reload)
-uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --ws-max-size 131072
 ```
 
 The service will start at http://localhost:8000.
@@ -188,11 +234,11 @@ SSE event types emitted by `/chat`: `message`, `title`, `plan`, `step`, `tool`, 
 | Method | Path | Description |
 |---|---|---|
 | POST | `/auth/login` | Login |
-| POST | `/auth/register` | Register a new user |
+| POST | `/auth/register` | Register a new user when `REGISTRATION_ENABLED=true` |
 | GET | `/auth/status` | Get authentication provider status |
 | GET | `/auth/me` | Get current user information |
-| POST | `/auth/refresh` | Refresh access token |
-| POST | `/auth/logout` | Logout |
+| POST | `/auth/refresh` | Rotate a single-use refresh token and return a replacement access/refresh pair |
+| POST | `/auth/logout` | Revoke the login token family (Sub2API requires the refresh token in the body) |
 | POST | `/auth/change-password` | Change password |
 | POST | `/auth/change-fullname` | Change full name |
 | POST | `/auth/send-verification-code` | Send email verification code |
@@ -208,13 +254,16 @@ SSE event types emitted by `/chat`: `message`, `title`, `plan`, `step`, `tool`, 
 | GET | `/claw` | Get the current user's Claw instance |
 | POST | `/claw` | Create a Claw instance for the current user |
 | DELETE | `/claw` | Delete the current user's Claw instance |
-| GET | `/claw/api-key` | Get the per-user API key for the LLM proxy |
 | GET | `/claw/history` | Get merged Claw chat history |
 | POST | `/claw/upload` | Upload a file from the Claw workspace (Claw API key auth) |
 | GET | `/claw/files/{filename}` | Proxy a file download from the Claw workspace |
 | GET | `/claw/resolve/{file_id}` | Resolve `manus-file://` metadata (Claw API key auth) |
 | GET | `/claw/resolve/{file_id}/download` | Download `manus-file://` content (Claw API key auth) |
 | WebSocket | `/claw/ws` | Persistent WebSocket connection for Claw chat |
+
+The LLM-proxy capability is injected only into the owned Claw runtime. It is
+not available from a user-facing endpoint and works only while that Claw record
+is running.
 
 ### Other Endpoints
 

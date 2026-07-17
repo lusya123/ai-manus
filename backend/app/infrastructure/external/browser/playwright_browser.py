@@ -6,6 +6,7 @@ from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
 from app.core.config import get_settings
 from app.domain.models.tool_result import ToolResult
+from app.domain.utils.error_reporting import safe_exception_summary
 import logging
 
 # Set up logger for this module
@@ -69,12 +70,20 @@ class PlaywrightBrowser:
                 
                 # Return error if maximum retry count is reached
                 if attempt == max_retries - 1:
-                    logger.error(f"Initialization failed (retried {max_retries} times): {e}")
+                    logger.error(
+                        "Browser initialization failed after %d attempts: %s",
+                        max_retries,
+                        safe_exception_summary(e),
+                    )
                     return False
                 
                 # Otherwise increase waiting time (exponential backoff strategy)
                 retry_delay = min(retry_delay * 2, 10)  # Maximum wait 10 seconds
-                logger.warning(f"Initialization failed, will retry in {retry_delay} seconds: {e}")
+                logger.warning(
+                    "Browser initialization failed; retrying in %s seconds: %s",
+                    retry_delay,
+                    safe_exception_summary(e),
+                )
                 await asyncio.sleep(retry_delay)
 
     async def cleanup(self):
@@ -107,7 +116,10 @@ class PlaywrightBrowser:
                 await self.playwright.stop()
                 
         except Exception as e:
-            logger.error(f"Error occurred when cleaning up resources: {e}")
+            logger.error(
+                "Error occurred when cleaning up browser resources: %s",
+                safe_exception_summary(e),
+            )
         finally:
             # Reset references
             self.page = None
@@ -422,7 +434,10 @@ class PlaywrightBrowser:
             try:
                 await self.page.goto(url, timeout=timeout)
             except Exception as e:
-                logger.warning(f"Failed to navigate to {url}: {str(e)}")
+                logger.warning(
+                    "Browser navigation failed: %s",
+                    safe_exception_summary(e),
+                )
             return ToolResult(
                 success=True,
                 data={

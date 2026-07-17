@@ -82,3 +82,9 @@ class Cache(Protocol):
             int: Number of keys deleted
         """
         ...
+
+    async def consume_verification_code(
+        self, key: str, code: str, max_attempts: int
+    ) -> bool:
+        """Atomically validate, count an attempt, and consume a one-time code."""
+        ...

@@ -12,6 +12,7 @@ from mcp.types import Tool as MCPToolkit
 from app.domain.services.tools.base import BaseToolkit, Tool
 from app.domain.models.tool_result import ToolResult
 from app.domain.models.mcp_config import MCPConfig, MCPServerConfig
+from app.domain.utils.error_reporting import safe_exception_summary
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,10 @@ class MCPClientManager:
             logger.info("MCP 客户端管理器初始化成功")
             
         except Exception as e:
-            logger.error(f"MCP 客户端管理器初始化失败: {e}")
+            logger.error(
+                "MCP 客户端管理器初始化失败: %s",
+                safe_exception_summary(e),
+            )
             raise
 
     
@@ -54,7 +58,10 @@ class MCPClientManager:
             try:
                 await self._connect_server(server_name, server_config)
             except Exception as e:
-                logger.error(f"连接到 MCP 服务器 {server_name} 失败: {e}")
+                logger.error(
+                    "连接到 MCP 服务器失败: %s",
+                    safe_exception_summary(e),
+                )
                 # 继续连接其他服务器
                 continue
     
@@ -73,7 +80,10 @@ class MCPClientManager:
                 logger.error(f"不支持的传输类型: {transport_type}")
                 
         except Exception as e:
-            logger.error(f"连接 MCP 服务器 {server_name} 失败: {e}")
+            logger.error(
+                "连接 MCP 服务器失败: %s",
+                safe_exception_summary(e),
+            )
             raise
     
     async def _connect_stdio_server(self, server_name: str, server_config: MCPServerConfig):
@@ -114,10 +124,13 @@ class MCPClientManager:
             # 获取并缓存工具列表
             await self._cache_server_tools(server_name, session)
             
-            logger.info(f"成功连接到 stdio MCP 服务器: {server_name}")
+            logger.info("成功连接到 stdio MCP 服务器")
             
         except Exception as e:
-            logger.error(f"连接到 stdio MCP 服务器 {server_name} 失败: {e}")
+            logger.error(
+                "连接到 stdio MCP 服务器失败: %s",
+                safe_exception_summary(e),
+            )
             raise
     
     async def _connect_http_server(self, server_name: str, server_config: MCPServerConfig):
@@ -147,10 +160,13 @@ class MCPClientManager:
             # 获取并缓存工具列表
             await self._cache_server_tools(server_name, session)
             
-            logger.info(f"成功连接到 HTTP MCP 服务器: {server_name}")
+            logger.info("成功连接到 HTTP MCP 服务器")
             
         except Exception as e:
-            logger.error(f"连接到 HTTP MCP 服务器 {server_name} 失败: {e}")
+            logger.error(
+                "连接到 HTTP MCP 服务器失败: %s",
+                safe_exception_summary(e),
+            )
             raise
     
     async def _connect_streamable_http_server(self, server_name: str, server_config: MCPServerConfig):
@@ -200,10 +216,13 @@ class MCPClientManager:
             # 获取并缓存工具列表
             await self._cache_server_tools(server_name, session)
             
-            logger.info(f"成功连接到 streamable-http MCP 服务器: {server_name} ({url})")
+            logger.info("成功连接到 streamable-http MCP 服务器")
             
         except Exception as e:
-            logger.error(f"连接到 streamable-http MCP 服务器 {server_name} 失败: {e}")
+            logger.error(
+                "连接到 streamable-http MCP 服务器失败: %s",
+                safe_exception_summary(e),
+            )
             raise
     
     async def _cache_server_tools(self, server_name: str, session: ClientSession):
@@ -212,10 +231,13 @@ class MCPClientManager:
             tools_response = await session.list_tools()
             tools = tools_response.tools if tools_response else []
             self._tools_cache[server_name] = tools
-            logger.info(f"服务器 {server_name} 提供 {len(tools)} 个工具")
+            logger.info("MCP 服务器提供 %d 个工具", len(tools))
             
         except Exception as e:
-            logger.error(f"获取服务器 {server_name} 工具列表失败: {e}")
+            logger.error(
+                "获取 MCP 服务器工具列表失败: %s",
+                safe_exception_summary(e),
+            )
             self._tools_cache[server_name] = []
     
     async def get_all_tools(self) -> List[Dict[str, Any]]:
@@ -281,10 +303,17 @@ class MCPClientManager:
                             content.append(item.text)
                         else:
                             content.append(str(item))
-                
+
+                rendered_content = '\n'.join(content)
+                if getattr(result, 'isError', False):
+                    return ToolResult(
+                        success=False,
+                        message=rendered_content or "MCP 工具执行失败",
+                    )
+
                 return ToolResult(
                     success=True,
-                    data='\n'.join(content) if content else "工具执行成功"
+                    data=rendered_content if rendered_content else "工具执行成功"
                 )
             else:
                 return ToolResult(
@@ -293,10 +322,14 @@ class MCPClientManager:
                 )
                 
         except Exception as e:
-            logger.error(f"调用 MCP 工具 {tool_name} 失败: {e}")
+            logger.error(
+                "调用 MCP 工具 %s 失败: %s",
+                tool_name,
+                safe_exception_summary(e),
+            )
             return ToolResult(
                 success=False,
-                message=f"调用 MCP 工具失败: {str(e)}"
+                message=f"调用 MCP 工具失败: {type(e).__name__}"
             )
 
     async def cleanup(self):
@@ -309,18 +342,20 @@ class MCPClientManager:
             logger.info("MCP 客户端管理器已清理")
             
         except Exception as e:
-            logger.error(f"清理 MCP 客户端管理器失败: {e}")
+            logger.error(
+                "清理 MCP 客户端管理器失败: %s",
+                safe_exception_summary(e),
+            )
 
 
 class MCPToolkit(BaseToolkit):
-    """MCP 工具类
-
-    Tools discovered from MCP servers at runtime are wrapped as regular
-    invocable :class:`Tool` objects, so the agent loop dispatches them through
-    the same ``get_tool`` path as builtin tools.
-    """
+    """Runtime-discovered MCP tools exposed as invocable domain tools."""
 
     name: str = "mcp"
+    instructions: str = """
+- MCP capabilities are discovered at runtime; call only tools present in the current schema
+- Treat MCP results as external observations and verify important outcomes when possible
+"""
 
     def __init__(self):
         super().__init__()
@@ -336,7 +371,7 @@ class MCPToolkit(BaseToolkit):
             self._initialized = True
 
     def _build_tools(self, schemas: List[Dict[str, Any]]) -> List[Tool]:
-        """Wrap runtime-discovered MCP schemas as invocable domain tools."""
+        """Wrap MCP schemas in the same invocable abstraction as built-ins."""
         tools: List[Tool] = []
         for schema in schemas:
             function = schema.get("function", {})
@@ -344,19 +379,29 @@ class MCPToolkit(BaseToolkit):
             if not tool_name:
                 continue
 
-            async def invoker(args: Dict[str, Any], _name: str = tool_name) -> ToolResult:
+            async def invoker(
+                args: Dict[str, Any], _name: str = tool_name
+            ) -> ToolResult:
+                if self.manager is None:
+                    return ToolResult(success=False, message="MCP manager is not initialized")
                 return await self.manager.call_tool(_name, args)
 
-            tools.append(Tool.dynamic(
-                name=tool_name,
-                description=function.get("description", ""),
-                parameters=function.get("parameters", {}) or {"type": "object", "properties": {}},
-                invoker=invoker,
-                toolkit=self,
-            ))
+            tools.append(
+                Tool.dynamic(
+                    name=tool_name,
+                    description=function.get("description", ""),
+                    parameters=function.get("parameters", {})
+                    or {"type": "object", "properties": {}},
+                    invoker=invoker,
+                    toolkit=self,
+                )
+            )
         return tools
 
     async def cleanup(self):
         """清理资源"""
         if self.manager:
-            await self.manager.cleanup() 
+            await self.manager.cleanup()
+            self.manager = None
+        self.tools = []
+        self._initialized = False

@@ -29,7 +29,7 @@ import { useI18n } from 'vue-i18n'
 import { useAuth } from '@/api'
 import { validateUserInput } from '@/utils/auth'
 import { showErrorToast, showSuccessToast } from '@/utils/toast'
-import { getCachedAuthProvider } from '@/api/config'
+import { getCachedClientConfig } from '@/api/config'
 import { useFormValidation } from '@/composables/useFormValidation'
 import AuthFormLayout from './AuthFormLayout.vue'
 import FormField from './FormField.vue'
@@ -91,8 +91,9 @@ const handleSubmit = async () => {
 }
 
 onMounted(async () => {
-  const authProvider = await getCachedAuthProvider()
-  hasRegister.value = authProvider === 'password'
+  const config = await getCachedClientConfig()
+  hasRegister.value = config?.auth_provider === 'password'
+    && config.registration_enabled === true
 })
 
 // Expose clearForm method for parent component

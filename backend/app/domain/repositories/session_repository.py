@@ -10,6 +10,20 @@ class SessionRepository(Protocol):
     async def save(self, session: Session) -> None:
         """Save or update a session"""
         ...
+
+    async def update_runtime_ownership(
+        self,
+        session_id: str,
+        sandbox_id: Optional[str],
+        task_id: Optional[str],
+        sandbox_provider: Optional[str] = None,
+    ) -> None:
+        """Update runtime IDs only when the session still exists.
+
+        Unlike ``save``, this operation must never recreate a concurrently
+        deleted session.
+        """
+        ...
     
     async def find_by_id(self, session_id: str) -> Optional[Session]:
         """Find a session by its ID"""
@@ -35,8 +49,18 @@ class SessionRepository(Protocol):
         """Update the latest message of a session"""
         ...
 
-    async def add_event(self, session_id: str, event: BaseEvent) -> None:
-        """Add an event to a session"""
+    async def add_event(self, session_id: str, event: BaseEvent) -> BaseEvent:
+        """Add a bounded event to a session."""
+        ...
+
+    async def add_event_once(self, session_id: str, event: BaseEvent) -> BaseEvent:
+        """Atomically append a stable event ID at most once."""
+        ...
+
+    async def update_event_transport_cursor(
+        self, session_id: str, event_id: str, transport_id: str
+    ) -> None:
+        """Attach a Redis output cursor without changing the logical event ID."""
         ...
     
     async def add_file(self, session_id: str, file_info: FileInfo) -> None:
@@ -67,8 +91,8 @@ class SessionRepository(Protocol):
         """Decrement the unread message count of a session"""
         ...
     
-    async def update_shared_status(self, session_id: str, is_shared: bool) -> None:
-        """Update the shared status of a session"""
+    async def update_shared_status(self, session_id: str, is_shared: bool) -> str:
+        """Update shared status, rotate its capability epoch, and return it."""
         ...
     
     async def delete(self, session_id: str) -> None:

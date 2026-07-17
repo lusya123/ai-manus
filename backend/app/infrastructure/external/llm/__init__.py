@@ -17,6 +17,7 @@ from app.infrastructure.external.llm.langchain_llm import (
     get_langchain_llm,
 )
 from app.infrastructure.external.llm.openai_llm import OpenAILLM, get_openai_llm
+from app.infrastructure.external.llm.factory import ConfigurableLLMFactory, get_llm_factory
 
 logger = logging.getLogger(__name__)
 
@@ -40,4 +41,6 @@ __all__ = [
     "get_llm",
     "get_langchain_llm",
     "get_openai_llm",
+    "ConfigurableLLMFactory",
+    "get_llm_factory",
 ]

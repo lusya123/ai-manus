@@ -10,6 +10,7 @@ from curl_cffi.requests import AsyncSession
 from app.domain.external.search import SearchEngine
 from app.domain.models.search import SearchResultItem, SearchResults
 from app.domain.models.tool_result import ToolResult
+from app.domain.utils.error_reporting import safe_exception_summary
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +123,10 @@ class BingWebSearchEngine(SearchEngine):
                                 )
                             )
                     except Exception as e:
-                        logger.warning(f"Failed to parse Bing search result item: {e}")
+                        logger.warning(
+                            "Failed to parse Bing search result item: %s",
+                            safe_exception_summary(e),
+                        )
                         continue
 
                 total_results = 0
@@ -147,7 +151,10 @@ class BingWebSearchEngine(SearchEngine):
                 return ToolResult(success=True, data=results)
 
         except Exception as e:
-            logger.error(f"Bing Web Search failed: {e}")
+            error_summary = safe_exception_summary(e)
+            logger.error(
+                "Bing Web Search failed: %s", error_summary
+            )
             error_results = SearchResults(
                 query=query,
                 date_range=date_range,
@@ -156,7 +163,7 @@ class BingWebSearchEngine(SearchEngine):
             )
             return ToolResult(
                 success=False,
-                message=f"Bing Web Search failed: {e}",
+                message=f"Bing Web Search failed: {error_summary}",
                 data=error_results,
             )
 

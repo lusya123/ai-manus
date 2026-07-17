@@ -13,6 +13,10 @@ class AgentRepository(Protocol):
     async def find_by_id(self, agent_id: str) -> Optional[Agent]:
         """Find an agent by its ID"""
         ...
+
+    async def delete(self, agent_id: str) -> None:
+        """Delete an agent and its persisted model credentials."""
+        ...
     
     async def add_memory(self, agent_id: str,
                         name: str,
@@ -26,4 +30,4 @@ class AgentRepository(Protocol):
 
     async def save_memory(self, agent_id: str, name: str, memory: Memory) -> None:
         """Update the messages of a memory"""
-        ... 
+        ...

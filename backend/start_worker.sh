@@ -10,7 +10,11 @@
 #                       one process for its whole run, so this bounds how many
 #                       agent sessions execute in parallel (default: 4)
 
-exec uv run celery -A app.worker.celery_app worker \
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
+# Use the exact environment installed during image build. Calling `uv run`
+# here would implicitly sync the default dev dependency group at runtime.
+exec "${SCRIPT_DIR}/.venv/bin/celery" -A app.worker.celery_app worker \
     --loglevel="${CELERY_LOG_LEVEL:-INFO}" \
     --concurrency="${CELERY_CONCURRENCY:-4}" \
     "$@"

@@ -1,0 +1,132 @@
+import asyncio
+from types import SimpleNamespace
+
+import pytest
+from pydantic import ValidationError
+
+from app.domain.models.event import ErrorEvent, MessageEvent
+from app.infrastructure.models.documents import SessionDocument
+from app.infrastructure.repositories.mongo_session_repository import (
+    MongoSessionRepository,
+)
+from app.interfaces.schemas.session import ChatRequest
+
+
+def test_chat_request_requires_uuid_and_enforces_decoded_limits():
+    with pytest.raises(ValidationError, match="submission_id"):
+        ChatRequest(message="hello")
+
+    with pytest.raises(ValidationError, match="message is too large"):
+        ChatRequest(
+            message="界" * 22_000,
+            submission_id="11111111-1111-4111-8111-111111111111",
+        )
+
+    with pytest.raises(ValidationError):
+        ChatRequest(
+            message="hello",
+            submission_id="11111111-1111-4111-8111-111111111111",
+            attachments=[
+                {"file_id": f"file-{index}", "filename": "a.txt"}
+                for index in range(11)
+            ],
+        )
+
+    with pytest.raises(ValidationError):
+        ChatRequest(
+            message="hello",
+            submission_id="11111111-1111-4111-8111-111111111111",
+            attachments=[{"file_id": "x" * 257}],
+        )
+
+    # Reconnect-only requests intentionally do not need a submission UUID.
+    assert ChatRequest(message="", event_id="1-0").submission_id is None
+
+
+class _BoundedSessionCollection:
+    def __init__(self):
+        self.events = []
+        self.lock = asyncio.Lock()
+
+    async def update_one(self, query, update, array_filters=None):
+        async with self.lock:
+            if array_filters:
+                event_id = array_filters[0]["event.id"]
+                for event in self.events:
+                    if event["id"] == event_id:
+                        event["transport_id"] = update["$set"][
+                            "events.$[event].transport_id"
+                        ]
+                return SimpleNamespace(matched_count=1, modified_count=1)
+
+            candidate = update["$push"]["events"]["$each"][0]
+            if any(event["id"] == candidate["id"] for event in self.events):
+                return SimpleNamespace(matched_count=0, modified_count=0)
+            self.events.append(candidate)
+            slice_value = update["$push"]["events"]["$slice"]
+            self.events = self.events[slice_value:]
+            return SimpleNamespace(matched_count=1, modified_count=1)
+
+    async def find_one(self, query, projection=None):
+        return {"_id": "session-document"}
+
+
+async def test_session_event_append_is_atomic_bounded_and_idempotent(
+    monkeypatch,
+):
+    collection = _BoundedSessionCollection()
+    monkeypatch.setattr(
+        SessionDocument,
+        "get_pymongo_collection",
+        classmethod(lambda cls: collection),
+    )
+    monkeypatch.setattr(
+        "app.infrastructure.repositories.mongo_session_repository.get_settings",
+        lambda: SimpleNamespace(
+            session_history_max_events=5,
+            session_event_max_bytes=1024,
+        ),
+    )
+    repository = MongoSessionRepository()
+    events = [MessageEvent(message=f"event-{index}") for index in range(20)]
+
+    await asyncio.gather(
+        *(repository.add_event_once("session-1", event) for event in events),
+        repository.add_event_once("session-1", events[-1]),
+    )
+
+    assert len(collection.events) == 5
+    assert len({event["id"] for event in collection.events}) == 5
+    assert [event["message"] for event in collection.events] == [
+        f"event-{index}" for index in range(15, 20)
+    ]
+
+
+async def test_oversized_single_event_is_replaced_with_safe_summary(monkeypatch):
+    collection = _BoundedSessionCollection()
+    monkeypatch.setattr(
+        SessionDocument,
+        "get_pymongo_collection",
+        classmethod(lambda cls: collection),
+    )
+    monkeypatch.setattr(
+        "app.infrastructure.repositories.mongo_session_repository.get_settings",
+        lambda: SimpleNamespace(
+            session_history_max_events=5,
+            session_event_max_bytes=1024,
+        ),
+    )
+    original = MessageEvent(
+        id="stable-event",
+        turn_id="turn-1",
+        message="secret-output" * 500,
+    )
+
+    persisted = await MongoSessionRepository().add_event_once(
+        "session-1", original
+    )
+
+    assert isinstance(persisted, ErrorEvent)
+    assert persisted.id == "stable-event"
+    assert persisted.turn_id == "turn-1"
+    assert "secret-output" not in collection.events[0]["error"]

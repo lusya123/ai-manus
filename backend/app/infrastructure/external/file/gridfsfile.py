@@ -1,14 +1,22 @@
 import logging
 import io
+import inspect
 from typing import BinaryIO, Optional, Dict, Any, Tuple
 from datetime import datetime
 from bson import ObjectId
 from gridfs import AsyncGridFSBucket
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
-from app.domain.external.file import FileStorage
+from app.domain.external.file import (
+    FileStorage,
+    FileStorageQuotaExceededError,
+    FileTooLargeError,
+)
 from app.domain.models.file import FileInfo
 from app.infrastructure.storage.mongodb import MongoDB
 from app.core.config import get_settings
+from app.domain.utils.error_reporting import safe_exception_summary
 from functools import lru_cache
 
 logger = logging.getLogger(__name__)
@@ -45,6 +53,117 @@ class GridFSFileStorage(FileStorage):
         
         database = self.mongodb.client[self.settings.mongodb_database]
         return database[f"{self.bucket_name}.files"]
+
+    def _get_quota_collection(self):
+        if not self.mongodb.client:
+            raise RuntimeError("MongoDB client not initialized")
+        database = self.mongodb.client[self.settings.mongodb_database]
+        return database["file_storage_quotas"]
+
+    @staticmethod
+    def _remaining_stream_size(file_data: BinaryIO) -> int:
+        try:
+            position = file_data.tell()
+            file_data.seek(0, 2)
+            end = file_data.tell()
+            file_data.seek(position)
+        except (AttributeError, OSError) as exc:
+            raise FileTooLargeError(
+                "File size cannot be verified before storage"
+            ) from exc
+        size = end - position
+        if size < 0:
+            raise FileTooLargeError("File size is invalid")
+        return size
+
+    async def _ensure_user_quota(self, user_id: str) -> None:
+        quotas = self._get_quota_collection()
+        if await quotas.find_one({"_id": user_id}, projection={"_id": 1}):
+            return
+        files = self._get_files_collection()
+        aggregate_result = files.aggregate(
+            [
+                {"$match": {"metadata.user_id": user_id}},
+                {
+                    "$group": {
+                        "_id": None,
+                        "bytes_used": {"$sum": "$length"},
+                        "file_count": {"$sum": 1},
+                    }
+                },
+            ]
+        )
+        # PyMongo's native AsyncCollection (used by Beanie 2) makes
+        # ``aggregate`` awaitable, while Motor returns its cursor directly.
+        # Support both APIs during the upstream migration instead of calling
+        # ``to_list`` on the PyMongo coroutine.
+        cursor = (
+            await aggregate_result
+            if inspect.isawaitable(aggregate_result)
+            else aggregate_result
+        )
+        rows = await cursor.to_list(length=1)
+        usage = rows[0] if rows else {"bytes_used": 0, "file_count": 0}
+        try:
+            await quotas.insert_one(
+                {
+                    "_id": user_id,
+                    "bytes_used": int(usage.get("bytes_used", 0)),
+                    "file_count": int(usage.get("file_count", 0)),
+                    "updated_at": datetime.utcnow(),
+                }
+            )
+        except DuplicateKeyError:
+            # A concurrent replica initialized the authoritative counter.
+            pass
+
+    async def _reserve_user_quota(self, user_id: str, size: int) -> None:
+        await self._ensure_user_quota(user_id)
+        max_bytes = max(1, int(self.settings.file_storage_max_bytes_per_user))
+        max_files = max(1, int(self.settings.file_storage_max_files_per_user))
+        result = await self._get_quota_collection().find_one_and_update(
+            {
+                "_id": user_id,
+                "bytes_used": {"$lte": max_bytes - size},
+                "file_count": {"$lt": max_files},
+            },
+            {
+                "$inc": {"bytes_used": size, "file_count": 1},
+                "$set": {"updated_at": datetime.utcnow()},
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        if result is None:
+            raise FileStorageQuotaExceededError(
+                "User file-storage quota has been reached"
+            )
+
+    async def _release_user_quota(self, user_id: str, size: int) -> None:
+        await self._get_quota_collection().update_one(
+            {"_id": user_id},
+            [
+                {
+                    "$set": {
+                        "bytes_used": {
+                            "$max": [0, {"$subtract": ["$bytes_used", size]}]
+                        },
+                        "file_count": {
+                            "$max": [0, {"$subtract": ["$file_count", 1]}]
+                        },
+                        "updated_at": datetime.utcnow(),
+                    }
+                }
+            ],
+        )
+
+    @staticmethod
+    def _to_object_id(file_id: str) -> ObjectId:
+        try:
+            return ObjectId(file_id)
+        except Exception as exc:
+            raise FileNotFoundError(
+                f"File not found with ID: {file_id}"
+            ) from exc
     
     def _create_file_info(self, file_info: Dict[str, Any], file_id: str) -> FileInfo:
         """Create FileInfo object from GridFS file metadata"""
@@ -68,6 +187,12 @@ class GridFSFileStorage(FileStorage):
         metadata: Optional[Dict[str, Any]] = None
     ) -> FileInfo:
         """Upload file to GridFS"""
+        size = self._remaining_stream_size(file_data)
+        max_file_bytes = max(1, int(self.settings.file_upload_max_bytes))
+        if size > max_file_bytes:
+            raise FileTooLargeError("File exceeds the configured size limit")
+        await self._reserve_user_quota(user_id, size)
+        file_id = None
         try:
             bucket = self._get_gridfs_bucket()
             
@@ -94,7 +219,11 @@ class GridFSFileStorage(FileStorage):
             file_info = await files_collection.find_one({"_id": file_id})
             file_size = file_info.get('length', 0) if file_info else 0
             
-            logger.info(f"File uploaded successfully: {filename} (ID: {file_id}) for user {user_id}")
+            logger.info(
+                "File uploaded successfully: file_id=%s user_id=%s",
+                file_id,
+                user_id,
+            )
             
             return FileInfo(
                 file_id=str(file_id),
@@ -107,7 +236,28 @@ class GridFSFileStorage(FileStorage):
             )
             
         except Exception as e:
-            logger.error(f"Failed to upload file {filename} for user {user_id}: {str(e)}")
+            release_reservation = file_id is None
+            if file_id is not None:
+                try:
+                    await self._get_gridfs_bucket().delete(file_id)
+                    release_reservation = True
+                except Exception as rollback_error:
+                    # Keep the reservation conservative when an uploaded blob
+                    # could not be rolled back; maintenance can reconcile it.
+                    logger.error(
+                        "Failed to roll back partially completed GridFS upload: "
+                        "file_id=%s user_id=%s error=%s",
+                        file_id,
+                        user_id,
+                        safe_exception_summary(rollback_error),
+                    )
+            if release_reservation:
+                await self._release_user_quota(user_id, size)
+            logger.error(
+                "Failed to upload file for user_id=%s: %s",
+                user_id,
+                safe_exception_summary(e),
+            )
             raise
     
     async def download_file(self, file_id: str, user_id: Optional[str] = None) -> Tuple[BinaryIO, FileInfo]:
@@ -116,11 +266,7 @@ class GridFSFileStorage(FileStorage):
             bucket = self._get_gridfs_bucket()
             files_collection = self._get_files_collection()
             
-            # Convert ObjectId
-            try:
-                obj_id = ObjectId(file_id)
-            except Exception:
-                raise ValueError(f"Invalid file ID format: {file_id}")
+            obj_id = self._to_object_id(file_id)
             
             # Get file information and check user ownership
             file_info = await files_collection.find_one({"_id": obj_id})
@@ -137,12 +283,15 @@ class GridFSFileStorage(FileStorage):
             stream.seek(0)
             return stream, self._create_file_info(file_info, file_id)
             
-        except FileNotFoundError:
-            raise
         except (FileNotFoundError, PermissionError):
             raise
         except Exception as e:
-            logger.error(f"Failed to download file {file_id} for user {user_id}: {str(e)}")
+            logger.error(
+                "Failed to download file_id=%s for user_id=%s: %s",
+                file_id,
+                user_id,
+                safe_exception_summary(e),
+            )
             raise
     
     async def delete_file(self, file_id: str, user_id: str) -> bool:
@@ -151,11 +300,7 @@ class GridFSFileStorage(FileStorage):
             bucket = self._get_gridfs_bucket()
             files_collection = self._get_files_collection()
             
-            # Convert ObjectId
-            try:
-                obj_id = ObjectId(file_id)
-            except Exception:
-                raise ValueError(f"Invalid file ID format: {file_id}")
+            obj_id = self._to_object_id(file_id)
             
             # Check if file exists and belongs to user
             file_info = await files_collection.find_one({"_id": obj_id})
@@ -167,14 +312,24 @@ class GridFSFileStorage(FileStorage):
             if file_user_id != user_id:
                 logger.warning(f"Delete access denied: file {file_id} does not belong to user {user_id}")
                 return False
+
+            await self._ensure_user_quota(user_id)
             
             # Delete file
             await bucket.delete(obj_id)
+            await self._release_user_quota(
+                user_id, int(file_info.get("length", 0))
+            )
             logger.info(f"File deleted successfully: {file_id} by user {user_id}")
             return True
             
         except Exception as e:
-            logger.error(f"Failed to delete file {file_id} for user {user_id}: {str(e)}")
+            logger.error(
+                "Failed to delete file_id=%s for user_id=%s: %s",
+                file_id,
+                user_id,
+                safe_exception_summary(e),
+            )
             return False
     
     async def get_file_info(self, file_id: str, user_id: Optional[str] = None) -> Optional[FileInfo]:
@@ -182,11 +337,10 @@ class GridFSFileStorage(FileStorage):
         try:
             files_collection = self._get_files_collection()
             
-            # Convert ObjectId
             try:
-                obj_id = ObjectId(file_id)
-            except Exception:
-                raise ValueError(f"Invalid file ID format: {file_id}")
+                obj_id = self._to_object_id(file_id)
+            except FileNotFoundError:
+                return None
             
             # Get file information and check user ownership
             file_info = await files_collection.find_one({"_id": obj_id})
@@ -202,7 +356,12 @@ class GridFSFileStorage(FileStorage):
             return self._create_file_info(file_info, file_id)
             
         except Exception as e:
-            logger.error(f"Failed to get file info {file_id} for user {user_id}: {str(e)}")
+            logger.error(
+                "Failed to get file info file_id=%s for user_id=%s: %s",
+                file_id,
+                user_id,
+                safe_exception_summary(e),
+            )
             return None
 
 @lru_cache()

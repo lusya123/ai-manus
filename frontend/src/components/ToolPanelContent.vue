@@ -4,8 +4,9 @@
       <div class="flex items-center gap-2 w-full">
         <div class="text-[var(--text-primary)] text-lg font-semibold flex-1">{{ $t('Manus Computer') }}</div>
         <button
-          class="w-7 h-7 relative rounded-md inline-flex items-center justify-center gap-2.5 cursor-pointer hover:bg-[var(--fill-tsp-gray-main)]">
-          <Minimize2 class="w-5 h-5 text-[var(--icon-tertiary)]" @click="hide" />
+          class="w-7 h-7 relative rounded-md inline-flex items-center justify-center gap-2.5 cursor-pointer hover:bg-[var(--fill-tsp-gray-main)]"
+          :title="$t('Hide workspace')" :aria-label="$t('Hide workspace')" @click="hide">
+          <Minimize2 class="w-5 h-5 text-[var(--icon-tertiary)]" />
         </button>
       </div>
       <div v-if="toolInfo" class="flex items-center gap-2 mt-2">

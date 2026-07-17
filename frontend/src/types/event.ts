@@ -1,13 +1,20 @@
 import type { FileInfo } from '../api/file';
 
 export type AgentSSEEvent = {
-  event: 'tool' | 'step' | 'message' | 'error' | 'done' | 'title' | 'wait' | 'plan' | 'attachments';
-  data: ToolEventData | StepEventData | MessageEventData | ErrorEventData | DoneEventData | TitleEventData | WaitEventData | PlanEventData;
+  event: 'accepted' | 'tool' | 'step' | 'message' | 'error' | 'done' | 'title' | 'wait' | 'plan' | 'attachments';
+  data: AcceptedEventData | ToolEventData | StepEventData | MessageEventData | ErrorEventData | DoneEventData | TitleEventData | WaitEventData | PlanEventData;
 }
 
 export interface BaseEventData {
   event_id: string;
+  turn_id?: string;
+  transport_cursor?: string;
   timestamp: number;
+}
+
+export interface AcceptedEventData extends BaseEventData {
+  submission_id: string;
+  state: string;
 }
 
 export interface ToolEventData extends BaseEventData {

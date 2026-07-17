@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field, field_validator
 class Message(BaseModel):
     """User-facing input message (a chat turn from the user)."""
     message: str = ""
-    attachments: List[str] = []
+    attachments: List[str] = Field(default_factory=list)
 
 
 class Role(str, Enum):
@@ -21,7 +21,7 @@ class ToolCall(BaseModel):
     """A single tool/function call requested by the assistant."""
     id: str = ""
     name: str = ""
-    args: Dict[str, Any] = {}
+    args: Dict[str, Any] = Field(default_factory=dict)
 
 
 class LLMMessage(BaseModel):
@@ -36,7 +36,7 @@ class LLMMessage(BaseModel):
 
     role: Role
     content: str = ""
-    tool_calls: List[ToolCall] = []
+    tool_calls: List[ToolCall] = Field(default_factory=list)
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
     # Raw tool result object, kept only in memory for event rendering; never

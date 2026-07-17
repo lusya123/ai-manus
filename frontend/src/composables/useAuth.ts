@@ -7,8 +7,10 @@ import {
   refreshToken as apiRefreshToken,
   setAuthToken,
   clearAuthToken,
+  getStoredExternalAuthToken,
   storeToken,
   storeRefreshToken,
+  storeExternalAuthToken,
   getStoredToken,
   getStoredRefreshToken,
   clearStoredTokens,
@@ -142,8 +144,10 @@ export function useAuth() {
         isLoading.value = true
         authError.value = null
         
-        // Call logout API
-        await apiLogout()
+        // Send the paired refresh token so external-provider logins can revoke
+        // both credentials instead of leaving a reusable refresh token behind.
+        const refreshToken = getStoredRefreshToken()
+        await apiLogout(refreshToken ? { refresh_token: refreshToken } : {})
       }
     } catch (error: any) {
       console.error('Logout API failed:', error)
@@ -182,6 +186,12 @@ export function useAuth() {
       // Store new access token
       storeToken(response.access_token)
       setAuthToken(response.access_token)
+      if (response.refresh_token) {
+        storeRefreshToken(response.refresh_token)
+      }
+      if (getStoredExternalAuthToken()) {
+        storeExternalAuthToken(response.access_token)
+      }
       
       return true
     } catch (error: any) {
@@ -247,4 +257,4 @@ export function useAuth() {
     clearError,
     clearAuth
   }
-} 
+}

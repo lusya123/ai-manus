@@ -9,7 +9,7 @@ services:
           - linux/amd64
           - linux/arm64
     ports:
-      - "5173:80"
+      - "${FRONTEND_HOST_PORT:-5173}:80"
     depends_on:
       - backend
     restart: unless-stopped
@@ -38,8 +38,18 @@ services:
       #- ./mcp.json:/etc/mcp.json # Mount MCP servers directory
     networks:
       - manus-network
+      - manus-data-network
     env_file:
       - .env
+    environment:
+      # User-controlled runtimes must stay on the runtime network. They must
+      # never join the MongoDB/Redis data network.
+      # Unless explicitly overridden, dynamically-created runtime images must
+      # match the same registry/tag used by the pre-pulled Compose services.
+      - SANDBOX_IMAGE=${SANDBOX_IMAGE:-${IMAGE_REGISTRY:-simpleyyt}/manus-sandbox:${IMAGE_TAG:-latest}}
+      - CLAW_IMAGE=${CLAW_IMAGE:-${IMAGE_REGISTRY:-simpleyyt}/manus-claw:${IMAGE_TAG:-latest}}
+      - SANDBOX_NETWORK=manus-network
+      - CLAW_NETWORK=manus-network
 
   sandbox:
     image: ${IMAGE_REGISTRY:-simpleyyt}/manus-sandbox:${IMAGE_TAG:-latest}
@@ -77,19 +87,32 @@ services:
     #ports:
     #  - "27017:27017"
     networks:
-      - manus-network
+      - manus-data-network
 
   redis:
     image: redis:7.0
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis_data:/data
     restart: unless-stopped
     networks:
-      - manus-network
+      - manus-data-network
 
 volumes:
   mongodb_data:
     name: manus-mongodb-data
+  redis_data:
+    name: manus-redis-data
 
 networks:
+  # Frontend, backend, and user-controlled sandbox/Claw runtimes communicate
+  # here. No datastore is attached to this network.
   manus-network:
     name: manus-network
     driver: bridge
+  # Backend is the only application service allowed to bridge into this
+  # internal datastore network.
+  manus-data-network:
+    name: manus-data-network
+    driver: bridge
+    internal: true

@@ -30,4 +30,18 @@ export default defineConfig({
       },
     }),
   },
-}); 
+  // Vite preview serves the production build during local acceptance tests.
+  // Mirror the dev proxy so those tests exercise the real backend instead of
+  // a mocked/static-only `/api` path.
+  preview: {
+    ...(process.env.BACKEND_URL && {
+      proxy: {
+        '/api': {
+          target: process.env.BACKEND_URL,
+          changeOrigin: true,
+          ws: true,
+        },
+      },
+    }),
+  },
+});

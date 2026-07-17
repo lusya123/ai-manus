@@ -4,6 +4,7 @@ import httpx
 from app.domain.models.tool_result import ToolResult
 from app.domain.models.search import SearchResults, SearchResultItem
 from app.domain.external.search import SearchEngine
+from app.domain.utils.error_reporting import safe_exception_summary
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +84,8 @@ class BingSearchEngine(SearchEngine):
                 return ToolResult(success=True, data=results)
 
         except httpx.HTTPStatusError as e:
-            logger.error(f"Bing Search API HTTP error: {e.response.status_code}")
+            error_summary = safe_exception_summary(e)
+            logger.error("Bing Search API HTTP error: %s", error_summary)
             error_results = SearchResults(
                 query=query,
                 date_range=date_range,
@@ -92,11 +94,14 @@ class BingSearchEngine(SearchEngine):
             )
             return ToolResult(
                 success=False,
-                message=f"Bing Search API error (HTTP {e.response.status_code})",
+                message=f"Bing Search API error: {error_summary}",
                 data=error_results,
             )
         except Exception as e:
-            logger.error(f"Bing Search failed: {e}")
+            error_summary = safe_exception_summary(e)
+            logger.error(
+                "Bing Search failed: %s", error_summary
+            )
             error_results = SearchResults(
                 query=query,
                 date_range=date_range,
@@ -105,7 +110,7 @@ class BingSearchEngine(SearchEngine):
             )
             return ToolResult(
                 success=False,
-                message=f"Bing Search failed: {e}",
+                message=f"Bing Search failed: {error_summary}",
                 data=error_results,
             )
 

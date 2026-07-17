@@ -2,10 +2,26 @@ import { apiClient, ApiResponse } from './client'
 
 export interface ClientConfigResponse {
   auth_provider: string
+  registration_enabled: boolean
+  sub2api_login_url?: string | null
+  sub2api_console_url?: string | null
+  sub2api_marketplace_url?: string | null
+  sub2api_use_token_url?: string | null
   show_github_button: boolean
   github_repository_url: string
   google_analytics_id: string | null
   claw_enabled: boolean
+  default_model?: ModelOptionResponse | null
+  available_models?: ModelOptionResponse[]
+  supported_byok_providers: string[]
+}
+
+export interface ModelOptionResponse {
+  id: string
+  label: string
+  model_name: string
+  model_provider: string
+  api_base: string | null
 }
 
 let clientConfigCache: ClientConfigResponse | null = null

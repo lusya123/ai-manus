@@ -1,15 +1,34 @@
 import json
 import uuid
 import asyncio
+import re
 from typing import Any, AsyncGenerator, Optional, Tuple
 import logging
 from app.infrastructure.storage.redis import get_redis
 from app.domain.external.message_queue import MessageQueue
+from redis.exceptions import ResponseError
 
 logger = logging.getLogger(__name__)
 
 class RedisStreamQueue(MessageQueue):
     """Redis Stream implementation of message queue"""
+
+    _STREAM_ID_PATTERN = re.compile(r"^(?:\$|\d+(?:-\d+)?)$")
+    _EMPTY_STREAM_TTL_SECONDS = 24 * 3600
+    _DEAD_LETTER_TTL_SECONDS = 7 * 24 * 3600
+    _PUT_SCRIPT = r"""
+    local id = redis.call('XADD', KEYS[1], '*', 'data', ARGV[1])
+    redis.call('PERSIST', KEYS[1])
+    return id
+    """
+    _ACK_DELETE_SCRIPT = r"""
+    local acknowledged = redis.call('XACK', KEYS[1], ARGV[1], ARGV[2])
+    local deleted = redis.call('XDEL', KEYS[1], ARGV[2])
+    if redis.call('XLEN', KEYS[1]) == 0 then
+      redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
+    end
+    return acknowledged + deleted
+    """
     
     def __init__(self, stream_name: str):
         self._stream_name = stream_name
@@ -82,9 +101,117 @@ class RedisStreamQueue(MessageQueue):
         Returns:
             str: Message ID
         """
-        logger.debug(f"Putting message into stream ({self._stream_name}): {message}")
-        message_id = await self._redis.client.xadd(self._stream_name, {"data": message})
+        logger.debug("Putting message into Redis stream: stream=%s", self._stream_name)
+        # PERSIST is atomic with XADD so a task stream that was empty and
+        # scheduled for cleanup cannot expire after accepting new work.
+        wire_message = (
+            message
+            if isinstance(message, (str, bytes, int, float))
+            else json.dumps(message, separators=(",", ":"), ensure_ascii=False)
+        )
+        message_id = await self._redis.client.eval(
+            self._PUT_SCRIPT,
+            1,
+            self._stream_name,
+            wire_message,
+        )
         return message_id
+
+    @staticmethod
+    def _message_data(message_data: Any) -> Any:
+        if not isinstance(message_data, dict):
+            return None
+        return message_data.get("data", message_data.get(b"data"))
+
+    async def _ensure_group(self, group: str) -> None:
+        try:
+            await self._redis.client.xgroup_create(
+                self._stream_name,
+                group,
+                id="0-0",
+                mkstream=True,
+            )
+        except ResponseError as exc:
+            if "BUSYGROUP" not in str(exc):
+                raise
+
+    async def read_group(
+        self,
+        group: str,
+        consumer: str,
+        *,
+        min_idle_ms: int = 30_000,
+        block_ms: Optional[int] = None,
+    ) -> Tuple[str, Any]:
+        """Read input with Redis consumer-group at-least-once semantics.
+
+        Stale pending entries are reclaimed before new entries, allowing a
+        worker crash before Mongo claim to recover without destructive XDEL.
+        """
+        await self._ensure_group(group)
+        claimed = await self._redis.client.xautoclaim(
+            self._stream_name,
+            group,
+            consumer,
+            min_idle_time=max(0, int(min_idle_ms)),
+            start_id="0-0",
+            count=1,
+        )
+        claimed_messages = claimed[1] if claimed and len(claimed) > 1 else []
+        if claimed_messages:
+            message_id, message_data = claimed_messages[0]
+            return message_id, self._message_data(message_data)
+
+        messages = await self._redis.client.xreadgroup(
+            group,
+            consumer,
+            {self._stream_name: ">"},
+            count=1,
+            block=block_ms,
+        )
+        if not messages or not messages[0][1]:
+            return None, None
+        message_id, message_data = messages[0][1][0]
+        return message_id, self._message_data(message_data)
+
+    async def ack(self, group: str, message_id: str) -> bool:
+        if not message_id:
+            return False
+        # Mongo terminal state commits before this call. Once acknowledged,
+        # retaining the prompt in Redis adds no recovery value and violates
+        # the bounded terminal-retention policy. XACK+XDEL is one retry-safe
+        # operation; the empty stream/group key receives a bounded cleanup TTL.
+        return bool(
+            await self._redis.client.eval(
+                self._ACK_DELETE_SCRIPT,
+                1,
+                self._stream_name,
+                group,
+                message_id,
+                self._EMPTY_STREAM_TTL_SECONDS,
+            )
+        )
+
+    async def quarantine(
+        self, group: str, message_id: str, *, reason: str, payload_digest: str
+    ) -> bool:
+        """Dead-letter metadata without copying sensitive prompt/tool payloads."""
+        dead_letter_stream = f"{self._stream_name}:dead-letter"
+        await self._redis.client.xadd(
+            dead_letter_stream,
+            {
+                "source_id": message_id,
+                "reason": reason[:128],
+                "payload_sha256": payload_digest,
+            },
+            maxlen=1000,
+            approximate=True,
+        )
+        await self._redis.client.expire(
+            dead_letter_stream,
+            self._DEAD_LETTER_TTL_SECONDS,
+        )
+        return await self.ack(group, message_id)
     
     async def get(self, start_id: str = "0", block_ms: Optional[int] = None) -> Tuple[str, Any]:
         """Get a message from the stream
@@ -96,10 +223,16 @@ class RedisStreamQueue(MessageQueue):
         Returns:
             Tuple[str, Any]: (Message ID, Message content), returns (None, None) if no message
         """
-        logger.debug(f"Getting message from stream ({self._stream_name}): {start_id}")
         # Handle None start_id by using "0" (read from beginning)
         if start_id is None:
             start_id = "0"
+        elif not self._STREAM_ID_PATTERN.fullmatch(start_id):
+            logger.warning(
+                "Invalid Redis stream start id for %s; falling back to 0",
+                self._stream_name,
+            )
+            start_id = "0"
+        logger.debug("Getting message from Redis stream: stream=%s", self._stream_name)
             
         # Read new messages
         messages = await self._redis.client.xread(
@@ -120,7 +253,7 @@ class RedisStreamQueue(MessageQueue):
         
         try:
             # Try both bytes and string keys for compatibility
-            return message_id, message_data.get("data")
+            return message_id, self._message_data(message_data)
         except (KeyError, json.JSONDecodeError):
             return None, None
     
@@ -143,7 +276,7 @@ class RedisStreamQueue(MessageQueue):
         for message_id, message_data in messages:
             try:
                 # Try both bytes and string keys for compatibility
-                data = message_data.get("data")
+                data = self._message_data(message_data)
                 yield message_id, data
             except (KeyError, json.JSONDecodeError):
                 continue
@@ -215,9 +348,12 @@ class RedisStreamQueue(MessageQueue):
             
             try:
                 # Try both bytes and string keys for compatibility
-                return message_id, message_data.get("data")
+                return message_id, self._message_data(message_data)
             except (KeyError, json.JSONDecodeError):
-                logger.exception(f"Error parsing message from stream ({self._stream_name}): {message_data}")
+                logger.warning(
+                    "Error parsing message from Redis stream: stream=%s",
+                    self._stream_name,
+                )
                 return None, None
                 
         finally:

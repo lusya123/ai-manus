@@ -41,6 +41,26 @@
                                 class="overflow-hidden flex-1 text-sm font-medium leading-5 whitespace-nowrap text-ellipsis">{{
                                 t('Settings') }}</span>
                         </div>
+                        <div
+                            class="flex gap-3 items-center p-2 rounded-lg cursor-pointer text-[var(--text-primary)] hover:bg-[var(--fill-tsp-white-main)]"
+                            @click="handleModelClick">
+                            <div class="flex-shrink-0 w-5 h-5">
+                                <BrainCircuit :size="20" />
+                            </div>
+                            <span
+                                class="overflow-hidden flex-1 text-sm font-medium leading-5 whitespace-nowrap text-ellipsis">{{
+                                t('Model') }}</span>
+                        </div>
+                        <a v-for="link in sub2apiLinks" :key="link.label" v-show="link.url" :href="link.url || undefined"
+                            target="_blank" rel="noopener noreferrer"
+                            class="flex gap-3 items-center p-2 rounded-lg cursor-pointer text-[var(--text-primary)] hover:bg-[var(--fill-tsp-white-main)]">
+                            <div class="flex-shrink-0 w-5 h-5">
+                                <ExternalLink :size="20" />
+                            </div>
+                            <span
+                                class="overflow-hidden flex-1 text-sm font-medium leading-5 whitespace-nowrap text-ellipsis">{{
+                                t(link.label) }}</span>
+                        </a>
                         <div class="w-full h-[1px] my-1 bg-[var(--border-main)]"></div>
                         <div v-if="authProvider !== 'none'"
                             class="flex gap-3 items-center p-2 rounded-lg cursor-pointer hover:bg-[var(--fill-tsp-white-main)] text-[var(--function-error)]"
@@ -65,14 +85,15 @@ import { useRouter } from 'vue-router';
 import { useI18n } from 'vue-i18n';
 import { useAuth } from '../composables/useAuth';
 import { useSettingsDialog } from '../composables/useSettingsDialog';
-import { getCachedAuthProvider } from '../api/config';
-import { LogOut, User, Settings2 } from 'lucide-vue-next';
+import { getCachedAuthProvider, getCachedClientConfig } from '../api/config';
+import { BrainCircuit, ExternalLink, LogOut, User, Settings2 } from 'lucide-vue-next';
 
 const router = useRouter();
 const { t } = useI18n();
 const { currentUser, logout } = useAuth();
 const { openSettingsDialog } = useSettingsDialog();
 const authProvider = ref<string | null>(null);
+const sub2apiLinks = ref<{ label: string; url: string | null }[]>([]);
 
 // Get first letter of user's fullname for avatar display
 const avatarLetter = computed(() => {
@@ -89,6 +110,10 @@ const handleSettingsClick = () => {
     openSettingsDialog('settings');
 };
 
+const handleModelClick = () => {
+    openSettingsDialog('model');
+};
+
 // Handle logout action
 const handleLogout = async () => {
     try {
@@ -101,5 +126,11 @@ const handleLogout = async () => {
 
 onMounted(async () => {
     authProvider.value = await getCachedAuthProvider();
+    const config = await getCachedClientConfig();
+    sub2apiLinks.value = [
+        { label: 'Sub2API Console', url: config?.sub2api_console_url ?? null },
+        { label: 'Model Marketplace', url: config?.sub2api_marketplace_url ?? null },
+        { label: 'Use Token', url: config?.sub2api_use_token_url ?? null },
+    ];
 });
 </script>

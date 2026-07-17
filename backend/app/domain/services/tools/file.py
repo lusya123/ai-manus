@@ -8,10 +8,11 @@ class FileToolkit(BaseToolkit):
 
     name: str = "file"
     instructions: str = """
-- Prefer file tools over shell redirection to avoid escaping issues
-- Actively save intermediate results; keep different kinds of reference material in separate files
-- Use append mode to concatenate content onto an existing file
-- Only read text, code, or markdown files; never read binary files
+- Prefer file tools over shell redirection to avoid escaping errors
+- Save useful intermediate results and keep different reference types separate
+- Only read text, code, or Markdown files; never read binary data as text
+- Put final user-facing files under /home/ubuntu/upload unless another absolute path was requested
+- Verify every deliverable exists and contains the expected content before attaching it
 """
     
     def __init__(self, sandbox: Sandbox):
@@ -23,7 +24,7 @@ class FileToolkit(BaseToolkit):
         super().__init__()
         self.sandbox = sandbox
         
-    @tool(parse_docstring=True)
+    @tool(parse_docstring=True, retryable=True)
     async def file_read(
         self,
         file: str,
@@ -108,7 +109,7 @@ class FileToolkit(BaseToolkit):
             sudo=sudo
         )
     
-    @tool(parse_docstring=True)
+    @tool(parse_docstring=True, retryable=True)
     async def file_find_in_content(
         self,
         file: str,
@@ -129,7 +130,7 @@ class FileToolkit(BaseToolkit):
             sudo=sudo
         )
     
-    @tool(parse_docstring=True)
+    @tool(parse_docstring=True, retryable=True)
     async def file_find_by_name(
         self,
         path: str,
@@ -145,4 +146,4 @@ class FileToolkit(BaseToolkit):
         return await self.sandbox.file_find(
             path=path,
             glob_pattern=glob
-        ) 
+        )

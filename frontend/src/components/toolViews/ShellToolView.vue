@@ -4,7 +4,14 @@
     <div dir="ltr" data-orientation="horizontal" class="flex flex-col flex-1 min-h-0">
       <div
         class="py-2 flex-1 font-mono text-sm leading-relaxed px-3 outline-none overflow-auto whitespace-pre-wrap break-all">
-        <code v-html="shell"></code>
+        <div data-testid="shell-console">
+          <div v-for="(record, index) in shellRecords" :key="index">
+            <div>
+              <span class="text-[#00bb00]">{{ record.ps1 }}</span><span> {{ record.command }}</span>
+            </div>
+            <div>{{ record.output }}</div>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -14,6 +21,7 @@
 import { ref, computed, toRef } from 'vue';
 import { viewShellSession } from '@/api/agent';
 import { ToolContent } from '@/types/message';
+import type { ConsoleRecord } from '@/types/response';
 import ToolViewHeader from './ToolViewHeader.vue';
 import { useLiveToolContent } from '@/composables/useLiveToolContent';
 
@@ -29,7 +37,7 @@ defineExpose({
   }
 });
 
-const shell = ref('');
+const shellRecords = ref<ConsoleRecord[]>([]);
 
 // Get shellSessionId from toolContent
 const shellSessionId = computed(() => {
@@ -39,17 +47,9 @@ const shellSessionId = computed(() => {
   return '';
 });
 
-const updateShellContent = (console: any) => {
-  if (!console) return;
-  let newShell = '';
-  for (const e of console) {
-    newShell += `<span style="color: rgb(0, 187, 0);">${e.ps1}</span><span> ${e.command}</span>\n`;
-    newShell += `<span>${e.output}</span>\n`;
-  }
-  if (newShell !== shell.value) {
-    shell.value = newShell;
-  }
-}
+const updateShellContent = (records: ConsoleRecord[] | null | undefined) => {
+  shellRecords.value = Array.isArray(records) ? records : [];
+};
 
 // Function to load Shell session content
 const loadShellContent = async () => {

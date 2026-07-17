@@ -8,11 +8,10 @@ class ShellToolkit(BaseToolkit):
 
     name: str = "shell"
     instructions: str = """
-- Avoid commands requiring interactive confirmation; use -y or -f flags
-- Avoid commands with excessive output; redirect to files when necessary
-- Chain related commands with && to minimize round-trips
-- Use non-interactive `bc` for simple math, Python for anything complex; never compute mentally
-- Save code to files before execution; never pipe code inline into interpreters
+- Avoid interactive confirmation; use appropriate non-interactive flags
+- Avoid excessive output and save large results to files
+- Use `bc` for simple arithmetic and saved Python files for complex calculations
+- Save code before execution; never pipe code inline into an interpreter
 """
     
     def __init__(self, sandbox: Sandbox):
@@ -40,7 +39,7 @@ class ShellToolkit(BaseToolkit):
         """
         return await self.sandbox.exec_command(id, exec_dir, command)
     
-    @tool(parse_docstring=True)
+    @tool(parse_docstring=True, retryable=True)
     async def shell_view(self, id: str) -> ToolResult:
         """View the content of a specified shell session. Use for checking command execution results or monitoring output.
         
@@ -49,7 +48,7 @@ class ShellToolkit(BaseToolkit):
         """
         return await self.sandbox.view_shell(id)
     
-    @tool(parse_docstring=True)
+    @tool(parse_docstring=True, retryable=True)
     async def shell_wait(
         self,
         id: str,

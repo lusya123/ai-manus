@@ -1,6 +1,14 @@
 from typing import Protocol, BinaryIO, Optional, Dict, Any, Tuple
 from app.domain.models.file import FileInfo
 
+
+class FileTooLargeError(RuntimeError):
+    """A file exceeds the configured single-file storage limit."""
+
+
+class FileStorageQuotaExceededError(RuntimeError):
+    """A user has exhausted the configured byte or file-count quota."""
+
 class FileStorage(Protocol):
     """File storage service interface for file upload and download operations"""
     
@@ -75,4 +83,3 @@ class FileStorage(Protocol):
             FileInfo containing file metadata, None if file not found
         """
         ...
-

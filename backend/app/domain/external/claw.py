@@ -24,8 +24,13 @@ class ClawRuntime(Protocol):
         """Create a new claw instance. Returns connection info."""
         ...
 
-    async def destroy(self, instance_name: Optional[str]) -> None:
-        """Destroy a claw instance (best-effort, should not raise)."""
+    async def destroy(self, instance_name: Optional[str]) -> bool:
+        """Destroy a claw instance.
+
+        Returns ``True`` when the instance is gone (including already absent)
+        and ``False`` when cleanup failed.  Implementations may raise for
+        unexpected failures; callers must retain ownership for retry.
+        """
         ...
 
     async def wait_for_ready(self, base_url: str) -> bool:

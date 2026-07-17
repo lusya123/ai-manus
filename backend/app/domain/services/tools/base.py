@@ -1,20 +1,8 @@
-"""Framework-agnostic tool abstraction for the domain layer.
+"""Framework-agnostic tool and structured-output abstractions.
 
-A lightweight ``@tool`` decorator parses the method signature and its
-Google-style docstring into an OpenAI-compatible function schema, and
-``Tool`` / ``BaseToolkit`` expose the tools for the agent loop and the LLM
-gateway.
-
-Two additional concepts support modern context engineering:
-
-* ``Tool.dynamic`` — build an invocable tool from a runtime schema and an
-  async invoker (used for MCP tools discovered at runtime), so every tool the
-  LLM sees is dispatchable through the same ``BaseToolkit.get_tool`` path.
-* ``OutputTool`` — a schema-only tool the model calls to submit structured
-  output (plans, step reports, final results). It is never executed; the agent
-  loop validates the arguments against a Pydantic model and feeds validation
-  errors back to the model for self-repair. This replaces the legacy
-  "JSON-in-prompt + repair parser" protocol with native function calling.
+``Tool.dynamic`` makes runtime-discovered MCP schemas genuinely invocable,
+while ``OutputTool`` lets agents accept validated native function calls for
+plans and results instead of asking models to print JSON in prose.
 """
 import inspect
 import re
@@ -96,14 +84,25 @@ def _build_parameters(func: Callable, param_docs: Dict[str, str]) -> Dict[str, A
 class ToolFunction:
     """Marker produced by ``@tool``; collected by ``BaseToolkit`` at init."""
 
-    def __init__(self, func: Callable, name: str, description: str, parameters: Dict[str, Any]):
+    def __init__(
+        self,
+        func: Callable,
+        name: str,
+        description: str,
+        parameters: Dict[str, Any],
+        *,
+        retryable: bool = False,
+    ):
         self.func = func
         self.name = name
         self.description = description
         self.parameters = parameters
+        # False is deliberately the safe default: a transport exception does
+        # not prove that a remote side effect failed to commit.
+        self.retryable = retryable
 
 
-def tool(func: Optional[Callable] = None, **_kwargs: Any):
+def tool(func: Optional[Callable] = None, **kwargs: Any):
     """Decorator that turns an async method into a :class:`ToolFunction`.
 
     Accepts and ignores extra keyword arguments (e.g. ``parse_docstring``) for
@@ -118,6 +117,7 @@ def tool(func: Optional[Callable] = None, **_kwargs: Any):
             name=f.__name__,
             description=summary,
             parameters=parameters,
+            retryable=bool(kwargs.get("retryable", False)),
         )
 
     if callable(func):
@@ -135,11 +135,14 @@ class Tool:
         parameters: Dict[str, Any],
         invoker: Callable[[Dict[str, Any]], Awaitable[Any]],
         toolkit: "BaseToolkit",
+        *,
+        retryable: bool = False,
     ):
         self.name = name
         self.description = description
         self.parameters = parameters
         self.toolkit = toolkit
+        self.retryable = retryable
         self._invoker = invoker
 
     @classmethod
@@ -155,6 +158,7 @@ class Tool:
             parameters=tool_function.parameters,
             invoker=invoker,
             toolkit=toolkit,
+            retryable=tool_function.retryable,
         )
 
     @classmethod
@@ -165,14 +169,17 @@ class Tool:
         parameters: Dict[str, Any],
         invoker: Callable[[Dict[str, Any]], Awaitable[Any]],
         toolkit: "BaseToolkit",
+        *,
+        retryable: bool = False,
     ) -> "Tool":
-        """Build a tool from a runtime-discovered schema (e.g. an MCP tool)."""
+        """Build a tool from a runtime-discovered schema (for example MCP)."""
         return cls(
             name=name,
             description=description,
             parameters=parameters,
             invoker=invoker,
             toolkit=toolkit,
+            retryable=retryable,
         )
 
     async def invoke(self, args: Dict[str, Any]) -> Any:
@@ -192,14 +199,7 @@ class Tool:
 
 
 class OutputTool:
-    """A schema-only tool the model calls to submit structured output.
-
-    The agent loop never executes it; instead the arguments are validated
-    against ``schema`` and returned as the structured result of the run.
-    Validation errors are sent back to the model as the tool response so it
-    can correct itself — native function calling replaces prompt-embedded
-    JSON format instructions.
-    """
+    """A schema-only function call used to submit a structured agent result."""
 
     def __init__(self, name: str, description: str, schema: Type[BaseModel]):
         self.name = name
@@ -208,15 +208,11 @@ class OutputTool:
         self.parameters = _clean_schema(schema.model_json_schema())
 
     def validate(self, args: Dict[str, Any]) -> BaseModel:
-        """Validate raw tool-call arguments against the output schema.
-
-        Raises:
-            pydantic.ValidationError: when the arguments do not conform.
-        """
+        """Validate raw call arguments against the declared Pydantic model."""
         return self.schema.model_validate(args or {})
 
     def to_openai_schema(self) -> Dict[str, Any]:
-        """Render this output tool as an OpenAI function-calling schema."""
+        """Render this output contract as an OpenAI function schema."""
         return {
             "type": "function",
             "function": {
@@ -228,12 +224,7 @@ class OutputTool:
 
 
 class BaseToolkit:
-    """Base toolset class, providing common tool discovery and lookup.
-
-    Subclasses may set ``instructions`` — usage guidance that is assembled
-    into the system prompt only when the toolkit is actually bound to the
-    agent, keeping prompt content and available tools in sync.
-    """
+    """Base toolset with optional prompt guidance for its bound tools."""
 
     name: str = ""
     instructions: str = ""
@@ -262,17 +253,12 @@ class BaseToolkit:
 
 
 def describe_toolkits(toolkits: List[BaseToolkit]) -> str:
-    """Render a compact capability overview of the given toolkits.
-
-    Used to inform the planner about available capabilities without paying
-    the context cost of full function schemas.
-    """
+    """Render a compact planner-facing overview without full JSON schemas."""
     lines: List[str] = []
     for toolkit in toolkits:
-        tool_names = [t.name for t in toolkit.get_tools()]
-        if not tool_names:
-            continue
-        lines.append(f"- {toolkit.name}: {', '.join(tool_names)}")
+        tool_names = [tool.name for tool in toolkit.get_tools()]
+        if tool_names:
+            lines.append(f"- {toolkit.name}: {', '.join(tool_names)}")
     return "\n".join(lines)
 
 

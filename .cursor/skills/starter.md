@@ -35,9 +35,12 @@ To stop: `./dev.sh down`
 |---|---|---|
 | `AUTH_PROVIDER` | `none` (skip login) or `local` | Controls auth; `local` uses `LOCAL_AUTH_EMAIL`/`LOCAL_AUTH_PASSWORD` |
 | `LOCAL_AUTH_EMAIL` | `admin@example.com` | Single-user local auth email |
-| `LOCAL_AUTH_PASSWORD` | `admin` | Single-user local auth password |
+| `LOCAL_AUTH_PASSWORD` | output of `openssl rand -base64 32` | Single-user local auth password; never reuse the development default outside disposable local work |
 | `API_BASE` | `http://mockserver:8090/v1` | Points backend at the mock LLM server |
 | `API_KEY` | any non-empty string | Required – set to anything when using mockserver |
+| `JWT_SECRET_KEY` | output of `openssl rand -hex 32` | Required with authentication and in staging/production |
+| `REGISTRATION_ENABLED` | `false` | Public registration is closed by default |
+| `BACKEND_REPLICA_COUNT` | `1` | Local task execution supports exactly one backend Python process |
 | `SEARCH_PROVIDER` | `bing_web` | No API key needed |
 | `SANDBOX_ADDRESS` | `sandbox` | Uses the single dev sandbox container |
 | `LOG_LEVEL` | `DEBUG` | Verbose logs for development |
@@ -48,7 +51,7 @@ Set `AUTH_PROVIDER=none` in `.env`. The frontend treats the user as an anonymous
 
 ### Using Local Auth
 
-Set `AUTH_PROVIDER=local`. Login at `http://localhost:5173/login` with `LOCAL_AUTH_EMAIL` / `LOCAL_AUTH_PASSWORD` (defaults: `admin@example.com` / `admin`).
+Set `AUTH_PROVIDER=local`, keep `LOCAL_AUTH_EMAIL=admin@example.com` or choose another address, and generate `LOCAL_AUTH_PASSWORD` with `openssl rand -base64 32`. Login at `http://localhost:5173/login`. Common weak defaults are rejected outside development/local/test.
 
 ---
 
@@ -61,10 +64,25 @@ cd backend
 # Install deps (requires uv – https://github.com/astral-sh/uv)
 uv sync
 # Needs running MongoDB and Redis (start via docker or locally)
-uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --ws-max-size 131072
 ```
 
-Requires `API_KEY` env var set (or a `.env` file in `backend/`). The app calls `get_settings().validate()` on startup and raises if `API_KEY` is empty.
+Requires `API_KEY` and, unless using disposable local `AUTH_PROVIDER=none`, a strong `JWT_SECRET_KEY` (or a `.env` file in `backend/`). The app validates both on startup.
+
+### Security-sensitive setup rules
+
+- Generate JWT, local-auth, `MODEL_CREDENTIAL_ENCRYPTION_KEYS`, and `CLAW_API_KEY_HMAC_KEYS` values independently; never copy a public example into a live environment. `REGISTRATION_ENABLED` remains `false` unless a test explicitly needs signup.
+- New password hashes use random per-user PBKDF2-SHA256 salts and at least 600,000 rounds. `PASSWORD_SALT`/`PASSWORD_LEGACY_HASH_ROUNDS` are only for progressively upgrading old hashes.
+- Redis contains security state, not disposable cache data. Keep the Compose AOF `everysec`, `noeviction`, and named-volume settings, or give an external production Redis equivalent persistence, backups, and high availability. A host crash can still lose roughly one second of AOF writes, so Redis is not a hard billing ledger.
+- Set `CORS_ALLOWED_ORIGINS` to comma-separated exact browser origins in non-local deployments. Wildcards and credentialed CORS are rejected.
+- Refresh tokens are single-use and rotate inside a logout-revocable family. Sub2API browser handoff requires a one-time random `state`, fragment-only credentials, and `/auth/me` verification before commit.
+- Run `scripts/rotate_model_credential_keys.py` without `--apply` before any BYOK key rotation. Pre-marker plaintext credential migration requires every historical server/catalog key in temporary `LEGACY_SYSTEM_API_KEYS` and a dry run of `scripts/migrate_agent_credentials.py`.
+- Preserve the multipart pre-parser cap, per-file limit, and per-user GridFS quotas when debugging uploads. Claw has additional WebSocket, attachment, proxy, upload, and bounded-history limits.
+- `TASK_BACKEND=local` requires `BACKEND_REPLICA_COUNT=1`. Multiple API processes/replicas require Celery and identical Redis, MongoDB, JWT, model-keyring, and sandbox settings across backend/workers.
+- AgentBay deletion waits for task cancellation and provider confirmation; failed cleanup retains the session ID for retry. Never print or log signed AgentBay gateway links.
+- Keep user/model-controlled Docker runtimes on `manus-network` and MongoDB/Redis on the internal `manus-data-network`. Backend is the only application service attached to both; never attach sandbox or Claw to the data network.
+
+<!-- Added 2026-07-16: security, secret-rotation, upload, and multi-replica deployment invariants. -->
 
 ### Frontend
 
@@ -132,11 +150,13 @@ uv run pytest
 
 ### 3.3 Frontend
 
-No automated test runner is configured. Validate with:
+Validate with the Vitest suite and static/build checks:
 
 ```bash
 cd frontend
+npm run test          # Vitest unit tests (src/**/*.spec.ts)
 npm run type-check    # vue-tsc type checking
+npm run lint          # ESLint
 npm run build         # production build (catches template + TS errors)
 ```
 
@@ -179,7 +199,7 @@ The mockserver tracks a `current_index` for sequential canned responses. It auto
 
 ### MongoDB data
 
-Dev data persists in a named volume `manus-mongodb-data`. To wipe: `./dev.sh down -v`.
+Dev uses the `ai-manus-dev` Compose project, `manus-network-dev` runtime network, and `manus-mongodb-data-dev` volume, all separate from production. To wipe the dev project: `./dev.sh down -v`.
 
 ---
 
@@ -189,10 +209,10 @@ Dev data persists in a named volume `manus-mongodb-data`. To wipe: `./dev.sh dow
 
 | Method | Path | Auth | Notes |
 |---|---|---|---|
-| POST | `/auth/register` | No | `{fullname, email, password}` |
+| POST | `/auth/register` | No | `{fullname, email, password}`; rejected unless `REGISTRATION_ENABLED=true` |
 | POST | `/auth/login` | No | `{email, password}` → tokens |
-| POST | `/auth/refresh` | No | `{refresh_token}` → new access token |
-| POST | `/auth/logout` | Bearer | Invalidates session |
+| POST | `/auth/refresh` | No | `{refresh_token}` → replacement access/refresh pair; input token becomes unusable |
+| POST | `/auth/logout` | Bearer | Revokes the token family; send the current refresh token in the body (required for Sub2API) |
 | GET | `/auth/status` | No | Returns `{authenticated, auth_provider}` |
 | GET | `/auth/me` | Bearer | Current user info |
 | POST | `/auth/change-password` | Bearer | `{old_password, new_password}` |

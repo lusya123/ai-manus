@@ -32,6 +32,23 @@
       class="max-w-none p-0 m-0 prose prose-sm sm:prose-base dark:prose-invert [&_pre:not(.shiki)]:!bg-[var(--fill-tsp-white-light)] [&_pre:not(.shiki)]:text-[var(--text-primary)] text-base text-[var(--text-primary)]"
       v-html="renderMarkdown(messageContent.content)"></div>
   </div>
+  <div v-else-if="message.type === 'thinking'" class="flex flex-col gap-1 w-full group"
+    :class="hideAssistantHeader ? 'mt-0' : 'mt-3'">
+    <div v-if="!hideAssistantHeader" class="flex items-center justify-between h-7 group">
+      <div class="flex items-center gap-[3px]">
+        <component v-if="assistantIcon" :is="assistantIcon" :size="24" class="w-6 h-6" />
+        <Bot v-else :size="24" class="w-6 h-6" />
+        <span v-if="assistantName" class="text-base text-[var(--text-primary)] tracking-tight leading-none ml-0.5">{{ assistantName }}</span>
+        <ManusTextIcon v-else-if="!assistantIcon" />
+      </div>
+      <div class="float-right text-[12px] text-[var(--text-tertiary)] invisible group-hover:visible">
+        {{ relativeTime(messageContent.timestamp) }}
+      </div>
+    </div>
+    <div class="max-w-none whitespace-pre-wrap text-xs italic leading-relaxed text-[var(--text-tertiary)] opacity-80">
+      {{ messageContent.content }}
+    </div>
+  </div>
   <ToolUse v-else-if="message.type === 'tool'" :tool="toolContent" @click="handleToolClick(toolContent)" />
   <div v-else-if="message.type === 'step'" class="flex flex-col">
     <div class="text-sm w-full clickable flex gap-2 justify-between group/header truncate text-[var(--text-primary)]"

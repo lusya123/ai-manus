@@ -22,10 +22,12 @@ from langchain_core.prompts import PromptTemplate
 
 from app.core.config import Settings, get_settings
 from app.domain.models.message import LLMMessage, Role, ToolCall
+from app.domain.utils.model_output import normalize_model_content
 from app.infrastructure.external.llm.robust_json_parser import (
     RobustJsonParser,
     ToolCallParseError,
 )
+from app.infrastructure.external.llm.security import provider_api_base, provider_api_key
 
 logger = logging.getLogger(__name__)
 
@@ -36,18 +38,36 @@ class LangchainLLM:
     _JSON_PARSE_PROMPT = PromptTemplate.from_template(
         "Extract or repair the JSON from the following LLM output.\n\n{input}"
     )
+    _EMPTY_TOOL_USE_RETRY_PROMPT = (
+        "Your previous response stopped for a tool call but did not include a "
+        "valid tool call payload. Please either call exactly one available tool "
+        "with complete JSON arguments, or respond with the required final text."
+    )
+    _EMPTY_TOOL_USE_FALLBACK_PROMPT = (
+        "Tool calling failed repeatedly because the provider returned empty "
+        "tool_use responses. Do not call tools now. Use the observations and "
+        "tool results already in the conversation to produce the required final "
+        "response. If JSON is required, return valid JSON only."
+    )
 
     def __init__(self, settings: Optional[Settings] = None, max_retries: int = 3):
         settings = settings or get_settings()
         self._max_retries = max_retries
+        self._model_provider = settings.model_provider.lower()
+        api_key = provider_api_key(settings, self._model_provider)
+        api_base = provider_api_base(
+            settings, self._model_provider, settings.api_base
+        )
 
         kwargs: Dict[str, Any] = dict(
             model=settings.model_name,
-            model_provider=settings.model_provider,
+            model_provider=self._model_provider,
             temperature=settings.temperature,
             max_tokens=settings.max_tokens,
-            base_url=settings.api_base,
+            base_url=api_base,
         )
+        if api_key:
+            kwargs["api_key"] = api_key
         if settings.extra_headers:
             kwargs["default_headers"] = settings.extra_headers
         self._model = init_chat_model(**kwargs)
@@ -57,6 +77,7 @@ class LangchainLLM:
             llm=self._model,
             max_retries=self._max_retries,
         )
+        self._closed = False
 
     # ------------------------------------------------------------------
     # Message translation (domain <-> LangChain)
@@ -101,14 +122,18 @@ class LangchainLLM:
             )
             for tc in (message.tool_calls or [])
         ]
-        raw = message.content
-        if isinstance(raw, str):
-            content = raw
-        elif raw is None:
-            content = ""
-        else:
-            content = str(raw)
+        content = normalize_model_content(message.content)
         return LLMMessage.assistant(content=content, tool_calls=tool_calls)
+
+    @staticmethod
+    def _is_empty_tool_use_response(message: AIMessage) -> bool:
+        stop_reason = (message.response_metadata or {}).get("stop_reason")
+        return (
+            stop_reason == "tool_use"
+            and not message.tool_calls
+            and not message.invalid_tool_calls
+            and not normalize_model_content(message.content).strip()
+        )
 
     # ------------------------------------------------------------------
     # LLM Protocol
@@ -121,22 +146,62 @@ class LangchainLLM:
         response_format: Optional[str] = None,
         tool_choice: Optional[str] = None,
     ) -> LLMMessage:
-        rf = {"type": response_format} if response_format else None
+        bind_kwargs: Dict[str, Any] = {}
+        if response_format and self._model_provider != "anthropic":
+            bind_kwargs["response_format"] = {"type": response_format}
+        if tool_choice is not None:
+            bind_kwargs["tool_choice"] = tool_choice
 
-        model = self._model.bind(response_format=rf, tool_choice=tool_choice)
-        if tools:
-            model = model.bind_tools(tools)
+        def build_chain(use_tools: bool = True):
+            effective_bind_kwargs = dict(bind_kwargs)
+            if not use_tools or not tools:
+                # A provider cannot satisfy a required/forced tool choice when
+                # the recovery path deliberately removes all tool schemas.
+                # Keeping it here makes the empty-tool-use fallback fail at
+                # the transport layer instead of producing a final answer.
+                effective_bind_kwargs.pop("tool_choice", None)
+                model = self._model.bind(**effective_bind_kwargs)
+            else:
+                # ``bind_tools`` creates a new runnable from the underlying
+                # chat model. Calling it after ``bind(tool_choice=...)`` can
+                # replace that earlier binding, silently turning a required
+                # output-tool call back into an optional one. Bind the schemas
+                # and all invocation options atomically instead.
+                if (
+                    self._model_provider == "anthropic"
+                    and effective_bind_kwargs.get("tool_choice") == "required"
+                ):
+                    # LangChain's Anthropic adapter names the cross-provider
+                    # "at least one tool" choice ``any``.
+                    effective_bind_kwargs["tool_choice"] = "any"
+                model = self._model.bind_tools(tools, **effective_bind_kwargs)
+            return model | RobustJsonParser.from_llm(self._model)
 
         # Stages 1-3: RobustJsonParser repairs invalid tool call JSON locally
         # and via a cheap fixing call. Stages 4-5: this outer loop retries the
         # model, silently first then with error feedback.
-        chain = model | RobustJsonParser.from_llm(self._model)
+        chain = build_chain(use_tools=True)
 
-        context = self._to_langchain(messages)
+        original_context = self._to_langchain(messages)
+        context = list(original_context)
         message: Optional[AIMessage] = None
+        saw_empty_tool_use = False
         for attempt in range(self._max_retries):
             try:
                 message = await chain.ainvoke(context)
+                if self._is_empty_tool_use_response(message):
+                    saw_empty_tool_use = True
+                    if attempt == self._max_retries - 1:
+                        break
+                    logger.warning(
+                        "Attempt %d/%d: model returned empty tool_use response, retrying",
+                        attempt + 1,
+                        self._max_retries,
+                    )
+                    context = context + [
+                        HumanMessage(content=self._EMPTY_TOOL_USE_RETRY_PROMPT)
+                    ]
+                    continue
                 break
             except ToolCallParseError as e:
                 if attempt == self._max_retries - 1:
@@ -150,13 +215,46 @@ class LangchainLLM:
                     # Stage 5: append the failed message and error feedback.
                     context = e.make_retry_context(context)
 
-        logger.debug("Response from model: %s", message)
+        if message is None:
+            raise RuntimeError("Model did not return a response")
+
+        if saw_empty_tool_use and self._is_empty_tool_use_response(message):
+            logger.warning(
+                "Model kept returning empty tool_use responses; retrying once without tools"
+            )
+            message = await build_chain(use_tools=False).ainvoke(
+                original_context
+                + [HumanMessage(content=self._EMPTY_TOOL_USE_FALLBACK_PROMPT)]
+            )
+
+        logger.debug(
+            "Model response received: content_chars=%d tool_calls=%d",
+            len(str(message.content or "")),
+            len(message.tool_calls or []),
+        )
         return self._from_langchain(message)
 
     async def parse_json(self, text: str) -> Dict[str, Any]:
         """Extract/repair a JSON object from raw model output."""
         prompt_value = self._JSON_PARSE_PROMPT.format_prompt(input=text)
         return await self._json_output_parser.aparse_with_prompt(text, prompt_value)
+
+    async def aclose(self) -> None:
+        """Release this gateway without closing LangChain's provider clients.
+
+        ``init_chat_model`` owns the provider client lifecycle.  In particular,
+        current LangChain OpenAI and Anthropic integrations cache their default
+        HTTPX transports and share them between model instances.  Closing an
+        internal ``root_async_client`` here therefore closes the process-wide
+        transport and breaks subsequently-created gateways.
+
+        This adapter does not inject an HTTP client of its own, so it has no
+        client resource to close.  Native gateways that construct their own
+        clients continue to close those clients in their own implementations.
+        """
+        if self._closed:
+            return
+        self._closed = True
 
 
 @lru_cache()

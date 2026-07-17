@@ -8,9 +8,9 @@ class MessageToolkit(BaseToolkit):
 
     name: str = "message"
     instructions: str = """
-- Use message_notify_user for brief one-sentence progress updates; it needs no reply
-- Use message_ask_user only when blocked without user input (clarification, confirmation, credentials, or browser takeover)
-- Deliver final results and files to the user, not todo lists, advice, or plans
+- Use message_notify_user for brief progress updates that need no response
+- Use message_ask_user only when blocked on essential input, authorization, credentials, or browser takeover
+- Deliver actual results and verified files, not internal plans or todo lists
 """
     
     def __init__(self):

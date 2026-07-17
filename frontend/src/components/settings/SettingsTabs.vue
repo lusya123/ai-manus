@@ -24,7 +24,7 @@
               :class="[
                 'flex px-1 py-2 items-center text-[14px] leading-5 text-[var(--text-primary)] max-md:whitespace-nowrap md:h-8 md:gap-2 md:self-stretch md:px-4 md:rounded-lg hover:bg-[var(--fill-tsp-white-main)]',
                 {
-                  'md:bg-[var(--fill-tsp-white-main)] font-medium max-md:border-b-[2px] max-md:border-[var(--Button-primray-black)]': activeTab === tab.id
+                  'md:bg-[var(--fill-tsp-white-main)] font-medium max-md:border-b-[2px] max-md:border-[var(--Button-primary-black)]': activeTab === tab.id
                 }
               ]">
               <span class="hidden md:block" :class="activeTab === tab.id ? 'text-[var(--icon-primary)]' : 'text-[var(--icon-secondary)]'">
@@ -65,7 +65,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { Bot, ChevronLeft } from 'lucide-vue-next'
 import ManusLogoTextIcon from '@/components/icons/ManusLogoTextIcon.vue'
@@ -105,6 +105,12 @@ const { t } = useI18n()
 
 // Active tab state
 const activeTab = ref<string>(props.defaultTab || props.tabs[0]?.id || '')
+
+watch(() => props.defaultTab, (defaultTab) => {
+  if (defaultTab && props.tabs.some((tab) => tab.id === defaultTab)) {
+    activeTab.value = defaultTab
+  }
+})
 
 // Computed active tab title
 const activeTabTitle = computed(() => {

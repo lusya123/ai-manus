@@ -33,6 +33,12 @@ def _create_celery_app() -> Celery:
         task_ignore_result=True,
         # Agent tasks are long-running; don't prefetch more than one per worker process
         worker_prefetch_multiplier=1,
+        # Durable turns must be redelivered after a worker process dies. The
+        # Redis task claim has its own renewable owner/lease, so a redelivery
+        # cannot execute concurrently with a worker that still owns it.
+        task_acks_late=True,
+        task_reject_on_worker_lost=True,
+        worker_cancel_long_running_tasks_on_connection_loss=True,
         broker_connection_retry_on_startup=True,
     )
     return app

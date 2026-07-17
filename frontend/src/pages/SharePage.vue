@@ -166,11 +166,14 @@ const simpleBarRef = ref<InstanceType<typeof SimpleBar>>();
 let countdownTimer: number | null = null;
 
 // Shared SSE event -> message list conversion
-const { handleEvent } = useAgentEvents(
+const { handleEvent, resetEventHistory } = useAgentEvents(
   { messages, title, plan, isLoading, lastEventId, lastTool, lastNoMessageTool },
   {
     onToolActivity: (tool: ToolContent) => {
-      if (realTime.value) {
+      // Public tool arguments and most results are intentionally redacted.
+      // Only open the workspace for content the shared mapper explicitly
+      // deemed safe (currently screenshots and sanitized local previews).
+      if (realTime.value && tool.content) {
         toolPanel.value?.showToolPanel(tool, false);
       }
     },
@@ -189,6 +192,7 @@ watch(messages, async () => {
 
 // Reset all refs to their initial values
 const resetState = () => {
+  resetEventHistory();
   // Reset reactive state to initial values
   Object.assign(state, createInitialState());
 };
@@ -278,6 +282,7 @@ onUnmounted(() => {
 });
 
 const handleToolClick = (tool: ToolContent) => {
+  if (!tool.content) return;
   realTime.value = false;
   if (sessionId.value) {
     toolPanel.value?.showToolPanel(tool, false);
@@ -286,7 +291,7 @@ const handleToolClick = (tool: ToolContent) => {
 
 const jumpToRealTime = () => {
   realTime.value = true;
-  if (lastNoMessageTool.value) {
+  if (lastNoMessageTool.value?.content) {
     toolPanel.value?.showToolPanel(lastNoMessageTool.value, false);
   }
 }
@@ -322,4 +327,3 @@ const handleCopyLink = async () => {
   }
 }
 </script>
-

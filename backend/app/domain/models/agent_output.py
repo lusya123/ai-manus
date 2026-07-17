@@ -6,6 +6,7 @@ the model calls through native function calling to submit structured results
 Pydantic models, and arguments are validated against them with self-repair on
 failure — no JSON format instructions live in prompts anymore.
 """
+
 from typing import List
 
 from pydantic import BaseModel, Field

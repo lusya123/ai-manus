@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Any, Optional
 from datetime import datetime, UTC
 from pydantic import BaseModel, field_validator, EmailStr
 from enum import Enum
@@ -20,6 +20,9 @@ class User(BaseModel):
     created_at: datetime = datetime.now(UTC)
     updated_at: datetime = datetime.now(UTC)
     last_login_at: Optional[datetime] = None
+    auth_provider: Optional[str] = None
+    external_id: Optional[str] = None
+    external_user: Optional[dict[str, Any]] = None
     
     @field_validator('fullname')
     @classmethod
@@ -48,4 +51,4 @@ class User(BaseModel):
     def activate(self):
         """Activate user account"""
         self.is_active = True
-        self.updated_at = datetime.now(UTC) 
+        self.updated_at = datetime.now(UTC)

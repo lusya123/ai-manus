@@ -22,16 +22,17 @@ class TaskRunner(ABC):
     
     @abstractmethod
     async def destroy(self) -> None:
-        """Destroy the task and release resources.
-        
-        Called when the task needs to be destroyed.
-        This method is responsible for cleaning up and releasing all resources used by the task,
-        including but not limited to:
-        - Closing network connections
-        - Freeing memory
-        - Cleaning up temporary files
-        - Stopping background processes etc.
+        """Close task-runner handles without deleting persisted providers.
+
+        Destructive sandbox lifecycle belongs to ``SandboxProvisioner`` under
+        the session's distributed lease. This legacy method remains only for
+        compatibility with task backends that still call ``destroy``.
         """
+        ...
+
+    @abstractmethod
+    async def aclose(self) -> None:
+        """Close per-run client handles without deleting persisted resources."""
         ...
 
     @abstractmethod
@@ -71,6 +72,19 @@ class Task(Protocol):
 
         Returns:
             bool: True if the task is cancelled, False otherwise
+        """
+        ...
+
+    async def wait_for_done(self, timeout_seconds: float) -> bool:
+        """Wait for the execution side to acknowledge completion.
+
+        Cancellation is only a request for remote task backends.  Callers
+        that are about to release resources owned by a task must wait for
+        this acknowledgement first so a still-running worker cannot access a
+        sandbox after it has been destroyed.
+
+        Returns:
+            bool: ``True`` when the task is done, ``False`` on timeout.
         """
         ...
     
@@ -123,6 +137,11 @@ class Task(Protocol):
         Returns:
             Task: New task instance
         """
+        ...
+
+    @classmethod
+    def recover(cls, task_id: str, params: Dict[str, Any]) -> "Task":
+        """Reconstruct a handle for persisted streams after a process restart."""
         ...
 
     @classmethod

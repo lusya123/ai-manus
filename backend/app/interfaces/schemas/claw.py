@@ -29,11 +29,6 @@ class ClawResponse(BaseModel):
         )
 
 
-class ClawApiKeyResponse(BaseModel):
-    """API key response schema"""
-    api_key: str
-
-
 class ClawChatRequest(BaseModel):
     """Chat request schema"""
     message: str

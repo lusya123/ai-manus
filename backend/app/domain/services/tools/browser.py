@@ -8,12 +8,10 @@ class BrowserToolkit(BaseToolkit):
 
     name: str = "browser"
     instructions: str = """
-- Use browser tools to open every URL provided by the user and URLs from search results
-- Actively explore valuable links for deeper information
-- Tools return elements in the visible viewport as `index[:]<tag>text</tag>`; use the index for subsequent interactions
-- Not all interactive elements are listed; use coordinates for unlisted elements
-- Pages are auto-extracted to Markdown when possible; the extraction may include off-screen text but omits links/images and is not guaranteed complete
-- If the extracted Markdown already covers what you need, don't scroll; otherwise scroll to view the full page
+- Open every URL supplied by the user and useful original pages found through search
+- Search snippets are not sources; inspect the original page before relying on it
+- Tools expose visible elements as `index[:]<tag>text</tag>`; use indexes or coordinates to interact
+- Extracted Markdown may include off-screen text but can omit links, images, or content; scroll when needed
 """
     
     def __init__(self, browser: Browser):
@@ -25,7 +23,7 @@ class BrowserToolkit(BaseToolkit):
         super().__init__()
         self.browser = browser
     
-    @tool(parse_docstring=True)
+    @tool(parse_docstring=True, retryable=True)
     async def browser_view(self) -> ToolResult:
         """View content of the current browser page. Use for checking the latest state of previously opened pages.
         """
@@ -161,7 +159,7 @@ class BrowserToolkit(BaseToolkit):
         """
         return await self.browser.console_exec(javascript)
     
-    @tool(parse_docstring=True)
+    @tool(parse_docstring=True, retryable=True)
     async def browser_console_view(
         self,
         max_lines: Optional[int] = None
@@ -171,4 +169,4 @@ class BrowserToolkit(BaseToolkit):
         Args:
             max_lines: (Optional) Maximum number of log lines to return.
         """
-        return await self.browser.console_view(max_lines) 
+        return await self.browser.console_view(max_lines)

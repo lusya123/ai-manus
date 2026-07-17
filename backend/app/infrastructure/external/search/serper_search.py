@@ -6,6 +6,7 @@ import httpx
 from app.domain.external.search import SearchEngine
 from app.domain.models.search import SearchResultItem, SearchResults
 from app.domain.models.tool_result import ToolResult
+from app.domain.utils.error_reporting import safe_exception_summary
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +90,10 @@ class SerperSearchEngine(SearchEngine):
             return ToolResult(success=True, data=results)
 
         except Exception as e:
-            logger.error(f"Serper Search failed: {e}")
+            error_summary = safe_exception_summary(e)
+            logger.error(
+                "Serper Search failed: %s", error_summary
+            )
             error_results = SearchResults(
                 query=query,
                 date_range=date_range,
@@ -98,7 +102,7 @@ class SerperSearchEngine(SearchEngine):
             )
             return ToolResult(
                 success=False,
-                message=f"Serper Search failed: {e}",
+                message=f"Serper Search failed: {error_summary}",
                 data=error_results,
             )
 

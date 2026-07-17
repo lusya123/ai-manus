@@ -1,11 +1,18 @@
-from typing import Any, Optional, List
 import asyncio
 import logging
+import os
+from typing import Any, Optional, List
+
+# browser-use configures root/CDP handlers as an import side effect unless this
+# is set first. The application owns logging so signed AgentBay gateway URLs can
+# be filtered consistently.
+os.environ["BROWSER_USE_SETUP_LOGGING"] = "false"
 
 from browser_use.browser.session import BrowserSession, CDPSession
 from browser_use.dom.views import EnhancedDOMTreeNode
 
 from app.domain.models.tool_result import ToolResult
+from app.domain.utils.error_reporting import safe_exception_summary
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +59,7 @@ class BrowserUseBrowser:
                     logger.error(
                         "Failed to initialise BrowserSession after %d attempts: %s",
                         max_retries,
-                        exc,
+                        safe_exception_summary(exc),
                     )
                     raise
                 retry_delay = min(retry_delay * 2, 10.0)
@@ -61,7 +68,7 @@ class BrowserUseBrowser:
                     attempt + 1,
                     max_retries,
                     retry_delay,
-                    exc,
+                    safe_exception_summary(exc),
                 )
                 await asyncio.sleep(retry_delay)
 
@@ -73,7 +80,10 @@ class BrowserUseBrowser:
             try:
                 await self._session.stop()
             except Exception as exc:
-                logger.error("Error stopping BrowserSession: %s", exc)
+                logger.error(
+                    "Error stopping BrowserSession: %s",
+                    safe_exception_summary(exc),
+                )
             finally:
                 self._session = None
 
@@ -204,7 +214,10 @@ class BrowserUseBrowser:
 
             return self._format_selector_map(selector_map)
         except Exception as exc:
-            logger.warning("Failed to get interactive elements: %s", exc)
+            logger.warning(
+                "Failed to get interactive elements: %s",
+                safe_exception_summary(exc),
+            )
             return []
 
     async def _dispatch_mouse_event(

@@ -1,6 +1,7 @@
 import jwt
 from datetime import datetime, timedelta, UTC
 from typing import Optional, Dict, Any
+import secrets
 from app.core.config import get_settings
 from app.domain.models.user import User
 import logging
@@ -8,6 +9,9 @@ import logging
 import hashlib
 import hmac
 import urllib.parse
+
+from app.domain.utils.error_reporting import safe_exception_summary
+from app.infrastructure.logging import redact_capability_text
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +22,15 @@ class TokenService:
     def __init__(self):
         self.settings = get_settings()
     
-    def create_access_token(self, user: User) -> str:
+    @staticmethod
+    def new_session_id() -> str:
+        """Create an opaque identifier shared by one access/refresh pair."""
+
+        return secrets.token_urlsafe(24)
+
+    def create_access_token(
+        self, user: User, *, session_id: Optional[str] = None
+    ) -> str:
         """Create JWT access token for user"""
         now = datetime.now(UTC)
         expire = now + timedelta(minutes=self.settings.jwt_access_token_expire_minutes)
@@ -29,6 +41,9 @@ class TokenService:
             "email": user.email,
             "role": user.role.value,
             "is_active": user.is_active,
+            "sid": session_id or self.new_session_id(),
+            "jti": secrets.token_urlsafe(24),
+            "iat_ms": int(now.timestamp() * 1000),
             "iat": int(now.timestamp()),  # Issued at (timestamp)
             "exp": int(expire.timestamp()),  # Expiration time (timestamp)
             "type": "access"
@@ -40,13 +55,19 @@ class TokenService:
                 self.settings.jwt_secret_key,
                 algorithm=self.settings.jwt_algorithm
             )
-            logger.debug(f"Created access token for user: {user.fullname}")
+            logger.debug("Created access token for user_id=%s", user.id)
             return token
         except Exception as e:
-            logger.error(f"Failed to create access token: {e}")
+            logger.error(
+                "Failed to create access token for user_id=%s: %s",
+                user.id,
+                safe_exception_summary(e),
+            )
             raise
     
-    def create_refresh_token(self, user: User) -> str:
+    def create_refresh_token(
+        self, user: User, *, session_id: Optional[str] = None
+    ) -> str:
         """Create JWT refresh token for user"""
         now = datetime.now(UTC)
         expire = now + timedelta(days=self.settings.jwt_refresh_token_expire_days)
@@ -54,6 +75,12 @@ class TokenService:
         payload = {
             "sub": user.id,  # Subject (user ID)
             "fullname": user.fullname,
+            "email": user.email,
+            "role": user.role.value,
+            "is_active": user.is_active,
+            "sid": session_id or self.new_session_id(),
+            "jti": secrets.token_urlsafe(24),
+            "iat_ms": int(now.timestamp() * 1000),
             "iat": int(now.timestamp()),  # Issued at (timestamp)
             "exp": int(expire.timestamp()),  # Expiration time (timestamp)
             "type": "refresh"
@@ -65,13 +92,28 @@ class TokenService:
                 self.settings.jwt_secret_key,
                 algorithm=self.settings.jwt_algorithm
             )
-            logger.debug(f"Created refresh token for user: {user.fullname}")
+            logger.debug("Created refresh token for user_id=%s", user.id)
             return token
         except Exception as e:
-            logger.error(f"Failed to create refresh token: {e}")
+            logger.error(
+                "Failed to create refresh token for user_id=%s: %s",
+                user.id,
+                safe_exception_summary(e),
+            )
             raise
     
-    def verify_token(self, token: str) -> Optional[Dict[str, Any]]:
+    def create_token_pair(self, user: User) -> tuple[str, str]:
+        """Issue an access/refresh pair in the same revocable session family."""
+
+        session_id = self.new_session_id()
+        return (
+            self.create_access_token(user, session_id=session_id),
+            self.create_refresh_token(user, session_id=session_id),
+        )
+
+    def verify_token(
+        self, token: str, *, expected_type: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         """Verify JWT token and return payload"""
         try:
             payload = jwt.decode(
@@ -80,28 +122,34 @@ class TokenService:
                 algorithms=[self.settings.jwt_algorithm]
             )
             
+            if expected_type and payload.get("type") != expected_type:
+                logger.warning("Unexpected token type")
+                return None
+
             # Check if token is not expired
             exp = payload.get("exp")
             if exp and exp < int(datetime.now(UTC).timestamp()):
                 logger.warning("Token has expired")
                 return None
             
-            logger.debug(f"Token verified for user: {payload.get('fullname')}")
+            logger.debug("Token verified for user_id=%s", payload.get("sub"))
             return payload
             
         except jwt.ExpiredSignatureError:
             logger.warning("Token has expired")
             return None
         except jwt.InvalidTokenError as e:
-            logger.warning(f"Invalid token: {e}")
+            logger.warning("Invalid token: %s", safe_exception_summary(e))
             return None
         except Exception as e:
-            logger.error(f"Token verification failed: {e}")
+            logger.error(
+                "Token verification failed: %s", safe_exception_summary(e)
+            )
             return None
     
     def get_user_from_token(self, token: str) -> Optional[Dict[str, Any]]:
         """Extract user information from JWT token"""
-        payload = self.verify_token(token)
+        payload = self.verify_token(token, expected_type="access")
         
         if not payload:
             return None
@@ -161,15 +209,15 @@ class TokenService:
             logger.debug(f"Created resource access token for {resource_type}: {resource_id}, user: {user_id}")
             return token
         except Exception as e:
-            logger.error(f"Failed to create resource access token: {e}")
+            logger.error(
+                "Failed to create resource access token for resource_type=%s "
+                "resource_id=%s user_id=%s: %s",
+                resource_type,
+                resource_id,
+                user_id,
+                safe_exception_summary(e),
+            )
             raise
-
-    def revoke_token(self, token: str) -> bool:
-        """Revoke token (placeholder for token blacklist implementation)"""
-        # TODO:In a real implementation, you would add the token to a blacklist
-        # stored in Redis or database with expiration time
-        logger.warning(f"Token revoked (placeholder implementation)")
-        return True
 
     def create_signed_url(self, base_url: str, expire_minutes: int = 60) -> str:
         """Create URL with signature for resource access
@@ -217,7 +265,10 @@ class TokenService:
             parsed_url.fragment
         ))
         
-        logger.debug(f"Created signed URL for: {final_url}")
+        logger.debug(
+            "Created signed URL for resource path: %s",
+            redact_capability_text(final_url),
+        )
         return signed_url
     
     def verify_signed_url(self, request_url: str) -> bool:
@@ -230,9 +281,14 @@ class TokenService:
             True if valid, False if invalid
         """
         try:
-            logger.info(f"Verifying signed URL: {request_url}")
             # Parse URL and extract query parameters
             parsed_url = urllib.parse.urlparse(request_url)
+            # Query parameters contain bearer capabilities; never persist them
+            # in application logs.
+            logger.info(
+                "Verifying signed URL for path: %s",
+                redact_capability_text(parsed_url.path),
+            )
             query_params = urllib.parse.parse_qs(parsed_url.query)
             
             # Extract required parameters
@@ -277,9 +333,15 @@ class TokenService:
                 logger.warning("Invalid signature in signed URL")
                 return False
             
-            logger.debug(f"Signed URL verified for: {base_url}")
+            logger.debug(
+                "Signed URL verified for path: %s",
+                redact_capability_text(base_url),
+            )
             return True
             
         except Exception as e:
-            logger.error(f"Signed URL verification failed: {e}")
+            logger.error(
+                "Signed URL verification failed: %s",
+                safe_exception_summary(e),
+            )
             return False

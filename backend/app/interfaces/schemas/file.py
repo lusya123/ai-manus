@@ -36,5 +36,36 @@ class FileInfoResponse(BaseModel):
             size=file_info.size,
             upload_date=file_info.upload_date,
             metadata=file_info.metadata,
-            file_url=await file_service.create_signed_url(file_info.file_id)
+            file_url=(
+                await file_service.create_signed_url(file_info.file_id, file_info.user_id)
+                if file_info.user_id
+                else None
+            )
+        )
+
+
+class SharedFileInfoResponse(BaseModel):
+    """Minimum metadata safe to expose for a file in a public share."""
+
+    file_id: str
+    filename: str
+    content_type: Optional[str] = None
+    size: Optional[int] = None
+    upload_date: Optional[datetime] = None
+    file_url: str
+
+    @classmethod
+    async def from_domain(
+        cls,
+        file_info: FileInfo,
+        session_id: str,
+        file_url: str,
+    ) -> "SharedFileInfoResponse":
+        return cls(
+            file_id=file_info.file_id,
+            filename=file_info.filename,
+            content_type=file_info.content_type,
+            size=file_info.size,
+            upload_date=file_info.upload_date,
+            file_url=file_url,
         )

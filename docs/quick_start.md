@@ -28,7 +28,7 @@
 
 ## 部署
 
-使用 Docker Compose 进行部署，所有配置均通过 `.env` 文件（`env_file`）管理：
+使用 Docker Compose 进行部署。模型与功能配置通过 `.env` 文件（`env_file`）管理，部署安全和运行时隔离约束仍由 Compose 显式覆盖：
 
 <!-- docker-compose-example.yml -->
 ```yaml
@@ -56,10 +56,25 @@ services:
       #- ./mcp.json:/etc/mcp.json # Mount MCP servers directory
     networks:
       - manus-network
+      - manus-data-network
     env_file:
       # All configuration is loaded from the .env file, see .env.example
       # More configuration options: https://docs.ai-manus.com/#/configuration
       - .env
+    environment:
+      # Keep deployment security and runtime isolation as explicit overrides.
+      - API_KEY=${API_KEY:?required}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:?required}
+      - REGISTRATION_ENABLED=false
+      - DEPLOYMENT_ENVIRONMENT=production
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:?required}
+      - SANDBOX_IMAGE=simpleyyt/manus-sandbox
+      - SANDBOX_NETWORK=manus-network
+      - SANDBOX_MEMORY_LIMIT=2g
+      - SANDBOX_CPU_LIMIT=2.0
+      - SANDBOX_PIDS_LIMIT=512
+      - CLAW_IMAGE=simpleyyt/manus-claw
+      - CLAW_NETWORK=manus-network
 
   sandbox:
     image: simpleyyt/manus-sandbox
@@ -83,22 +98,31 @@ services:
     #ports:
     #  - "27017:27017"
     networks:
-      - manus-network
+      - manus-data-network
 
   redis:
     image: redis:7.0
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis_data:/data
     restart: unless-stopped
     networks:
-      - manus-network
+      - manus-data-network
 
 volumes:
   mongodb_data:
     name: manus-mongodb-data
+  redis_data:
+    name: manus-redis-data
 
 networks:
   manus-network:
     name: manus-network
     driver: bridge
+  manus-data-network:
+    name: manus-data-network
+    driver: bridge
+    internal: true
 ```
 <!-- /docker-compose-example.yml -->
 
@@ -106,12 +130,14 @@ networks:
 
 ### 创建 `.env` 配置文件
 
-在 `docker-compose.yml` 同级目录下，基于 [`.env.example`](https://github.com/simpleyyt/ai-manus/blob/main/.env.example) 创建 `.env` 文件，至少需要修改 `API_KEY`，并根据模型服务调整 `API_BASE` 与 `MODEL_NAME`：
+在 `docker-compose.yml` 同级目录下，基于 [`.env.example`](https://github.com/simpleyyt/ai-manus/blob/main/.env.example) 创建 `.env` 文件，至少填写 `API_KEY`，用 `openssl rand -hex 32` 生成独立的 `JWT_SECRET_KEY`，并根据模型服务调整 `API_BASE` 与 `MODEL_NAME`：
 
 ```ini
-API_KEY=sk-xxxx
+API_KEY=
 API_BASE=https://api.openai.com/v1
 MODEL_NAME=gpt-4o
+# 粘贴 `openssl rand -hex 32` 的唯一输出
+JWT_SECRET_KEY=
 ```
 
 完整的 `.env.example` 如下（搜索引擎、认证方式、沙箱、Claw 等更多配置项）：
@@ -149,17 +175,36 @@ MAX_TOKENS=2000
 #REDIS_PORT=6379
 #REDIS_DB=0
 #REDIS_PASSWORD=
+# 生产 Redis 保存的是安全状态。项目自带 Compose 使用 AOF everysec 和命名
+# 持久卷；外部 Redis 必须提供同等级的持久化、备份和高可用。
 
 # Sandbox configuration
+# Provider：docker（默认）或 agentbay（阿里云无影）
+#SANDBOX_PROVIDER=docker
 #SANDBOX_ADDRESS=
-SANDBOX_IMAGE=simpleyyt/manus-sandbox
+# 不设置时，本地直跑使用默认镜像；生产 Compose 会跟随 IMAGE_REGISTRY/IMAGE_TAG
+#SANDBOX_IMAGE=
 SANDBOX_NAME_PREFIX=sandbox
 SANDBOX_TTL_MINUTES=30
 SANDBOX_NETWORK=manus-network
+SANDBOX_MEMORY_LIMIT=2g
+SANDBOX_CPU_LIMIT=2.0
+SANDBOX_PIDS_LIMIT=512
 #SANDBOX_CHROME_ARGS=
 #SANDBOX_HTTPS_PROXY=
 #SANDBOX_HTTP_PROXY=
 #SANDBOX_NO_PROXY=
+
+# 仅 AgentBay。API key 从密钥管理器注入，并先注册自定义沙箱镜像；
+# 生命周期注意事项见 agentbay.md。
+#AGENTBAY_API_KEY=
+#AGENTBAY_REGION_ID=
+#AGENTBAY_IMAGE_ID=
+#AGENTBAY_DEPLOYMENT_ID=
+#AGENTBAY_QUOTA_CONFIG_VERSION=1
+#AGENTBAY_API_PORT=30150
+#AGENTBAY_CDP_PORT=30151
+#AGENTBAY_VNC_PORT=30152
 
 # Browser engine configuration
 # Options: playwright, browser_use (default)
@@ -246,19 +291,41 @@ SEARCH_PROVIDER=bing_web
 #GOOGLE_ANALYTICS_ID=
 
 # Auth configuration
-# Options: password, none, local
+# Options: password, none, local, sub2api
 AUTH_PROVIDER=password
+REGISTRATION_ENABLED=false
+# 逗号分隔的精确 origin；禁止使用 '*'
+#CORS_ALLOWED_ORIGINS=https://manus.example.com
+# Redis 权威认证限流
+#AUTH_LOGIN_ATTEMPTS_PER_WINDOW=10
+#AUTH_LOGIN_IP_ATTEMPTS_PER_WINDOW=30
+#AUTH_LOGIN_WINDOW_SECONDS=300
+#AUTH_REGISTER_ATTEMPTS_PER_HOUR=5
+#AUTH_PASSWORD_RESET_ATTEMPTS_PER_HOUR=5
+#AUTH_REFRESH_ATTEMPTS_PER_MINUTE=60
 
 # Password auth configuration, only used when AUTH_PROVIDER=password
-PASSWORD_SALT=
-PASSWORD_HASH_ROUNDS=10
+# 新哈希使用 per-user 随机 salt；PASSWORD_SALT 仅用于旧数据迁移
+#PASSWORD_SALT=
+PASSWORD_HASH_ROUNDS=600000
+#PASSWORD_LEGACY_HASH_ROUNDS=10
 
 # Local auth configuration, only used when AUTH_PROVIDER=local
 #LOCAL_AUTH_EMAIL=admin@example.com
-#LOCAL_AUTH_PASSWORD=admin
+#LOCAL_AUTH_PASSWORD=
+
+# Sub2API 认证配置，仅 AUTH_PROVIDER=sub2api 时使用
+#SUB2API_BASE_URL=
+#SUB2API_LOGIN_URL=
+#SUB2API_AUTH_ME_PATH=/api/v1/auth/me
+#SUB2API_AUTH_REFRESH_PATH=/api/v1/auth/refresh
+#SUB2API_REFRESH_TOKEN_MAX_AGE_DAYS=90
 
 # JWT configuration
-JWT_SECRET_KEY=your-secret-key-here
+# 粘贴 `openssl rand -hex 32` 的唯一输出
+JWT_SECRET_KEY=
+# 生产 BYOK 的独立 keyring；JSON 数组中的每一项都单独生成
+#MODEL_CREDENTIAL_ENCRYPTION_KEYS=[]
 JWT_ALGORITHM=HS256
 JWT_ACCESS_TOKEN_EXPIRE_MINUTES=30
 JWT_REFRESH_TOKEN_EXPIRE_DAYS=7
@@ -268,7 +335,7 @@ JWT_REFRESH_TOKEN_EXPIRE_DAYS=7
 #EMAIL_HOST=smtp.gmail.com
 #EMAIL_PORT=587
 #EMAIL_USERNAME=your-email@gmail.com
-#EMAIL_PASSWORD=your-password
+#EMAIL_PASSWORD=
 #EMAIL_FROM=your-email@gmail.com
 
 # Claw (OpenClaw) configuration
@@ -278,18 +345,36 @@ JWT_REFRESH_TOKEN_EXPIRE_DAYS=7
 #CLAW_IMAGE=simpleyyt/manus-claw
 # Prefix for Claw container names
 #CLAW_NAME_PREFIX=manus-claw
-# Time-to-live for Claw containers in seconds (0 = unlimited)
-#CLAW_TTL_SECONDS=3600
+# Claw 容器 TTL；默认常驻，正数仅用于临时部署
+#CLAW_TTL_SECONDS=0
 # Docker network bridge name for Claw containers
-#CLAW_NETWORK=manus-network
+CLAW_NETWORK=manus-network
 # Max seconds to wait for Claw container to become ready
 #CLAW_READY_TIMEOUT=300
-# Fixed Claw address (for development; skips Docker container creation)
+# 固定 Claw 地址（仅单用户 AUTH_PROVIDER=none/local 开发环境）
 #CLAW_ADDRESS=
-# Static API key for Claw (for development / fixed container)
+# 固定 runtime 内部启动 capability；禁止通过用户 API 暴露
 #CLAW_API_KEY=
 # Backend API URL used by Claw containers for callbacks
 #MANUS_API_BASE_URL=http://backend:8000
+# 独立 Claw runtime-key HMAC keyring；每一项都单独生成
+#CLAW_API_KEY_HMAC_KEYS=
+# Claw 代理/WebSocket 防滥用限制
+#CLAW_PROXY_REQUESTS_PER_MINUTE=30
+#CLAW_PROXY_MAX_CONCURRENT_REQUESTS=2
+#CLAW_CHAT_TURN_LEASE_SECONDS=300
+#CLAW_CHAT_MAX_MESSAGE_BYTES=65536
+#CLAW_CHAT_MAX_ATTACHMENTS=10
+#CLAW_CHAT_MAX_ATTACHMENT_BYTES=26214400
+#CLAW_CHAT_MAX_TOTAL_ATTACHMENT_BYTES=52428800
+#CLAW_UPLOAD_MAX_BYTES=26214400
+#CLAW_HISTORY_MAX_MESSAGES=128
+
+# 上传与每用户 GridFS 配额
+#MULTIPART_UPLOAD_MAX_BODY_BYTES=27262976
+#FILE_UPLOAD_MAX_BYTES=26214400
+#FILE_STORAGE_MAX_BYTES_PER_USER=1073741824
+#FILE_STORAGE_MAX_FILES_PER_USER=1000
 
 # Extra headers for LLM API requests (JSON format)
 #EXTRA_HEADERS={"X-Custom-Header": "value"}
@@ -299,6 +384,8 @@ JWT_REFRESH_TOKEN_EXPIRE_DAYS=7
 # celery: run agent tasks on distributed Celery workers
 #         (requires a worker container, see docs/configuration.md)
 #TASK_BACKEND=local
+# 实际 backend Python 进程/副本数；大于 1 时必须使用 Celery
+#BACKEND_REPLICA_COUNT=1
 # Optional custom Celery broker URL (defaults to the Redis settings above)
 #CELERY_BROKER_URL=
 
@@ -311,6 +398,19 @@ LOG_LEVEL=INFO
 <!-- /.env.example -->
 
 > **提示**：`env_file` 和 `environment` 可以同时使用，`environment` 中的值会覆盖 `env_file` 中的同名变量。完整的配置项说明请参阅[配置说明](configuration.md)。
+
+### 安全首次启动
+
+对外开放服务前，请确认：
+
+1. 已设置 `DEPLOYMENT_ENVIRONMENT=production`，`JWT_SECRET_KEY` 已填入唯一的 `openssl rand -hex 32` 输出；除非确实开放公共注册，否则保持 `REGISTRATION_ENABLED=false`；`CORS_ALLOWED_ORIGINS` 只包含精确的前端 origin。
+2. 保持 Redis 持久化：保留项目自带的 AOF `everysec`、`noeviction` 和命名持久卷设置；使用外部服务时配置同等级的持久化、备份和高可用。AOF `everysec` 在主机崩溃时仍可能丢失约一秒写入，禁止用临时 Redis 承载安全状态，也不要把它当作 AgentBay 计费硬账本。
+3. 允许用户填写自定义模型凭证时，配置独立 `MODEL_CREDENTIAL_ENCRYPTION_KEYS` keyring；启用 Claw 时也配置独立 `CLAW_API_KEY_HMAC_KEYS` keyring。
+4. 除非已经按更大容量规划 MongoDB、Nginx 和存储，否则保留默认的请求体、单文件和每用户配额。
+5. `TASK_BACKEND=local` 必须与 `BACKEND_REPLICA_COUNT=1` 配套。增加第二个 backend 进程/副本前先切换到 Celery，并让所有 backend/worker 共享 Redis、MongoDB、JWT、模型 keyring 和沙箱配置。
+6. 使用 AgentBay 时，把每个 signed gateway link 都当作 secret。清理失败会保留 provider session ID 供重试；provider 未确认删除前不要手工删数据库记录。
+
+refresh token 单次使用且每次刷新都会替换，logout 会撤销其 family。Sub2API 重定向还要求一次性随机 `state` 和验证通过的 fragment handoff。key 轮换与旧凭证迁移命令见[配置说明](configuration.md)。
 
 ### 启动服务
 

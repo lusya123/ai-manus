@@ -3,6 +3,7 @@ import logging
 from app.domain.repositories.mcp_repository import MCPRepository
 from app.domain.models.mcp_config import MCPConfig
 from app.core.config import get_settings
+from app.domain.utils.error_reporting import safe_exception_summary
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +19,8 @@ class FileMCPRepository(MCPRepository):
             with open(file_path, "r") as file:
                 return MCPConfig.model_validate_json(file.read())
         except Exception as e:
-            logger.exception(f"Error reading MCP config file: {e}")
+            logger.error(
+                "Error reading MCP config: %s", safe_exception_summary(e)
+            )
         
         return MCPConfig(mcpServers={})

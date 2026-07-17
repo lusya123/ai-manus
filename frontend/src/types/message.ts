@@ -1,6 +1,6 @@
 import type { FileInfo } from '../api/file';
 
-export type MessageType = "user" | "assistant" | "tool" | "step" | "attachments";
+export type MessageType = "user" | "assistant" | "thinking" | "tool" | "step" | "attachments";
 
 export interface Message {
   type: MessageType;
@@ -40,6 +40,7 @@ export function isConsecutiveAssistant(messages: Message[], index: number): bool
   if (index <= 0) return false;
   const isAst = (m: Message) =>
     m.type === 'assistant' ||
+    m.type === 'thinking' ||
     (m.type === 'attachments' && (m.content as AttachmentsContent).role === 'assistant');
   return isAst(messages[index]) && isAst(messages[index - 1]);
 }

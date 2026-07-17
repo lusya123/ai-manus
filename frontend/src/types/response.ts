@@ -17,6 +17,14 @@ export interface GetSessionResponse {
     status: SessionStatus;
     events: AgentSSEEvent[];
     is_shared: boolean;
+    model_config?: SessionModelConfig | null;
+}
+
+export interface SessionModelConfig {
+    model_id: string | null;
+    api_base: string | null;
+    model_name: string | null;
+    model_provider: string | null;
 }
 
 export interface ListSessionItem {
@@ -67,4 +75,3 @@ export interface SharedSessionResponse {
     events: AgentSSEEvent[];
     is_shared: boolean;
 }
-  

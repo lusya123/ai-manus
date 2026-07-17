@@ -9,6 +9,9 @@ if [ "$#" -gt 0 ]; then
     exec "$@"
 fi
 
+# The generated configuration contains both gateway and Manus bearer tokens.
+umask 077
+
 CONFIG_DIR="/home/node/.openclaw"
 CONFIG_FILE="${CONFIG_DIR}/openclaw.json"
 mkdir -p "${CONFIG_DIR}/workspace"
@@ -19,7 +22,9 @@ if [ -z "${OPENCLAW_GATEWAY_TOKEN}" ]; then
     export OPENCLAW_GATEWAY_TOKEN
 fi
 
-echo "[entrypoint] Gateway token: ${OPENCLAW_GATEWAY_TOKEN}"
+# OPENCLAW_GATEWAY_TOKEN is a bearer capability. Never print it, even in
+# development logs.
+echo "[entrypoint] Gateway token configured"
 echo "[entrypoint] Manus API base URL: ${MANUS_API_BASE_URL:-http://backend:8000}/v1"
 
 # Write openclaw.json configuration
@@ -138,11 +143,10 @@ if [ "${CLAW_TTL_SECONDS}" -gt 0 ] 2>/dev/null; then
     ) &
 fi
 
-# Wait for the gateway to exit. The first wait may be interrupted by the TERM
-# trap; wait again to collect the real exit status after the trap returns.
+# Preserve the gateway's real exit status. A second wait after a normal exit
+# would report 127 (the child was already reaped) and hide the actual failure.
 set +e
 wait "${GATEWAY_PID}"
-wait "${GATEWAY_PID}" 2>/dev/null
 EXIT_CODE=$?
 echo "[entrypoint] OpenClaw gateway exited with code ${EXIT_CODE}"
 exit "${EXIT_CODE}"

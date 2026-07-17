@@ -6,8 +6,10 @@ import socket
 import logging
 import asyncio
 import io
+from urllib.parse import urlsplit, urlunsplit
 from async_lru import alru_cache
 from app.core.config import get_settings
+from app.domain.utils.error_reporting import safe_exception_summary
 from app.domain.models.tool_result import ToolResult
 from app.domain.external.sandbox import Sandbox
 from app.infrastructure.external.browser.playwright_browser import PlaywrightBrowser
@@ -17,14 +19,23 @@ from app.domain.external.browser import Browser
 logger = logging.getLogger(__name__)
 
 class DockerSandbox(Sandbox):
-    def __init__(self, ip: str = None, container_name: str = None):
+    def __init__(
+        self,
+        ip: str = None,
+        container_name: str = None,
+        managed_container: bool = False,
+        api_port: int = 8080,
+        cdp_port: int = 9222,
+        vnc_port: int = 5901,
+    ):
         """Initialize Docker sandbox and API interaction client"""
         self.client = httpx.AsyncClient(timeout=600)
         self.ip = ip
-        self.base_url = f"http://{self.ip}:8080"
-        self._vnc_url = f"ws://{self.ip}:5901"
-        self._cdp_url = f"http://{self.ip}:9222"
+        self.base_url = f"http://{self.ip}:{api_port}"
+        self._vnc_url = f"ws://{self.ip}:{vnc_port}"
+        self._cdp_url = f"http://{self.ip}:{cdp_port}"
         self._container_name = container_name
+        self._managed_container = managed_container
     
     @property
     def id(self) -> str:
@@ -32,8 +43,7 @@ class DockerSandbox(Sandbox):
         if not self._container_name:
             return "dev-sandbox"
         return self._container_name
-    
-    
+
     @property
     def cdp_url(self) -> str:
         return self._cdp_url
@@ -41,6 +51,20 @@ class DockerSandbox(Sandbox):
     @property
     def vnc_url(self) -> str:
         return self._vnc_url
+
+    def _api_url(self, path: str) -> str:
+        """Append an API path without moving signed query data into the path.
+
+        Docker endpoints normally have no query string, while AgentBay gateway
+        links often do. Plain string concatenation turns ``?signature=...``
+        into the middle of the URL and makes every inherited API call invalid.
+        """
+
+        parsed = urlsplit(self.base_url)
+        joined_path = f"{parsed.path.rstrip('/')}/{path.lstrip('/')}"
+        return urlunsplit(
+            (parsed.scheme, parsed.netloc, joined_path, parsed.query, parsed.fragment)
+        )
 
     @staticmethod
     def _get_container_ip(container) -> str:
@@ -107,6 +131,15 @@ class DockerSandbox(Sandbox):
                     "NO_PROXY": settings.sandbox_no_proxy
                 }
             }
+
+            if settings.sandbox_memory_limit:
+                container_config["mem_limit"] = settings.sandbox_memory_limit
+            if settings.sandbox_cpu_limit:
+                container_config["nano_cpus"] = int(
+                    settings.sandbox_cpu_limit * 1_000_000_000
+                )
+            if settings.sandbox_pids_limit:
+                container_config["pids_limit"] = settings.sandbox_pids_limit
             
             # Add network to container config if configured
             if settings.sandbox_network:
@@ -122,7 +155,8 @@ class DockerSandbox(Sandbox):
             # Create and return DockerSandbox instance
             return DockerSandbox(
                 ip=ip_address,
-                container_name=container_name
+                container_name=container_name,
+                managed_container=True,
             )
             
         except Exception as e:
@@ -135,7 +169,9 @@ class DockerSandbox(Sandbox):
         
         for attempt in range(max_retries):
             try:
-                response = await self.client.get(f"{self.base_url}/api/v1/supervisor/status")
+                response = await self.client.get(
+                    self._api_url("/api/v1/supervisor/status")
+                )
                 response.raise_for_status()
                 
                 # Parse response as ToolResult
@@ -172,7 +208,12 @@ class DockerSandbox(Sandbox):
                     await asyncio.sleep(retry_interval)
                     
             except Exception as e:
-                logger.warning(f"Failed to check supervisor status (attempt {attempt + 1}/{max_retries}): {str(e)}")
+                logger.warning(
+                    "Failed to check supervisor status (attempt %d/%d): %s",
+                    attempt + 1,
+                    max_retries,
+                    safe_exception_summary(e),
+                )
                 await asyncio.sleep(retry_interval)
         
         # If we reach here, we've exhausted all retries
@@ -183,7 +224,7 @@ class DockerSandbox(Sandbox):
 
     async def exec_command(self, session_id: str, exec_dir: str, command: str) -> ToolResult:
         response = await self.client.post(
-            f"{self.base_url}/api/v1/shell/exec",
+            self._api_url("/api/v1/shell/exec"),
             json={
                 "id": session_id,
                 "exec_dir": exec_dir,
@@ -194,7 +235,7 @@ class DockerSandbox(Sandbox):
 
     async def view_shell(self, session_id: str, console: bool = False) -> ToolResult:
         response = await self.client.post(
-            f"{self.base_url}/api/v1/shell/view",
+            self._api_url("/api/v1/shell/view"),
             json={
                 "id": session_id,
                 "console": console
@@ -204,7 +245,7 @@ class DockerSandbox(Sandbox):
 
     async def wait_for_process(self, session_id: str, seconds: Optional[int] = None) -> ToolResult:
         response = await self.client.post(
-            f"{self.base_url}/api/v1/shell/wait",
+            self._api_url("/api/v1/shell/wait"),
             json={
                 "id": session_id,
                 "seconds": seconds
@@ -214,7 +255,7 @@ class DockerSandbox(Sandbox):
 
     async def write_to_process(self, session_id: str, input_text: str, press_enter: bool = True) -> ToolResult:
         response = await self.client.post(
-            f"{self.base_url}/api/v1/shell/write",
+            self._api_url("/api/v1/shell/write"),
             json={
                 "id": session_id,
                 "input": input_text,
@@ -225,7 +266,7 @@ class DockerSandbox(Sandbox):
 
     async def kill_process(self, session_id: str) -> ToolResult:
         response = await self.client.post(
-            f"{self.base_url}/api/v1/shell/kill",
+            self._api_url("/api/v1/shell/kill"),
             json={"id": session_id}
         )
         return ToolResult(**response.json())
@@ -247,7 +288,7 @@ class DockerSandbox(Sandbox):
             Result of write operation
         """
         response = await self.client.post(
-            f"{self.base_url}/api/v1/file/write",
+            self._api_url("/api/v1/file/write"),
             json={
                 "file": file,
                 "content": content,
@@ -273,7 +314,7 @@ class DockerSandbox(Sandbox):
             File content
         """
         response = await self.client.post(
-            f"{self.base_url}/api/v1/file/read",
+            self._api_url("/api/v1/file/read"),
             json={
                 "file": file,
                 "start_line": start_line,
@@ -293,7 +334,7 @@ class DockerSandbox(Sandbox):
             Whether file exists
         """
         response = await self.client.post(
-            f"{self.base_url}/api/v1/file/exists",
+            self._api_url("/api/v1/file/exists"),
             json={"path": path}
         )
         return ToolResult(**response.json())
@@ -308,7 +349,7 @@ class DockerSandbox(Sandbox):
             Result of delete operation
         """
         response = await self.client.post(
-            f"{self.base_url}/api/v1/file/delete",
+            self._api_url("/api/v1/file/delete"),
             json={"path": path}
         )
         return ToolResult(**response.json())
@@ -323,7 +364,7 @@ class DockerSandbox(Sandbox):
             List of directory contents
         """
         response = await self.client.post(
-            f"{self.base_url}/api/v1/file/list",
+            self._api_url("/api/v1/file/list"),
             json={"path": path}
         )
         return ToolResult(**response.json())
@@ -341,7 +382,7 @@ class DockerSandbox(Sandbox):
             Result of replace operation
         """
         response = await self.client.post(
-            f"{self.base_url}/api/v1/file/replace",
+            self._api_url("/api/v1/file/replace"),
             json={
                 "file": file,
                 "old_str": old_str,
@@ -363,7 +404,7 @@ class DockerSandbox(Sandbox):
             Search results
         """
         response = await self.client.post(
-            f"{self.base_url}/api/v1/file/search",
+            self._api_url("/api/v1/file/search"),
             json={
                 "file": file,
                 "regex": regex,
@@ -383,7 +424,7 @@ class DockerSandbox(Sandbox):
             List of found files
         """
         response = await self.client.post(
-            f"{self.base_url}/api/v1/file/find",
+            self._api_url("/api/v1/file/find"),
             json={
                 "path": path,
                 "glob": glob_pattern
@@ -407,7 +448,7 @@ class DockerSandbox(Sandbox):
         data = {"path": path}
         
         response = await self.client.post(
-            f"{self.base_url}/api/v1/file/upload",
+            self._api_url("/api/v1/file/upload"),
             files=files,
             data=data
         )
@@ -423,7 +464,7 @@ class DockerSandbox(Sandbox):
             File content as binary stream
         """
         response = await self.client.get(
-            f"{self.base_url}/api/v1/file/download",
+            self._api_url("/api/v1/file/download"),
             params={"path": path}
         )
         response.raise_for_status()
@@ -432,54 +473,37 @@ class DockerSandbox(Sandbox):
         # TODO: change to real stream
         return io.BytesIO(response.content)
     
-    @staticmethod
-    @alru_cache(maxsize=128, typed=True)
-    async def _resolve_hostname_to_ip(hostname: str) -> str:
-        """Resolve hostname to IP address
-        
-        Args:
-            hostname: Hostname to resolve
-            
-        Returns:
-            Resolved IP address, or None if resolution fails
-            
-        Note:
-            This method is cached using LRU cache with a maximum size of 128 entries.
-            The cache helps reduce repeated DNS lookups for the same hostname.
+    async def aclose(self) -> None:
+        """Close only this handle's HTTP client.
+
+        A sandbox ID is persisted independently of this Python object, so
+        closing a request/runner handle must not remove its container.
         """
-        try:
-            # First check if hostname is already in IP address format
-            try:
-                socket.inet_pton(socket.AF_INET, hostname)
-                # If successfully parsed, it's an IPv4 address format, return directly
-                return hostname
-            except OSError:
-                # Not a valid IP address format, proceed with DNS resolution
-                pass
-                
-            # Use socket.getaddrinfo for DNS resolution
-            addr_info = socket.getaddrinfo(hostname, None, family=socket.AF_INET)
-            # Return the first IPv4 address found
-            if addr_info and len(addr_info) > 0:
-                return addr_info[0][4][0]  # Return sockaddr[0] from (family, type, proto, canonname, sockaddr), which is the IP address
-            return None
-        except Exception as e:
-            # Log error and return None on failure
-            logger.error(f"Failed to resolve hostname {hostname}: {str(e)}")
-            return None
-    
+        if self.client and not self.client.is_closed:
+            await self.client.aclose()
+
     async def destroy(self) -> bool:
-        """Destroy Docker sandbox"""
+        """Destroy the managed Docker sandbox and close this handle."""
+        destroyed = True
         try:
-            if self.client:
-                await self.client.aclose()
-            if self.container_name:
+            if self._managed_container and self._container_name:
                 docker_client = docker.from_env()
-                docker_client.containers.get(self.container_name).remove(force=True)
-            return True
+                docker_client.containers.get(self._container_name).remove(force=True)
         except Exception as e:
-            logger.error(f"Failed to destroy Docker sandbox: {str(e)}")
-            return False
+            logger.error(
+                "Failed to destroy Docker sandbox: %s",
+                safe_exception_summary(e),
+            )
+            destroyed = False
+        finally:
+            try:
+                await self.aclose()
+            except Exception as e:
+                logger.error(
+                    "Failed to close Docker sandbox handle: %s",
+                    safe_exception_summary(e),
+                )
+        return destroyed
     
     async def get_browser(self) -> Browser:
         """Get browser instance
@@ -492,9 +516,10 @@ class DockerSandbox(Sandbox):
         settings = get_settings()
         engine = (settings.browser_engine or "browser_use").lower().strip()
         if engine == "browser_use":
-            logger.info("Using BrowserUseBrowser engine for CDP URL: %s", self.cdp_url)
+            # AgentBay CDP URLs contain signed gateway capabilities.
+            logger.info("Using BrowserUseBrowser engine for sandbox %s", self.id)
             return BrowserUseBrowser(self.cdp_url)
-        logger.info("Using PlaywrightBrowser engine for CDP URL: %s", self.cdp_url)
+        logger.info("Using PlaywrightBrowser engine for sandbox %s", self.id)
         return PlaywrightBrowser(self.cdp_url)
 
     @staticmethod
@@ -529,8 +554,11 @@ class DockerSandbox(Sandbox):
                 return addr_info[0][4][0]  # Return sockaddr[0] from (family, type, proto, canonname, sockaddr), which is the IP address
             return None
         except Exception as e:
-            # Log error and return None on failure
-            logger.error(f"Failed to resolve hostname {hostname}: {str(e)}")
+            # Log a bounded summary and return None on failure.
+            logger.error(
+                "Failed to resolve sandbox hostname: %s",
+                safe_exception_summary(e),
+            )
             return None
 
     @classmethod
@@ -545,12 +573,16 @@ class DockerSandbox(Sandbox):
         if settings.sandbox_address:
             # Chrome CDP needs IP address
             ip = await cls._resolve_hostname_to_ip(settings.sandbox_address)
-            return DockerSandbox(ip=ip)
+            return DockerSandbox(
+                ip=ip,
+                api_port=settings.sandbox_api_port,
+                cdp_port=settings.sandbox_cdp_port,
+                vnc_port=settings.sandbox_vnc_port,
+            )
     
         return await asyncio.to_thread(DockerSandbox._create_task)
     
     @classmethod
-    @alru_cache(maxsize=128, typed=True)
     async def get(cls, id: str) -> Sandbox:
         """Get sandbox by ID
         
@@ -558,17 +590,40 @@ class DockerSandbox(Sandbox):
             id: Sandbox ID
             
         Returns:
-            Sandbox instance
+            A fresh sandbox handle.  Live handles are intentionally not
+            cached because each owns a closeable HTTP client.  In fixed-host
+            mode, sharing a cached handle would let deleting one chat close
+            the client used by every other chat.
         """
         settings = get_settings()
         if settings.sandbox_address:
+            # Fixed-host mode has exactly one canonical runtime identity: the
+            # handle returned by create() is always ``dev-sandbox``. Refusing
+            # arbitrary persisted IDs is important for legacy provider-marker
+            # adoption; otherwise an old AgentBay ID could be made to look
+            # like an exact Docker match merely because both point at the same
+            # configured development host.
+            if id != "dev-sandbox":
+                logger.warning("Fixed sandbox ID %s is not authoritative", id)
+                return None
             ip = await cls._resolve_hostname_to_ip(settings.sandbox_address)
-            return DockerSandbox(ip=ip, container_name=id)
+            return DockerSandbox(
+                ip=ip,
+                container_name=id,
+                managed_container=False,
+                api_port=settings.sandbox_api_port,
+                cdp_port=settings.sandbox_cdp_port,
+                vnc_port=settings.sandbox_vnc_port,
+            )
 
         docker_client = docker.from_env()
-        container = docker_client.containers.get(id)
+        try:
+            container = docker_client.containers.get(id)
+        except docker.errors.NotFound:
+            logger.warning("Sandbox container %s not found", id)
+            return None
         container.reload()
         
         ip_address = cls._get_container_ip(container)
         logger.info(f"IP address: {ip_address}")
-        return DockerSandbox(ip=ip_address, container_name=id)
+        return DockerSandbox(ip=ip_address, container_name=id, managed_container=True)

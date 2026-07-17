@@ -1,37 +1,33 @@
 import json
 import logging
-from pydantic import BaseModel
 from typing import List, Optional
+
+from pydantic import BaseModel, Field
+
 from app.domain.models.message import LLMMessage, Role
 
 logger = logging.getLogger(__name__)
 
-# Rough chars-per-token ratio; conservative for mixed prose/code/JSON.
 _CHARS_PER_TOKEN = 4
 
-# Placeholder written over elided tool results. Kept as a ToolResult-shaped
-# JSON string so downstream consumers can still parse the content.
+# Keep an ordinary ToolResult-shaped JSON payload so infrastructure adapters
+# and future model calls can still consume the compacted message.
 _ELIDED_CONTENT = json.dumps(
     {"success": True, "message": "(result elided to save context)", "data": None}
 )
 
 
 def estimate_tokens(text: str) -> int:
-    """Cheap, dependency-free token estimate for context budgeting."""
+    """Return a cheap, dependency-free token estimate."""
     if not text:
         return 0
     return max(1, len(text) // _CHARS_PER_TOKEN)
 
 
 class Memory(BaseModel):
-    """Agent conversation memory with token-aware compaction.
+    """Append-only agent memory with token-aware tool-result compaction."""
 
-    Messages are stored append-only; :meth:`compact` reclaims context budget
-    by eliding the *content* of old tool results (oldest first) while keeping
-    the message skeleton intact, so tool-call pairing required by LLM APIs is
-    never broken and recent working context is preserved.
-    """
-    messages: List[LLMMessage] = []
+    messages: List[LLMMessage] = Field(default_factory=list)
 
     def add_message(self, message: LLMMessage) -> None:
         """Add message to memory"""
@@ -56,7 +52,7 @@ class Memory(BaseModel):
         self.messages = self.messages[:-1]
 
     def estimate_tokens(self) -> int:
-        """Estimate the total token footprint of the stored messages."""
+        """Estimate content and tool-call argument tokens in memory."""
         total = 0
         for message in self.messages:
             total += estimate_tokens(message.content)
@@ -66,25 +62,21 @@ class Memory(BaseModel):
         return total
 
     def compact(self, max_tokens: int = 0, keep_recent: int = 10) -> None:
-        """Elide old tool results until the memory fits the token budget.
+        """Elide old tool results without breaking tool-call pairing.
 
-        Args:
-            max_tokens: Target context budget. ``0`` means "compact all
-                eligible tool results" (unconditional cleanup between steps).
-            keep_recent: Number of most recent messages that are never
-                touched, so the model keeps its working context.
+        ``max_tokens=0`` compacts every eligible old result. The newest
+        ``keep_recent`` messages are never modified so the model retains its
+        immediate working context.
         """
         if max_tokens and self.estimate_tokens() <= max_tokens:
             return
 
         cutoff = max(0, len(self.messages) - keep_recent)
         for message in self.messages[:cutoff]:
-            if message.role != Role.TOOL:
-                continue
-            if message.content == _ELIDED_CONTENT:
+            if message.role != Role.TOOL or message.content == _ELIDED_CONTENT:
                 continue
             message.content = _ELIDED_CONTENT
-            logger.debug(f"Elided old tool result from memory: {message.name}")
+            logger.debug("Elided old tool result from memory: %s", message.name)
             if max_tokens and self.estimate_tokens() <= max_tokens:
                 return
 

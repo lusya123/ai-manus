@@ -60,5 +60,5 @@ class TestMemoryOperations:
 
     def test_compact_keeps_recent_tool_output(self):
         m = self._memory()
-        m.compact()  # default keep_recent window covers all 4 messages
+        m.compact()
         assert m.messages[-1].content == "huge page content"

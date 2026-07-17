@@ -3,9 +3,11 @@ from datetime import datetime, UTC
 from app.domain.models.session import Session, SessionStatus, SessionSummary
 from app.domain.models.file import FileInfo
 from app.domain.repositories.session_repository import SessionRepository
-from app.domain.models.event import BaseEvent
+from app.domain.models.event import BaseEvent, ErrorEvent
 from app.infrastructure.models.documents import SessionDocument
+from app.core.config import get_settings
 import logging
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +24,36 @@ SESSION_LIST_PROJECTION = {
 
 class MongoSessionRepository(SessionRepository):
     """MongoDB implementation of SessionRepository"""
+
+    async def _to_domain_with_share_epoch(
+        self, mongo_session: SessionDocument
+    ) -> Session:
+        """Atomically backfill the public capability epoch on legacy records."""
+
+        if not mongo_session.share_epoch:
+            candidate = uuid.uuid4().hex
+            collection = SessionDocument.get_pymongo_collection()
+            result = await collection.update_one(
+                {
+                    "_id": mongo_session.id,
+                    "$or": [
+                        {"share_epoch": {"$exists": False}},
+                        {"share_epoch": None},
+                        {"share_epoch": ""},
+                    ],
+                },
+                {"$set": {"share_epoch": candidate}},
+            )
+            if result.modified_count:
+                mongo_session.share_epoch = candidate
+            else:
+                persisted = await collection.find_one(
+                    {"_id": mongo_session.id}, {"share_epoch": 1}
+                )
+                mongo_session.share_epoch = (
+                    (persisted or {}).get("share_epoch") or candidate
+                )
+        return mongo_session.to_domain()
     
     async def save(self, session: Session) -> None:
         """Save or update a session"""
@@ -38,20 +70,48 @@ class MongoSessionRepository(SessionRepository):
         mongo_session.update_from_domain(session)
         await mongo_session.save()
 
+    async def update_runtime_ownership(
+        self,
+        session_id: str,
+        sandbox_id: Optional[str],
+        task_id: Optional[str],
+        sandbox_provider: Optional[str] = None,
+    ) -> None:
+        """Persist sandbox/task ownership without upserting deleted sessions."""
+        result = await SessionDocument.find_one(
+            SessionDocument.session_id == session_id
+        ).update(
+            {"$set": {
+                "sandbox_id": sandbox_id,
+                "sandbox_provider": sandbox_provider,
+                "task_id": task_id,
+                "updated_at": datetime.now(UTC),
+            }}
+        )
+        if not result:
+            raise ValueError(f"Session {session_id} not found")
+
 
     async def find_by_id(self, session_id: str) -> Optional[Session]:
         """Find a session by its ID"""
         mongo_session = await SessionDocument.find_one(
             SessionDocument.session_id == session_id
         )
-        return mongo_session.to_domain() if mongo_session else None
+        return (
+            await self._to_domain_with_share_epoch(mongo_session)
+            if mongo_session
+            else None
+        )
     
     async def find_by_user_id(self, user_id: str) -> List[Session]:
         """Find all sessions for a specific user"""
         mongo_sessions = await SessionDocument.find(
             SessionDocument.user_id == user_id
         ).sort("-latest_message_at").to_list()
-        return [mongo_session.to_domain() for mongo_session in mongo_sessions]
+        return [
+            await self._to_domain_with_share_epoch(mongo_session)
+            for mongo_session in mongo_sessions
+        ]
 
     async def find_summaries_by_user_id(self, user_id: str) -> List[SessionSummary]:
         """Find lightweight session summaries for a user (excludes events/files)"""
@@ -80,7 +140,11 @@ class MongoSessionRepository(SessionRepository):
             SessionDocument.session_id == session_id,
             SessionDocument.user_id == user_id
         )
-        return mongo_session.to_domain() if mongo_session else None
+        return (
+            await self._to_domain_with_share_epoch(mongo_session)
+            if mongo_session
+            else None
+        )
     
     async def update_title(self, session_id: str, title: str) -> None:
         """Update the title of a session"""
@@ -102,15 +166,69 @@ class MongoSessionRepository(SessionRepository):
         if not result:
             raise ValueError(f"Session {session_id} not found")
 
-    async def add_event(self, session_id: str, event: BaseEvent) -> None:
-        """Add an event to a session"""
-        result = await SessionDocument.find_one(
-            SessionDocument.session_id == session_id
-        ).update(
-            {"$push": {"events": event.model_dump()}, "$set": {"updated_at": datetime.now(UTC)}}
+    @staticmethod
+    def _bounded_event(event: BaseEvent) -> BaseEvent:
+        """Replace an oversized event with a safe, stable summary."""
+        max_bytes = max(1024, int(get_settings().session_event_max_bytes))
+        if len(event.model_dump_json().encode("utf-8")) <= max_bytes:
+            return event
+        return ErrorEvent(
+            id=event.id,
+            turn_id=event.turn_id,
+            timestamp=event.timestamp,
+            error=(
+                "Event details were omitted because the serialized event "
+                f"exceeded the {max_bytes}-byte persistence limit"
+            ),
         )
-        if not result:
-            raise ValueError(f"Session {session_id} not found")
+
+    async def add_event(self, session_id: str, event: BaseEvent) -> BaseEvent:
+        """Append through the idempotent, atomically bounded event path."""
+        return await self.add_event_once(session_id, event)
+
+    async def add_event_once(self, session_id: str, event: BaseEvent) -> BaseEvent:
+        """Append one stable event ID and retain only the configured tail."""
+        bounded = self._bounded_event(event)
+        event_limit = max(1, int(get_settings().session_history_max_events))
+        collection = SessionDocument.get_pymongo_collection()
+        now = datetime.now(UTC)
+        result = await collection.update_one(
+            {
+                "session_id": session_id,
+                "events": {"$not": {"$elemMatch": {"id": bounded.id}}},
+            },
+            {
+                "$push": {
+                    "events": {
+                        "$each": [bounded.model_dump()],
+                        "$slice": -event_limit,
+                    }
+                },
+                "$set": {"updated_at": now},
+            },
+        )
+        if not result.matched_count:
+            exists = await collection.find_one(
+                {"session_id": session_id}, {"_id": 1}
+            )
+            if not exists:
+                raise ValueError(f"Session {session_id} not found")
+        return bounded
+
+    async def update_event_transport_cursor(
+        self, session_id: str, event_id: str, transport_id: str
+    ) -> None:
+        """Persist a Redis cursor on a retained event without changing its ID."""
+        await SessionDocument.get_pymongo_collection().update_one(
+            {"session_id": session_id},
+            {
+                "$set": {
+                    "events.$[event].transport_id": transport_id,
+                    "updated_at": datetime.now(UTC),
+                }
+            },
+            array_filters=[{"event.id": event_id}],
+        )
     
     async def add_file(self, session_id: str, file_info: FileInfo) -> None:
         """Add a file to a session"""
@@ -157,7 +275,10 @@ class MongoSessionRepository(SessionRepository):
     async def get_all(self) -> List[Session]:
         """Get all sessions"""
         mongo_sessions = await SessionDocument.find().sort("-latest_message_at").to_list()
-        return [mongo_session.to_domain() for mongo_session in mongo_sessions]
+        return [
+            await self._to_domain_with_share_epoch(mongo_session)
+            for mongo_session in mongo_sessions
+        ]
     
     async def update_status(self, session_id: str, status: SessionStatus) -> None:
         """Update the status of a session"""
@@ -199,13 +320,18 @@ class MongoSessionRepository(SessionRepository):
         if not result:
             raise ValueError(f"Session {session_id} not found")
 
-    async def update_shared_status(self, session_id: str, is_shared: bool) -> None:
-        """Update the shared status of a session"""
+    async def update_shared_status(self, session_id: str, is_shared: bool) -> str:
+        """Update shared status and revoke every previously issued share URL."""
+        share_epoch = uuid.uuid4().hex
         result = await SessionDocument.find_one(
             SessionDocument.session_id == session_id
         ).update(
-            {"$set": {"is_shared": is_shared, "updated_at": datetime.now(UTC)}}
+            {"$set": {
+                "is_shared": is_shared,
+                "share_epoch": share_epoch,
+                "updated_at": datetime.now(UTC),
+            }}
         )
         if not result:
             raise ValueError(f"Session {session_id} not found")
-
+        return share_epoch

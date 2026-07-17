@@ -4,6 +4,7 @@ from tavily import AsyncTavilyClient
 from app.domain.models.tool_result import ToolResult
 from app.domain.models.search import SearchResults, SearchResultItem
 from app.domain.external.search import SearchEngine
+from app.domain.utils.error_reporting import safe_exception_summary
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +62,11 @@ class TavilySearchEngine(SearchEngine):
             return ToolResult(success=True, data=results)
 
         except Exception as e:
-            logger.error(f"Tavily Search API call failed: {e}")
+            error_summary = safe_exception_summary(e)
+            logger.error(
+                "Tavily Search API call failed: %s",
+                error_summary,
+            )
             error_results = SearchResults(
                 query=query,
                 date_range=date_range,
@@ -71,6 +76,6 @@ class TavilySearchEngine(SearchEngine):
 
             return ToolResult(
                 success=False,
-                message=f"Tavily Search API call failed: {e}",
+                message=f"Tavily Search API call failed: {error_summary}",
                 data=error_results,
             )

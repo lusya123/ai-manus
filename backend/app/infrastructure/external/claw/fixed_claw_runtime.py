@@ -23,11 +23,18 @@ class FixedClawRuntime:
         self._address = address
         self.settings = get_settings()
 
+    @property
+    def ready_timeout(self) -> int:
+        return self.settings.claw_ready_timeout
+
     async def create(self, claw_id: str, api_key: str) -> ClawInstanceInfo:
         return ClawInstanceInfo(address=self._address)
 
-    async def destroy(self, instance_name: Optional[str]) -> None:
-        pass
+    async def destroy(self, instance_name: Optional[str]) -> bool:
+        # The fixed runtime is externally managed and never owned by a Claw
+        # record (``create`` returns no instance_name), so there is no local
+        # resource to destroy.
+        return True
 
     async def wait_for_ready(self, base_url: str) -> bool:
         timeout = self.settings.claw_ready_timeout
@@ -38,10 +45,12 @@ class FixedClawRuntime:
                 try:
                     resp = await client.get(f"{base_url}/health")
                     if resp.status_code == 200:
-                        logger.info(f"Fixed claw instance ready: {base_url}")
+                        logger.info("Fixed claw instance is ready")
                         return True
                 except Exception:
                     pass
                 await asyncio.sleep(interval)
-        logger.warning(f"Fixed claw instance not ready after {timeout}s: {base_url}")
+        logger.warning(
+            "Fixed claw instance not ready after %s seconds", timeout
+        )
         return False

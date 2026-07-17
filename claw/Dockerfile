@@ -5,8 +5,10 @@ USER root
 
 # Setup manus-claw plugin
 RUN mkdir -p /home/node/.openclaw/extensions/manus-claw
-COPY manus-claw/ /home/node/.openclaw/extensions/manus-claw/
-RUN cd /home/node/.openclaw/extensions/manus-claw && npm install --production
+COPY manus-claw/package.json manus-claw/package-lock.json /home/node/.openclaw/extensions/manus-claw/
+RUN cd /home/node/.openclaw/extensions/manus-claw && npm ci --omit=dev --ignore-scripts
+COPY manus-claw/src/ /home/node/.openclaw/extensions/manus-claw/src/
+COPY manus-claw/openclaw.plugin.json /home/node/.openclaw/extensions/manus-claw/openclaw.plugin.json
 RUN chown -R node:node /home/node/.openclaw
 
 # Copy entrypoint script

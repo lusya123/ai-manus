@@ -5,21 +5,154 @@ on:
     branches:
       - main
       - develop
+      - custom
     tags:
       - 'v*'
+      - 'deploy-test-20260717-integration-01'
   pull_request:
     branches:
       - main
       - develop
+      - custom
+  workflow_dispatch:
+    inputs:
+      deploy_fork:
+        description: Publish fork images and deploy them to the configured server
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 env:
   REGISTRY: docker.io
   IMAGE_REGISTRY: simpleyyt
+  UV_VERSION: 0.7.12
 
 jobs:
+  frontend-smoke:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Run frontend unit tests
+        working-directory: frontend
+        run: npm run test
+
+      - name: Lint frontend
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Type check frontend
+        working-directory: frontend
+        run: npm run type-check
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Set up Chrome
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Smoke test production frontend
+        working-directory: frontend
+        env:
+          CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: npm run smoke:prod
+
+      - name: Upload smoke failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-smoke-failure
+          path: |
+            frontend/smoke-prod-failure.png
+            frontend/smoke-prod-failure.json
+          if-no-files-found: ignore
+
+  backend-unit-security:
+    runs-on: ubuntu-latest
+    env:
+      DEPLOYMENT_ENVIRONMENT: test
+      AUTH_PROVIDER: none
+      API_KEY: test-model-key
+      JWT_SECRET_KEY: ci-test-jwt-secret-at-least-32-bytes-long
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: uv sync --frozen
+
+      - name: Run backend unit and security tests
+        working-directory: backend
+        run: |
+          uv run pytest \
+            --ignore=tests/test_auth_routes.py \
+            --ignore=tests/test_api_file.py \
+            --ignore=tests/test_sandbox_file.py
+
+  sandbox-unit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: sandbox/uv.lock
+
+      - name: Install sandbox dependencies
+        working-directory: sandbox
+        run: uv sync --frozen
+
+      - name: Run sandbox proxy unit tests
+        working-directory: sandbox
+        run: uv run pytest tests/test_proxy.py
+
   build-and-push:
     runs-on: ubuntu-latest
+    needs: [frontend-smoke, backend-unit-security, sandbox-unit]
     strategy:
+      fail-fast: false
       matrix:
         component: [frontend, backend, sandbox, claw]
     
@@ -27,11 +160,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && github.repository == 'Simpleyyt/ai-manus'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -57,8 +193,389 @@ jobs:
           context: ./${{ matrix.component }}
           file: ./${{ matrix.component }}/Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          # Forks still validate the upstream image matrix, but only the
+          # upstream repository is allowed to publish upstream Docker Hub tags.
+          push: ${{ github.event_name != 'pull_request' && github.repository == 'Simpleyyt/ai-manus' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Fork-only deployment is deliberately explicit and opt-in. Manual deployment
+  # requires ENABLE_FORK_DEPLOY=true; both paths require SERVER_* secrets. The
+  # exact tag below is a one-time deployment authorization for this integration.
+  # Normal branch and version-tag pushes never contact a server.
+  deploy-preflight:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: >-
+      (
+        github.event_name == 'workflow_dispatch' &&
+        inputs.deploy_fork == true &&
+        (github.ref_name == 'main' || github.ref_name == 'custom') &&
+        vars.ENABLE_FORK_DEPLOY == 'true'
+      ) ||
+      (
+        github.event_name == 'push' &&
+        github.event.created == true &&
+        github.ref == 'refs/tags/deploy-test-20260717-integration-01'
+      )
+    outputs:
+      enabled: ${{ steps.secrets.outputs.enabled }}
+    steps:
+      - name: Verify deployment secrets
+        id: secrets
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+        shell: bash
+        run: |
+          if [[ -n "$SERVER_HOST" && -n "$SERVER_USER" && -n "$SERVER_PASSWORD" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Fork deployment is enabled, but one or more SERVER_* secrets are missing."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish-fork-images:
+    runs-on: ubuntu-latest
+    needs: deploy-preflight
+    if: needs.deploy-preflight.outputs.enabled == 'true'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # mockserver is fork-deployment-only; the upstream Docker Hub matrix
+        # intentionally remains unchanged above.
+        component: [frontend, backend, sandbox, claw, mockserver]
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_TAG: sha-${{ github.sha }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Prepare image name
+        id: image
+        shell: bash
+        run: |
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          echo "name=${REGISTRY}/${owner}/ai-manus-${{ matrix.component }}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push fork image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./${{ matrix.component }}
+          file: ./${{ matrix.component }}/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.image.outputs.name }}:${{ env.IMAGE_TAG }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=fork-${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=fork-${{ matrix.component }}
+
+  deploy-fork:
+    runs-on: ubuntu-latest
+    needs: publish-fork-images
+    if: needs.publish-fork-images.result == 'success'
+    concurrency:
+      group: fork-production-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: read
+    environment: fork-production
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_TAG: sha-${{ github.sha }}
+      DEPLOY_PATH: ${{ vars.FORK_DEPLOY_PATH || '/home/ubuntu/ai-manus' }}
+      FRONTEND_HOST_PORT: ${{ vars.FORK_FRONTEND_HOST_PORT || '18081' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Prepare deploy variables
+        id: deploy
+        shell: bash
+        run: |
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          echo "owner=${owner}" >> "$GITHUB_OUTPUT"
+          compose_b64="$(base64 < docker-compose.yml | tr -d '\n')"
+          echo "compose_b64=${compose_b64}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy fork images on server
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+          OWNER: ${{ steps.deploy.outputs.owner }}
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+          DEPLOY_PATH: ${{ env.DEPLOY_PATH }}
+          FRONTEND_HOST_PORT: ${{ env.FRONTEND_HOST_PORT }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+          COMPOSE_B64: ${{ steps.deploy.outputs.compose_b64 }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          envs: REGISTRY,OWNER,IMAGE_TAG,DEPLOY_PATH,FRONTEND_HOST_PORT,GHCR_TOKEN,GHCR_USER,COMPOSE_B64
+          script: |
+            set -eu
+            cd "$DEPLOY_PATH"
+
+            previous_compose="$(mktemp)"
+            previous_override="$(mktemp)"
+            incoming_compose="$(mktemp .docker-compose.yml.new.XXXXXX)"
+            incoming_override="$(mktemp .docker-compose.deploy.yml.new.XXXXXX)"
+            had_previous_compose=false
+            had_previous_override=false
+            changed=false
+            if [ -f docker-compose.yml ]; then
+              cp docker-compose.yml "$previous_compose"
+              had_previous_compose=true
+            fi
+            if [ -f docker-compose.deploy.yml ]; then
+              cp docker-compose.deploy.yml "$previous_override"
+              had_previous_override=true
+            fi
+
+            compose() {
+              docker compose -p ai-manus -f docker-compose.yml -f docker-compose.deploy.yml "$@"
+            }
+
+            restore_compose() {
+              if [ -f docker-compose.deploy.yml ]; then
+                docker compose -p ai-manus -f docker-compose.yml -f docker-compose.deploy.yml "$@"
+              else
+                docker compose -p ai-manus -f docker-compose.yml "$@"
+              fi
+            }
+
+            restore_file() {
+              backup="$1"
+              destination="$2"
+              restore_tmp="$(mktemp ".${destination}.restore.XXXXXX")"
+              if cp "$backup" "$restore_tmp"; then
+                mv -f "$restore_tmp" "$destination"
+              else
+                rm -f "$restore_tmp"
+                return 1
+              fi
+            }
+
+            rollback() {
+              status=$?
+              trap - EXIT
+              set +e
+              if [ "$changed" = true ]; then
+                echo "Deployment failed; restoring both previous compose files." >&2
+                if [ -f docker-compose.yml ]; then
+                  if [ -f docker-compose.deploy.yml ]; then
+                    compose stop worker >/dev/null 2>&1 || true
+                  else
+                    docker compose -p ai-manus -f docker-compose.yml stop worker >/dev/null 2>&1 || true
+                  fi
+                fi
+
+                if [ "$had_previous_compose" = true ]; then
+                  restore_file "$previous_compose" docker-compose.yml || true
+                else
+                  rm -f docker-compose.yml
+                fi
+                if [ "$had_previous_override" = true ]; then
+                  restore_file "$previous_override" docker-compose.deploy.yml || true
+                else
+                  rm -f docker-compose.deploy.yml
+                fi
+
+                if [ -f docker-compose.yml ] && restore_compose config -q; then
+                  for service in mongodb redis mockserver backend frontend; do
+                    if restore_compose config --services | grep -qx "$service"; then
+                      restore_compose up -d "$service" || true
+                    fi
+                  done
+                  task_backend="$(sed -n 's/^[[:space:]]*TASK_BACKEND=//p' .env 2>/dev/null | tail -n 1 || true)"
+                  if restore_compose config --services | grep -qx worker; then
+                    if [ "${task_backend:-local}" = "celery" ]; then
+                      restore_compose up -d worker || true
+                    else
+                      restore_compose stop worker >/dev/null 2>&1 || true
+                    fi
+                  fi
+                else
+                  echo "Previous compose configuration is unavailable or invalid; automatic service rollback was skipped." >&2
+                fi
+              fi
+
+              rm -f "$previous_compose" "$previous_override"
+              if [ -n "${incoming_compose:-}" ]; then
+                rm -f "$incoming_compose"
+              fi
+              if [ -n "${incoming_override:-}" ]; then
+                rm -f "$incoming_override"
+              fi
+              exit "$status"
+            }
+            trap rollback EXIT
+
+            printf '%s' "$COMPOSE_B64" | base64 -d > "$incoming_compose"
+            chmod 600 "$incoming_compose"
+
+            cat > "$incoming_override" <<EOF
+            services:
+              frontend:
+                image: ${REGISTRY}/${OWNER}/ai-manus-frontend:${IMAGE_TAG}
+                environment:
+                  - BACKEND_URL=http://backend:8000
+
+              backend:
+                image: ${REGISTRY}/${OWNER}/ai-manus-backend:${IMAGE_TAG}
+                depends_on:
+                  - mongodb
+                  - redis
+                  - mockserver
+                volumes:
+                  - /var/run/docker.sock:/var/run/docker.sock:ro
+                environment:
+                  - MONGODB_URI=mongodb://mongodb:27017
+                  - REDIS_HOST=redis
+                  - REDIS_PORT=6379
+                  - SANDBOX_NETWORK=manus-network
+                  - CLAW_NETWORK=manus-network
+                  - MANUS_API_BASE_URL=http://backend:8000
+                  - SANDBOX_IMAGE=${REGISTRY}/${OWNER}/ai-manus-sandbox:${IMAGE_TAG}
+                  - CLAW_IMAGE=${REGISTRY}/${OWNER}/ai-manus-claw:${IMAGE_TAG}
+
+              sandbox:
+                image: ${REGISTRY}/${OWNER}/ai-manus-sandbox:${IMAGE_TAG}
+
+              claw:
+                image: ${REGISTRY}/${OWNER}/ai-manus-claw:${IMAGE_TAG}
+
+              mockserver:
+                image: ${REGISTRY}/${OWNER}/ai-manus-mockserver:${IMAGE_TAG}
+                restart: unless-stopped
+                environment:
+                  - MOCK_DATA_FILE=default.yaml
+                  - MOCK_DELAY=1
+                networks:
+                  - manus-network
+
+              worker:
+                image: ${REGISTRY}/${OWNER}/ai-manus-backend:${IMAGE_TAG}
+                command: ["./start_worker.sh"]
+                restart: unless-stopped
+                depends_on:
+                  - mongodb
+                  - redis
+                volumes:
+                  - /var/run/docker.sock:/var/run/docker.sock:ro
+                env_file:
+                  - .env
+                environment:
+                  - SANDBOX_IMAGE=${REGISTRY}/${OWNER}/ai-manus-sandbox:${IMAGE_TAG}
+                  - CLAW_IMAGE=${REGISTRY}/${OWNER}/ai-manus-claw:${IMAGE_TAG}
+                  - MANUS_API_BASE_URL=http://backend:8000
+                  - SANDBOX_NETWORK=manus-network
+                  - CLAW_NETWORK=manus-network
+                networks:
+                  - manus-network
+                  - manus-data-network
+                healthcheck:
+                  test:
+                    - CMD-SHELL
+                    - >-
+                      /app/.venv/bin/celery -A app.worker.celery_app inspect ping
+                      --destination "celery@\$\$(hostname)" --timeout 5 | grep -q pong
+                  interval: 15s
+                  timeout: 10s
+                  retries: 5
+                  start_period: 20s
+            EOF
+            chmod 600 "$incoming_override"
+
+            docker compose -p ai-manus -f "$incoming_compose" -f "$incoming_override" config -q
+            changed=true
+            mv -f "$incoming_compose" docker-compose.yml
+            incoming_compose=""
+            mv -f "$incoming_override" docker-compose.deploy.yml
+            incoming_override=""
+            compose config -q
+
+            echo "$GHCR_TOKEN" | docker login "$REGISTRY" -u "$GHCR_USER" --password-stdin
+            # Never leave an old worker consuming jobs while the backend image
+            # and Compose topology are being replaced. The EXIT trap restores
+            # its previous state if any later deployment step fails.
+            compose stop worker >/dev/null 2>&1 || true
+            compose pull frontend backend sandbox claw mockserver
+            compose up -d backend mongodb redis mockserver
+            for i in $(seq 1 60); do
+              if compose exec -T backend \
+                python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)" >/dev/null 2>&1; then
+                break
+              fi
+              if [ "$i" -eq 60 ]; then
+                compose logs --tail=120 backend
+                exit 1
+              fi
+              sleep 2
+            done
+            compose up -d frontend
+            for i in $(seq 1 30); do
+              if compose exec -T backend python -c "import urllib.request; [urllib.request.urlopen(url, timeout=2).read(1) for url in ('http://frontend/', 'http://frontend/api/v1/config/frontend')]" >/dev/null 2>&1; then
+                break
+              fi
+              if [ "$i" -eq 30 ]; then
+                compose logs --tail=120 frontend backend
+                exit 1
+              fi
+              sleep 2
+            done
+            task_backend="$(sed -n 's/^[[:space:]]*TASK_BACKEND=//p' .env 2>/dev/null | tail -n 1 || true)"
+            if [ "${task_backend:-local}" = "celery" ]; then
+              compose up -d worker
+              worker_id="$(compose ps -q worker)"
+              if [ -z "$worker_id" ]; then
+                echo "Worker container was not created." >&2
+                exit 1
+              fi
+              for i in $(seq 1 60); do
+                worker_status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$worker_id" 2>/dev/null || echo missing)"
+                case "$worker_status" in
+                  healthy)
+                    break
+                    ;;
+                  unhealthy|exited|dead|missing)
+                    compose logs --tail=120 worker
+                    echo "Worker entered terminal state: ${worker_status}" >&2
+                    exit 1
+                    ;;
+                esac
+                if [ "$i" -eq 60 ]; then
+                  compose logs --tail=120 worker
+                  echo "Timed out waiting for worker health." >&2
+                  exit 1
+                fi
+                sleep 2
+              done
+            else
+              compose stop worker >/dev/null 2>&1 || true
+            fi
+            compose up --no-start sandbox claw
+            trap - EXIT
+            rm -f "$previous_compose" "$previous_override"

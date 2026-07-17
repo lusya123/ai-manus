@@ -23,9 +23,13 @@ class MongoAgentRepository(AgentRepository):
             mongo_agent = AgentDocument.from_domain(agent)
             await mongo_agent.save()
             return
-        
-        # Update fields from agent domain model
-        mongo_agent.update_from_domain(agent)
+
+        # Build the replacement through AgentDocument's credential serializer;
+        # BaseDocument.update_from_domain() would otherwise copy api_key into a
+        # plaintext MongoDB field.
+        replacement = AgentDocument.from_domain(agent)
+        for field, value in replacement.model_dump(exclude={"id"}).items():
+            setattr(mongo_agent, field, value)
         await mongo_agent.save()
 
     async def find_by_id(self, agent_id: str) -> Optional[Agent]:
@@ -33,7 +37,26 @@ class MongoAgentRepository(AgentRepository):
         mongo_agent = await AgentDocument.find_one(
             AgentDocument.agent_id == agent_id
         )
-        return mongo_agent.to_domain() if mongo_agent else None
+        if not mongo_agent:
+            return None
+        agent = mongo_agent.to_domain()
+        if mongo_agent.api_key:
+            # Opportunistically migrate both historical BYOK credentials and
+            # duplicated system keys away from the legacy plaintext field.
+            replacement = AgentDocument.from_domain(agent)
+            mongo_agent.api_key = None
+            mongo_agent.api_key_encrypted = replacement.api_key_encrypted
+            mongo_agent.is_byok = agent.is_byok
+            await mongo_agent.save()
+        return agent
+
+    async def delete(self, agent_id: str) -> None:
+        """Delete an agent and any encrypted per-session credential it owns."""
+        mongo_agent = await AgentDocument.find_one(
+            AgentDocument.agent_id == agent_id
+        )
+        if mongo_agent:
+            await mongo_agent.delete()
 
     async def add_memory(self, agent_id: str,
                           name: str,

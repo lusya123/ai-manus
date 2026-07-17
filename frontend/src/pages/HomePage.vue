@@ -39,8 +39,9 @@
           <div class="flex flex-col w-full bg-[var(--background-gray-main)]">
             <div class="[&amp;:not(:empty)]:pb-2 bg-[var(--background-gray-main)] rounded-[22px_22px_0px_0px]">
             </div>
-            <ChatBox :rows="2" v-model="message" v-model:attachments="attachments" @submit="handleSubmit"
-              :isRunning="false" />
+            <ChatBox :rows="2" v-model="message" v-model:attachments="attachments"
+              :selected-model-id="selectedModelId" :model-options="modelOptions" show-model-picker
+              @update:selectedModelId="handleModelChange" @submit="handleSubmit" :isRunning="false" />
           </div>
         </div>
         <!-- Suggestion chips (structure replicated from manus.im home) -->
@@ -72,7 +73,7 @@
 
 <script setup lang="ts">
 import SimpleBar from '../components/SimpleBar.vue';
-import { ref, onMounted, computed } from 'vue';
+import { ref, onMounted, onUnmounted, computed } from 'vue';
 import { useRouter } from 'vue-router';
 import { useI18n } from 'vue-i18n';
 import ChatBox from '../components/ChatBox.vue';
@@ -87,6 +88,15 @@ import type { FileInfo } from '../api/file';
 import { useFilePanel } from '../composables/useFilePanel';
 import { useAuth } from '../composables/useAuth';
 import { getCachedClientConfig } from '../api/config';
+import {
+  AGENT_CONFIG_CHANGED_EVENT,
+  buildChatModelOptions,
+  ensureSelectedModelId,
+  getModelConfigForSelection,
+  getSavedSelectedModelId,
+  saveSelectedModelId,
+} from '../api/agentConfig';
+import type { ChatModelOption } from '../api/agentConfig';
 
 const { t } = useI18n();
 const router = useRouter();
@@ -97,6 +107,19 @@ const { hideFilePanel } = useFilePanel();
 const { currentUser } = useAuth();
 const showGithubButton = ref(false);
 const githubRepositoryUrl = ref('https://github.com/simpleyyt/ai-manus');
+const modelOptions = ref<ChatModelOption[]>([]);
+const selectedModelId = ref(getSavedSelectedModelId());
+let loadedClientConfig: Awaited<ReturnType<typeof getCachedClientConfig>> = null;
+
+const syncModelSelection = () => {
+  modelOptions.value = buildChatModelOptions(loadedClientConfig);
+  selectedModelId.value = ensureSelectedModelId(
+    getSavedSelectedModelId(),
+    modelOptions.value,
+  );
+};
+
+const handleAgentConfigChanged = () => syncModelSelection();
 
 // Suggestion chips, structure replicated from the manus.im home page
 interface Suggestion {
@@ -130,26 +153,44 @@ const handleSuggestionClick = (suggestion: Suggestion) => {
 
 onMounted(async () => {
   hideFilePanel();
-  const clientConfig = await getCachedClientConfig();
-  if (clientConfig) {
-    showGithubButton.value = clientConfig.show_github_button;
-    githubRepositoryUrl.value = clientConfig.github_repository_url;
+  loadedClientConfig = await getCachedClientConfig();
+  if (loadedClientConfig) {
+    showGithubButton.value = loadedClientConfig.show_github_button;
+    githubRepositoryUrl.value = loadedClientConfig.github_repository_url;
   }
+  syncModelSelection();
+  saveSelectedModelId(selectedModelId.value);
+  window.addEventListener(AGENT_CONFIG_CHANGED_EVENT, handleAgentConfigChanged);
 });
+
+onUnmounted(() => {
+  window.removeEventListener(AGENT_CONFIG_CHANGED_EVENT, handleAgentConfigChanged);
+});
+
+const handleModelChange = (modelId: string) => {
+  selectedModelId.value = ensureSelectedModelId(modelId, modelOptions.value);
+  saveSelectedModelId(selectedModelId.value);
+};
 
 const handleSubmit = async () => {
   if (message.value.trim() && !isSubmitting.value) {
     isSubmitting.value = true;
 
     try {
+      // Settings can be changed while HomePage remains mounted. Re-read the
+      // latest selection at submit time as a final guard against stale refs.
+      syncModelSelection();
       // Create new Agent
-      const session = await createSession();
+      const session = await createSession(
+        getModelConfigForSelection(selectedModelId.value, modelOptions.value),
+      );
       const sessionId = session.session_id;
 
       // Navigate to new route with session_id, passing initial message via state
       router.push({
         path: `/chat/${sessionId}`,
         state: {
+          modelId: selectedModelId.value,
           message: message.value, files: attachments.value.map((file: FileInfo) => ({
             file_id: file.file_id,
             filename: file.filename,

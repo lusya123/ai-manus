@@ -34,16 +34,24 @@ class Claw(BaseModel):
     user_id: str
     container_name: Optional[str] = None
     container_ip: Optional[str] = None
-    api_key: str  # Per-user OpenAI-compatible API key for LLM proxy
+    # Runtime capability plaintext exists only while a runtime is being
+    # provisioned.  It is excluded from repr/model serialization and is never
+    # reconstructed from MongoDB; durable storage contains only a keyed HMAC.
+    api_key: Optional[str] = Field(default=None, repr=False, exclude=True)
     status: ClawStatus = ClawStatus.CREATING
     error_message: Optional[str] = None
     expires_at: Optional[datetime] = None
+    last_activity_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     @property
     def http_base_url(self) -> Optional[str]:
         """HTTP base URL for the manus-claw plugin server"""
-        if self.container_ip:
-            return f"http://{self.container_ip}:18788"
-        return None
+        if not self.container_ip:
+            return None
+        if self.container_ip.startswith(("http://", "https://")):
+            return self.container_ip.rstrip("/")
+        if ":" in self.container_ip:
+            return f"http://{self.container_ip}"
+        return f"http://{self.container_ip}:18788"

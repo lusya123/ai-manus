@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import logging
 
@@ -8,12 +8,12 @@ from app.application.services.file_service import FileService
 from app.application.services.agent_service import AgentService
 from app.application.services.email_service import EmailService
 from app.application.errors.exceptions import (
-    UnauthorizedError, NotFoundError, BadRequestError
+    UnauthorizedError, ForbiddenError, NotFoundError, BadRequestError
 )
 from app.interfaces.dependencies import get_auth_service, get_current_user, get_file_service, get_agent_service, get_token_service, get_email_service
 from app.interfaces.schemas.base import APIResponse
 from app.interfaces.schemas.auth import (
-    LoginRequest, RegisterRequest, ChangePasswordRequest, ChangeFullnameRequest, RefreshTokenRequest,
+    LoginRequest, RegisterRequest, ChangePasswordRequest, ChangeFullnameRequest, RefreshTokenRequest, LogoutRequest,
     SendVerificationCodeRequest, ResetPasswordRequest,
     LoginResponse, RegisterResponse, AuthStatusResponse, RefreshTokenResponse,
     UserResponse
@@ -26,13 +26,33 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
+def _client_ip(request: Request) -> str:
+    # Do not trust X-Forwarded-For here unless a deployment has configured a
+    # trusted-proxy middleware; the direct peer is the safe default key.
+    return request.client.host if request.client else "unknown"
+
+
 
 @router.post("/login", response_model=APIResponse[LoginResponse])
 async def login(
     request: LoginRequest,
+    http_request: Request,
     auth_service: AuthService = Depends(get_auth_service)
 ) -> APIResponse[LoginResponse]:
     """User login endpoint"""
+    settings = get_settings()
+    await auth_service.enforce_rate_limit(
+        "login-ip",
+        _client_ip(http_request),
+        limit=settings.auth_login_ip_attempts_per_window,
+        window_seconds=settings.auth_login_window_seconds,
+    )
+    await auth_service.enforce_rate_limit(
+        "login-account",
+        request.email,
+        limit=settings.auth_login_attempts_per_window,
+        window_seconds=settings.auth_login_window_seconds,
+    )
     # Authenticate user and get tokens
     auth_result = await auth_service.login_with_tokens(request.email, request.password)
     
@@ -48,9 +68,17 @@ async def login(
 @router.post("/register", response_model=APIResponse[RegisterResponse])
 async def register(
     request: RegisterRequest,
+    http_request: Request,
     auth_service: AuthService = Depends(get_auth_service)
 ) -> APIResponse[RegisterResponse]:
     """User registration endpoint"""
+    settings = get_settings()
+    await auth_service.enforce_rate_limit(
+        "register-ip",
+        _client_ip(http_request),
+        limit=settings.auth_register_attempts_per_hour,
+        window_seconds=3600,
+    )
     # Register user
     user = await auth_service.register_user(
         fullname=request.fullname,
@@ -59,8 +87,7 @@ async def register(
     )
     
     # Generate tokens for the new user
-    access_token = auth_service.token_service.create_access_token(user)
-    refresh_token = auth_service.token_service.create_refresh_token(user)
+    access_token, refresh_token = auth_service.token_service.create_token_pair(user)
     
     # Return success response with tokens
     return APIResponse.success(RegisterResponse(
@@ -126,7 +153,7 @@ async def get_user(
     """Get user information by ID (admin only)"""
     # Check if current user is admin
     if current_user.role != "admin":
-        raise UnauthorizedError("Admin access required")
+        raise ForbiddenError("Admin access required")
     
     user = await auth_service.get_user_by_id(user_id)
     
@@ -145,7 +172,7 @@ async def deactivate_user(
     """Deactivate user account (admin only)"""
     # Check if current user is admin
     if current_user.role != "admin":
-        raise UnauthorizedError("Admin access required")
+        raise ForbiddenError("Admin access required")
     
     # Prevent self-deactivation
     if current_user.id == user_id:
@@ -164,7 +191,7 @@ async def activate_user(
     """Activate user account (admin only)"""
     # Check if current user is admin
     if current_user.role != "admin":
-        raise UnauthorizedError("Admin access required")
+        raise ForbiddenError("Admin access required")
     
     await auth_service.activate_user(user_id)
     return APIResponse.success({})
@@ -173,22 +200,39 @@ async def activate_user(
 @router.post("/refresh", response_model=APIResponse[RefreshTokenResponse])
 async def refresh_token(
     request: RefreshTokenRequest,
+    http_request: Request,
     auth_service: AuthService = Depends(get_auth_service)
 ) -> APIResponse[RefreshTokenResponse]:
     """Refresh access token endpoint"""
+    settings = get_settings()
+    await auth_service.enforce_rate_limit(
+        "refresh-token",
+        request.refresh_token,
+        limit=settings.auth_refresh_attempts_per_minute,
+        window_seconds=60,
+    )
+    await auth_service.enforce_rate_limit(
+        "refresh-ip",
+        _client_ip(http_request),
+        limit=settings.auth_refresh_attempts_per_minute * 2,
+        window_seconds=60,
+    )
     # Refresh access token
     token_result = await auth_service.refresh_access_token(request.refresh_token)
     
     return APIResponse.success(RefreshTokenResponse(
         access_token=token_result.access_token,
-        token_type=token_result.token_type
+        token_type=token_result.token_type,
+        refresh_token=token_result.refresh_token,
     ))
 
 
 @router.post("/logout", response_model=APIResponse[dict])
 async def logout(
-    current_user: User = Depends(get_current_user),
-    bearer_credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer()),
+    request: LogoutRequest | None = None,
+    bearer_credentials: HTTPAuthorizationCredentials | None = Depends(
+        HTTPBearer(auto_error=False)
+    ),
     auth_service: AuthService = Depends(get_auth_service)
 ) -> APIResponse[dict]:
     """User logout endpoint"""
@@ -196,7 +240,10 @@ async def logout(
         raise BadRequestError("Logout is not allowed")
     
     # Revoke token
-    await auth_service.logout(bearer_credentials.credentials)
+    await auth_service.logout(
+        bearer_credentials.credentials if bearer_credentials else None,
+        refresh_token=request.refresh_token if request else None,
+    )
     
     return APIResponse.success({})
 
@@ -204,12 +251,25 @@ async def logout(
 @router.post("/send-verification-code", response_model=APIResponse[dict])
 async def send_verification_code(
     request: SendVerificationCodeRequest,
+    http_request: Request,
     auth_service: AuthService = Depends(get_auth_service),
     email_service: EmailService = Depends(get_email_service)
 ) -> APIResponse[dict]:
     """Send verification code for password reset"""
     if get_settings().auth_provider != "password":
         raise BadRequestError("Password reset is not available")
+    await auth_service.enforce_rate_limit(
+        "password-reset-ip",
+        _client_ip(http_request),
+        limit=get_settings().auth_password_reset_attempts_per_hour,
+        window_seconds=3600,
+    )
+    await auth_service.enforce_rate_limit(
+        "password-reset-account",
+        request.email,
+        limit=get_settings().auth_password_reset_attempts_per_hour,
+        window_seconds=3600,
+    )
     
     # Check if user exists with this email
     user = await auth_service.user_repository.get_user_by_email(request.email)
@@ -228,12 +288,25 @@ async def send_verification_code(
 @router.post("/reset-password", response_model=APIResponse[dict])
 async def reset_password(
     request: ResetPasswordRequest,
+    http_request: Request,
     auth_service: AuthService = Depends(get_auth_service),
     email_service: EmailService = Depends(get_email_service)
 ) -> APIResponse[dict]:
     """Reset password with verification code"""
     if get_settings().auth_provider != "password":
         raise BadRequestError("Password reset is not available")
+    await auth_service.enforce_rate_limit(
+        "password-reset-confirm-ip",
+        _client_ip(http_request),
+        limit=get_settings().auth_password_reset_attempts_per_hour,
+        window_seconds=3600,
+    )
+    await auth_service.enforce_rate_limit(
+        "password-reset-confirm-account",
+        request.email,
+        limit=get_settings().auth_password_reset_attempts_per_hour,
+        window_seconds=3600,
+    )
     
     # Verify the verification code
     if not await email_service.verify_code(request.email, request.verification_code):
@@ -243,4 +316,3 @@ async def reset_password(
     await auth_service.reset_password(request.email, request.new_password)
     
     return APIResponse.success({})
- 

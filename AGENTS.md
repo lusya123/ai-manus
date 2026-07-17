@@ -62,7 +62,7 @@ ai-manus/
 
 ```bash
 cp .env.example .env
-# Edit .env — at minimum set API_KEY to any non-empty string
+# Edit .env — set API_KEY and generate JWT_SECRET_KEY with: openssl rand -hex 32
 ./dev.sh up -d
 ```
 
@@ -75,6 +75,9 @@ This starts: frontend (5173), backend (8000), sandbox (8080), mockserver (8090),
 | `AUTH_PROVIDER` | `none` | Skip authentication entirely |
 | `API_BASE` | `http://mockserver:8090/v1` | Use mock LLM server |
 | `API_KEY` | any non-empty string | Required — set to anything with mockserver |
+| `JWT_SECRET_KEY` | output of `openssl rand -hex 32` | Required whenever authentication is enabled; also required in staging/production |
+| `REGISTRATION_ENABLED` | `false` | Keep public account creation closed unless a test explicitly needs it |
+| `BACKEND_REPLICA_COUNT` | `1` | `TASK_BACKEND=local` is process-local and supports only one backend process |
 | `SEARCH_PROVIDER` | `bing_web` | No API key needed |
 | `SANDBOX_ADDRESS` | `sandbox` | Use single dev sandbox container |
 | `LOG_LEVEL` | `DEBUG` | Verbose logging |
@@ -87,7 +90,19 @@ cd backend
 uv sync
 uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
-Requires running MongoDB and Redis. Requires `API_KEY` env var (or `.env` in `backend/`).
+Requires running MongoDB and Redis. Requires `API_KEY` and, unless this is disposable local development with `AUTH_PROVIDER=none`, a strong `JWT_SECRET_KEY` env var (or a `.env` file in `backend/`).
+
+### Security and Topology Invariants
+
+- Never add a usable fixed production secret to documentation, tests, Compose examples, or `.env.example`. Generate JWT, BYOK, Claw HMAC, and local-auth secrets independently.
+- Password auth uses random per-user PBKDF2-SHA256 salts and at least 600,000 rounds. `PASSWORD_SALT` and `PASSWORD_LEGACY_HASH_ROUNDS` are legacy-login migration inputs, not defaults for new accounts. Public registration defaults off; auth limits and revocation depend on Redis and fail closed.
+- Redis security state must be durable and non-evicting. Preserve the bundled AOF `everysec`, `noeviction`, and named-volume settings, or provide equivalent persistence, backups, and high availability for an external Redis. A host crash can still lose roughly one second of AOF writes, so never treat Redis as a hard billing ledger or refresh/revocation state as an ephemeral cache.
+- CORS accepts exact HTTP(S) origins only. Do not add `*`, credentialed CORS, or broad regex origins. Sub2API handoff credentials belong in a one-time-state-correlated URL fragment and must be verified before storage.
+- Production BYOK uses `MODEL_CREDENTIAL_ENCRYPTION_KEYS`, not JWT-derived encryption. Use `backend/scripts/rotate_model_credential_keys.py` dry-run first. Pre-marker plaintext credentials require the complete temporary `LEGACY_SYSTEM_API_KEYS` history and `migrate_agent_credentials.py` dry-run before `--apply`.
+- Claw runtime-key hashes use the independent `CLAW_API_KEY_HMAC_KEYS` keyring. Preserve its WebSocket input/attachment limits, distributed leases, upload limits, and bounded history.
+- Upload changes must preserve the pre-parser HTTP body cap, verified per-file cap, and atomic per-user GridFS byte/file reservations. Keep Nginx and backend body limits aligned.
+- `TASK_BACKEND=local` is valid for exactly one Python process. Set `BACKEND_REPLICA_COUNT` to the actual Uvicorn/Gunicorn/container replica count and use Celery whenever it is greater than one.
+- AgentBay session IDs are cleanup handles for billable resources. Preserve them whenever deletion is unconfirmed, wait for task cancellation before destruction, and never log signed AgentBay gateway URLs.
 
 **Frontend:**
 ```bash
@@ -242,7 +257,7 @@ The dev compose starts the backend with **debugpy** on port `5678`. Attach a rem
 
 ### Resetting State
 
-- MongoDB data persists in volume `manus-mongodb-data`. Wipe with `./dev.sh down -v`.
+- Development uses the `ai-manus-dev` Compose project, `manus-network-dev`, and `manus-mongodb-data-dev`, all separate from production. Wipe only that dev project with `./dev.sh down -v`.
 - Mockserver tracks response index; restart to reset: `./dev.sh restart mockserver`.
 
 ---

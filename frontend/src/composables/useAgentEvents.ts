@@ -16,6 +16,33 @@ import {
   AgentSSEEvent,
 } from '../types/event';
 
+const TERMINAL_EVENTS = new Set<AgentSSEEvent['event']>(['done', 'error', 'wait']);
+
+/**
+ * A session contains every historical turn. Terminal events from an older
+ * turn must not prevent reconnecting to a newer running turn.
+ */
+export function hasTerminalEventForLatestTurn(events: AgentSSEEvent[]): boolean {
+  let latestTurnStart = -1;
+  let latestTurnId: string | undefined;
+  events.forEach((event, index) => {
+    const role = (event.data as { role?: string }).role;
+    if ((event.event === 'message' || event.event === 'attachments') && role === 'user') {
+      latestTurnStart = index;
+      latestTurnId = event.data.turn_id;
+    }
+  });
+  if (latestTurnStart < 0) return false;
+  if (latestTurnId) {
+    return events.some(
+      event => TERMINAL_EVENTS.has(event.event) && event.data.turn_id === latestTurnId,
+    );
+  }
+  // Legacy history predates stable turn IDs. Retain its ordered fallback while
+  // new durable turns use an exact logical-turn match above.
+  return events.slice(latestTurnStart).some((event) => TERMINAL_EVENTS.has(event.event));
+}
+
 export interface AgentEventState {
   messages: Ref<Message[]>;
   title: Ref<string>;
@@ -37,6 +64,11 @@ export interface AgentEventOptions {
  */
 export function useAgentEvents(state: AgentEventState, options: AgentEventOptions = {}) {
   const { messages, title, plan, isLoading, lastEventId, lastTool, lastNoMessageTool } = state;
+  const seenEventIds = new Set<string>();
+
+  const resetEventHistory = () => {
+    seenEventIds.clear();
+  };
 
   const getLastStep = (): StepContent | undefined => {
     return messages.value.filter(message => message.type === 'step').pop()?.content as StepContent;
@@ -123,6 +155,16 @@ export function useAgentEvents(state: AgentEventState, options: AgentEventOption
   };
 
   const handleEvent = (event: AgentSSEEvent) => {
+    // Mongo history replay and Redis live delivery can overlap. Stable logical
+    // event IDs make that overlap harmless while transport cursors remain
+    // independently usable for reconnects.
+    if (event.data.event_id && seenEventIds.has(event.data.event_id)) {
+      lastEventId.value = event.data.transport_cursor ?? lastEventId.value;
+      return;
+    }
+    if (event.data.event_id) {
+      seenEventIds.add(event.data.event_id);
+    }
     if (event.event === 'message') {
       handleMessageEvent(event.data as MessageEventData);
     } else if (event.event === 'tool') {
@@ -130,9 +172,10 @@ export function useAgentEvents(state: AgentEventState, options: AgentEventOption
     } else if (event.event === 'step') {
       handleStepEvent(event.data as StepEventData);
     } else if (event.event === 'done') {
-      // Loading state is cleared when the SSE connection closes
+      // Some task backends keep the SSE connection open briefly after a terminal event.
+      isLoading.value = false;
     } else if (event.event === 'wait') {
-      // TODO: handle wait event
+      isLoading.value = false;
     } else if (event.event === 'error') {
       handleErrorEvent(event.data as ErrorEventData);
     } else if (event.event === 'title') {
@@ -140,8 +183,8 @@ export function useAgentEvents(state: AgentEventState, options: AgentEventOption
     } else if (event.event === 'plan') {
       handlePlanEvent(event.data as PlanEventData);
     }
-    lastEventId.value = event.data.event_id;
+    lastEventId.value = event.data.transport_cursor ?? lastEventId.value;
   };
 
-  return { handleEvent };
+  return { handleEvent, resetEventHistory };
 }

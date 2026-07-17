@@ -43,10 +43,7 @@ RUN add-apt-repository ppa:deadsnakes/ppa && \
 # Install uv
 RUN pip3 install uv
 
-# Configure uv to use Aliyun mirror
-ENV UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
-
-# Install Node.js 20.18.0
+# Install the current Node.js 20.x package from NodeSource
 RUN mkdir -p /etc/apt/keyrings && \
     curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
     echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list && \
@@ -54,9 +51,6 @@ RUN mkdir -p /etc/apt/keyrings && \
     apt-get install -y nodejs && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
-
-# Configure npm to use Aliyun mirror
-RUN npm config set registry https://registry.npmmirror.com
 
 # Install Google Chrome
 RUN add-apt-repository ppa:xtradeb/apps -y && \
@@ -84,10 +78,10 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy project files (copy dependency files first to leverage cache)
-COPY pyproject.toml ./
+COPY pyproject.toml uv.lock ./
 
-# Install Python dependencies
-RUN uv sync --no-dev
+# Install the exact dependency graph reviewed in source control.
+RUN uv sync --frozen --no-dev
 
 # Copy remaining project files
 COPY . .
@@ -98,8 +92,8 @@ RUN chown -R ubuntu:ubuntu /app
 # Configure supervisor
 COPY supervisord.conf /etc/supervisor/conf.d/app.conf
 
-# Expose ports
-EXPOSE 8080 9222 5900 5901
+# Expose ports (3015x are AgentBay gateway mirrors of 8080/8222/5901)
+EXPOSE 8080 9222 5900 5901 30150 30151 30152
 
 ENV UVI_ARGS=""
 ENV CHROME_ARGS=""

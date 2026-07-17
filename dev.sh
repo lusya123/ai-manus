@@ -12,4 +12,5 @@ fi
 
 
 # Execute Docker Compose command
-$COMPOSE -f docker-compose-development.yml "$@"
+PROJECT_NAME="${DEV_COMPOSE_PROJECT_NAME:-ai-manus-dev}"
+$COMPOSE -p "$PROJECT_NAME" -f docker-compose-development.yml "$@"

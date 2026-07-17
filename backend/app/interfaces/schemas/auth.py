@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Any, Optional
 from pydantic import BaseModel, field_validator
 from datetime import datetime
 from app.domain.models.user import UserRole
@@ -96,6 +96,12 @@ class RefreshTokenRequest(BaseModel):
         return v
 
 
+class LogoutRequest(BaseModel):
+    """Optional refresh token used to revoke external-provider sessions."""
+
+    refresh_token: Optional[str] = None
+
+
 class SendVerificationCodeRequest(BaseModel):
     """Send verification code request schema"""
     email: str
@@ -148,6 +154,9 @@ class UserResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     last_login_at: Optional[datetime] = None
+    auth_provider: Optional[str] = None
+    external_id: Optional[str] = None
+    external_user: Optional[dict[str, Any]] = None
     
     @staticmethod
     def from_domain(user) -> 'UserResponse':
@@ -160,7 +169,10 @@ class UserResponse(BaseModel):
             is_active=user.is_active,
             created_at=user.created_at,
             updated_at=user.updated_at,
-            last_login_at=user.last_login_at
+            last_login_at=user.last_login_at,
+            auth_provider=getattr(user, "auth_provider", None),
+            external_id=getattr(user, "external_id", None),
+            external_user=getattr(user, "external_user", None),
         )
 
 
@@ -188,4 +200,5 @@ class AuthStatusResponse(BaseModel):
 class RefreshTokenResponse(BaseModel):
     """Refresh token response schema"""
     access_token: str
-    token_type: str = "bearer" 
+    token_type: str = "bearer"
+    refresh_token: Optional[str] = None

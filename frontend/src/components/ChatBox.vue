@@ -16,16 +16,21 @@
             </div>
             <div class="px-3"></div>
             <footer class="flex gap-2 px-3 items-center">
-                <button @click="uploadFile"
-                    class="rounded-full border border-[var(--border-main)] inline-flex items-center justify-center gap-1 clickable cursor-pointer text-xs text-[var(--text-secondary)] hover:bg-[var(--fill-tsp-white-light)] w-8 h-8 p-0 shrink-0"
-                    aria-expanded="false" aria-haspopup="dialog">
-                    <Paperclip :size="16" />
-                </button>
+                <div class="flex items-center gap-2 min-w-0">
+                    <button @click="uploadFile"
+                        class="rounded-full border border-[var(--border-main)] inline-flex items-center justify-center gap-1 clickable cursor-pointer text-xs text-[var(--text-secondary)] hover:bg-[var(--fill-tsp-white-light)] w-8 h-8 p-0 shrink-0"
+                        aria-expanded="false" aria-haspopup="dialog">
+                        <Paperclip :size="16" />
+                    </button>
+                    <ModelPicker v-if="showModelPicker && modelOptions.length > 0" :options="modelOptions"
+                        :selected-model-id="selectedModelId" :disabled="modelPickerDisabled"
+                        @update:selectedModelId="emit('update:selectedModelId', $event)" />
+                </div>
                 <div class="flex gap-2 ml-auto">
                     <button v-if="!isRunning || sendEnabled || hideStopButton"
                         class="inline-flex items-center justify-center whitespace-nowrap font-medium transition-colors text-sm rounded-full p-0 w-8 h-8 min-w-0 hover:opacity-90"
                         :class="!sendEnabled ? 'cursor-not-allowed bg-[var(--fill-tsp-white-dark)] hover:opacity-100' : 'cursor-pointer bg-[var(--Button-primary-black)]'"
-                        @click="handleSubmit">
+                        @click="handleSubmit()">
                         <SendIcon :disabled="!sendEnabled" />
                     </button>
                     <button v-else-if="!hideStopButton" @click="handleStop"
@@ -40,58 +45,76 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch, computed } from 'vue';
+import { ref, computed } from 'vue';
 import SendIcon from './icons/SendIcon.vue';
 import { useI18n } from 'vue-i18n';
 import ChatBoxFiles from './ChatBoxFiles.vue';
+import ModelPicker from './ModelPicker.vue';
 import { Paperclip } from 'lucide-vue-next';
 import type { FileInfo } from '../api/file';
+import type { ChatModelOption } from '../api/agentConfig';
+import { SYSTEM_MODEL_ID } from '../api/agentConfig';
 
 const { t } = useI18n();
-const hasTextInput = ref(false);
 const isComposing = ref(false);
 const chatBoxFileListRef = ref();
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
     modelValue: string;
     rows: number;
     isRunning: boolean;
     attachments: FileInfo[];
     hideStopButton?: boolean;
     allowSendFilesOnly?: boolean;
-}>();
+    showModelPicker?: boolean;
+    modelOptions?: ChatModelOption[];
+    selectedModelId?: string;
+    modelPickerDisabled?: boolean;
+}>(), {
+    showModelPicker: false,
+    modelOptions: () => [],
+    selectedModelId: SYSTEM_MODEL_ID,
+    modelPickerDisabled: false,
+});
 
-const sendEnabled = computed(() => {
+const canSubmit = (draftValue = props.modelValue) => {
+    const hasTextInput = draftValue.trim() !== '';
     const hasFiles = (props.attachments?.length ?? 0) > 0;
     const allUploaded = chatBoxFileListRef.value?.isAllUploaded ?? true;
     if (props.allowSendFilesOnly) {
-        return hasTextInput.value || (hasFiles && allUploaded);
+        return (hasTextInput || hasFiles) && (!hasFiles || allUploaded);
     }
-    return hasTextInput.value && (!hasFiles || allUploaded);
-});
+    return hasTextInput && (!hasFiles || allUploaded);
+};
+
+const sendEnabled = computed(() => canSubmit());
 
 const emit = defineEmits<{
     (e: 'update:modelValue', value: string): void;
     (e: 'update:attachments', value: FileInfo[]): void;
+    (e: 'update:selectedModelId', value: string): void;
     (e: 'submit'): void;
     (e: 'stop'): void;
 }>();
 
 const handleEnterKeydown = (event: KeyboardEvent) => {
-    if (isComposing.value) {
+    if (isComposing.value || event.isComposing) {
         // If in input method composition state, do nothing and allow default behavior
         return;
     }
 
-    // Not in input method composition state and has text input, prevent default behavior and submit
-    if (sendEnabled.value) {
+    const draftValue = (event.currentTarget as HTMLTextAreaElement | null)?.value ?? props.modelValue;
+
+    // Read from the textarea itself so Enter cannot race the parent v-model update.
+    if (canSubmit(draftValue)) {
         event.preventDefault();
-        handleSubmit();
+        emit('update:modelValue', draftValue);
+        handleSubmit(draftValue);
     }
 };
 
-const handleSubmit = () => {
-    if (!sendEnabled.value) return;
+const handleSubmit = (draftValue = props.modelValue) => {
+    if (!canSubmit(draftValue)) return;
     emit('submit');
 };
 
@@ -103,7 +126,4 @@ const uploadFile = () => {
     chatBoxFileListRef.value?.uploadFile();
 };
 
-watch(() => props.modelValue, (value) => {
-    hasTextInput.value = value.trim() !== '';
-});
 </script>

@@ -11,10 +11,17 @@
       <ToolPanelContent v-if="isShow && toolContent" :sessionId="sessionId" :realTime="realTime" :toolContent="toolContent" :live="live" :isShare="isShare" @hide="hideToolPanel" @jumpToRealTime="jumpToRealTime" />
     </div>
   </div>
+  <button v-if="visible && !isShow && toolContent" @click="reopenToolPanel"
+    class="fixed right-4 bottom-24 z-40 h-10 px-3 rounded-full inline-flex items-center gap-2 bg-[var(--background-white-main)] text-[var(--text-primary)] border border-[var(--border-main)] shadow-[0px_5px_16px_0px_var(--shadow-S),0px_0px_1.25px_0px_var(--shadow-S)] hover:bg-[var(--background-gray-main)] cursor-pointer"
+    :title="$t('Open Manus workspace')">
+    <Monitor class="size-4 text-[var(--icon-secondary)]" />
+    <span class="text-sm font-medium whitespace-nowrap">{{ $t('Open workspace') }}</span>
+  </button>
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted, onUnmounted, watch } from 'vue'
+import { Monitor } from 'lucide-vue-next'
 import type { ToolContent } from '../types/message'
 import ToolPanelContent from './ToolPanelContent.vue'
 import { useResizeObserver } from '../composables/useResizeObserver'
@@ -37,7 +44,8 @@ const emit = defineEmits<{
   (e: 'jumpToRealTime'): void
 }>()
 
-defineProps<{
+const props = defineProps<{
+  size?: number
   sessionId?: string
   realTime: boolean
   isShare: boolean
@@ -55,23 +63,39 @@ const hideToolPanel = () => {
   isShow.value = false
 }
 
+const clearToolPanel = () => {
+  isShow.value = false
+  visible.value = true
+  live.value = false
+  toolContent.value = undefined
+}
+
+const reopenToolPanel = () => {
+  if (toolContent.value) showToolPanel(toolContent.value, live.value)
+}
+
 const jumpToRealTime = () => {
   emit('jumpToRealTime')
 }
 
+const handleFilePanelShown = () => {
+  visible.value = false
+}
+
 onMounted(() => {
-  eventBus.on(EVENT_SHOW_FILE_PANEL, () => {
-    visible.value = false
-  })
+  eventBus.on(EVENT_SHOW_FILE_PANEL, handleFilePanelShown)
 })
 
 onUnmounted(() => {
-  eventBus.off(EVENT_SHOW_FILE_PANEL)
+  eventBus.off(EVENT_SHOW_FILE_PANEL, handleFilePanelShown)
 })
+
+watch(() => props.sessionId, clearToolPanel)
 
 defineExpose({
   showToolPanel,
   hideToolPanel,
+  clearToolPanel,
   isShow
 })
 </script>

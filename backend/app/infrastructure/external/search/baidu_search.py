@@ -6,6 +6,7 @@ import httpx
 from app.domain.external.search import SearchEngine
 from app.domain.models.search import SearchResultItem, SearchResults
 from app.domain.models.tool_result import ToolResult
+from app.domain.utils.error_reporting import safe_exception_summary
 
 logger = logging.getLogger(__name__)
 
@@ -97,8 +98,9 @@ class BaiduSearchEngine(SearchEngine):
                 return ToolResult(success=True, data=results)
 
         except httpx.HTTPStatusError as e:
+            error_summary = safe_exception_summary(e)
             logger.error(
-                f"Baidu Search API HTTP error: {e.response.status_code}"
+                "Baidu Search API HTTP error: %s", error_summary
             )
             error_results = SearchResults(
                 query=query,
@@ -108,11 +110,14 @@ class BaiduSearchEngine(SearchEngine):
             )
             return ToolResult(
                 success=False,
-                message=f"Baidu Search API error (HTTP {e.response.status_code})",
+                message=f"Baidu Search API error: {error_summary}",
                 data=error_results,
             )
         except Exception as e:
-            logger.error(f"Baidu Search failed: {e}")
+            error_summary = safe_exception_summary(e)
+            logger.error(
+                "Baidu Search failed: %s", error_summary
+            )
             error_results = SearchResults(
                 query=query,
                 date_range=date_range,
@@ -121,7 +126,7 @@ class BaiduSearchEngine(SearchEngine):
             )
             return ToolResult(
                 success=False,
-                message=f"Baidu Search failed: {e}",
+                message=f"Baidu Search failed: {error_summary}",
                 data=error_results,
             )
 

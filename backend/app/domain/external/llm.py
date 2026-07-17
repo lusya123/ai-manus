@@ -1,5 +1,8 @@
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol, TYPE_CHECKING
 from app.domain.models.message import LLMMessage
+
+if TYPE_CHECKING:
+    from app.domain.models.agent import Agent
 
 
 class LLM(Protocol):
@@ -33,4 +36,17 @@ class LLM(Protocol):
 
     async def parse_json(self, text: str) -> Dict[str, Any]:
         """Extract/repair a JSON object from raw model output."""
+        ...
+
+
+class LLMFactory(Protocol):
+    """Build an LLM gateway for one persisted agent configuration.
+
+    The factory is deliberately part of the domain boundary: task runners may
+    execute in the API process or in a Celery worker, but both must reconstruct
+    the same per-session model from the persisted :class:`Agent` aggregate.
+    """
+
+    def create(self, agent: Optional["Agent"] = None) -> LLM:
+        """Create a gateway using *agent* overrides or system defaults."""
         ...

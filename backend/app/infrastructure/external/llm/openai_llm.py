@@ -21,6 +21,10 @@ from openai import AsyncOpenAI
 
 from app.core.config import Settings, get_settings
 from app.domain.models.message import LLMMessage, Role, ToolCall
+from app.domain.utils.model_output import normalize_model_content
+from app.infrastructure.external.llm.security import (
+    create_pinned_model_http_client,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -95,11 +99,20 @@ class OpenAILLM:
         self._temperature = settings.temperature
         self._max_tokens = settings.max_tokens
         self._max_retries = max_retries
+        self._http_client = (
+            create_pinned_model_http_client(
+                settings.api_base, settings.byok_pinned_ip
+            )
+            if settings.api_base and settings.byok_pinned_ip
+            else None
+        )
         self._client = AsyncOpenAI(
             api_key=settings.api_key,
             base_url=settings.api_base,
             default_headers=settings.extra_headers or None,
+            http_client=self._http_client,
         )
+        self._closed = False
 
     # ------------------------------------------------------------------
     # Message translation (domain <-> OpenAI chat completion payloads)
@@ -166,7 +179,10 @@ class OpenAILLM:
         if errors:
             raise _ToolArgsParseError(errors)
 
-        return LLMMessage.assistant(content=message.content or "", tool_calls=tool_calls)
+        return LLMMessage.assistant(
+            content=normalize_model_content(message.content),
+            tool_calls=tool_calls,
+        )
 
     # ------------------------------------------------------------------
     # LLM Protocol
@@ -206,16 +222,19 @@ class OpenAILLM:
             raw = await self._create(payload, tools, response_format, tool_choice)
             try:
                 message = self._from_openai(raw)
-                logger.debug("Response from model: %s", message)
+                logger.debug(
+                    "Model response received: content_chars=%d tool_calls=%d",
+                    len(message.content or ""),
+                    len(message.tool_calls or []),
+                )
                 return message
             except _ToolArgsParseError as e:
                 if attempt == self._max_retries - 1:
                     raise
                 logger.warning(
-                    "Attempt %d/%d: tool call JSON parse failed, retrying model: %s",
+                    "Attempt %d/%d: tool call JSON parse failed, retrying model",
                     attempt + 1,
                     self._max_retries,
-                    e,
                 )
                 if attempt > 0:
                     # Append the failed assistant turn plus corrective feedback.
@@ -250,6 +269,19 @@ class OpenAILLM:
         if repaired is None:
             raise ValueError(f"Failed to parse JSON from model output: {text!r}")
         return repaired
+
+    async def aclose(self) -> None:
+        """Close the per-run SDK/HTTP clients idempotently."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self._client.close()
+        finally:
+            # SDK clients normally close an injected httpx client too, but
+            # retain an explicit fallback for version/provider differences.
+            if self._http_client is not None and not self._http_client.is_closed:
+                await self._http_client.aclose()
 
 
 @lru_cache()

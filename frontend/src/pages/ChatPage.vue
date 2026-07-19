@@ -327,8 +327,6 @@ const chat = async (message: string = '', files: FileInfo[] = []) => {
   inputMessage.value = '';
   attachments.value = [];
   isLoading.value = true;
-  const submissionId = message ? globalThis.crypto.randomUUID() : undefined;
-
   try {
     // Use the split event handler function and store the cancel function
     const cancel = await agentApi.chatWithSession(
@@ -369,7 +367,6 @@ const chat = async (message: string = '', files: FileInfo[] = []) => {
           activeChatToken = null;
         }
       },
-      submissionId,
     );
     if (!isActiveChat()) {
       cancel();

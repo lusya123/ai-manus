@@ -6,6 +6,7 @@ import { CreateSessionResponse, GetSessionResponse, ShellViewResponse, FileViewR
 import type { FileInfo } from './file';
 import { getStoredAgentConfig } from './agentConfig';
 import type { StoredAgentConfig } from './agentConfig';
+import { createUuid } from '../utils/uuid';
 
 
 
@@ -106,7 +107,7 @@ export const chatWithSession = async (
   // Create once per logical send. createSSEConnection reuses this frozen body
   // for network/auth retries, so a lost response cannot create a second turn.
   const logicalSubmissionId = message
-    ? (submissionId ?? globalThis.crypto.randomUUID())
+    ? (submissionId ?? createUuid())
     : undefined;
   return createSSEConnection<AgentSSEEvent['data']>(
     `/sessions/${sessionId}/chat`,

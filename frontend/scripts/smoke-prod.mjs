@@ -134,6 +134,7 @@ async function installApiMocks(page, options = {}) {
     }
 
     if (url.pathname === "/api/v1/sessions/smoke-session/chat" && request.method() === "POST") {
+      options.onChatSubmission?.(request.postDataJSON());
       await route.fulfill({
         status: 200,
         contentType: "text/event-stream",
@@ -184,12 +185,22 @@ async function verifyEnterSubmits(browser, consoleErrors, pageErrors, requestFai
   const routePath = "/ enter-submit";
   const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
   let createSessionBody = null;
+  let chatSubmissionBody = null;
   await installApiMocks(page, {
     onCreateSession: (body) => {
       createSessionBody = body;
     },
+    onChatSubmission: (body) => {
+      chatSubmissionBody = body;
+    },
   });
   await page.addInitScript(() => {
+    // Simulate the deployed HTTP IP origin, where randomUUID is unavailable
+    // even though getRandomValues remains usable.
+    Object.defineProperty(globalThis.crypto, "randomUUID", {
+      configurable: true,
+      value: undefined,
+    });
     localStorage.setItem("manus_selected_model_id", "smoke-model");
   });
 
@@ -220,6 +231,12 @@ async function verifyEnterSubmits(browser, consoleErrors, pageErrors, requestFai
 
   if (createSessionBody?.model_config?.model_id !== "smoke-model") {
     throw new Error(`Selected model was not sent when creating a session: ${JSON.stringify(createSessionBody)}`);
+  }
+  if (chatSubmissionBody?.message !== draft) {
+    throw new Error(`Initial chat message was not submitted: ${JSON.stringify(chatSubmissionBody)}`);
+  }
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(chatSubmissionBody?.submission_id || "")) {
+    throw new Error(`Chat submission did not include an RFC 4122 v4 UUID: ${JSON.stringify(chatSubmissionBody)}`);
   }
 
   const state = await page.evaluate(() => ({

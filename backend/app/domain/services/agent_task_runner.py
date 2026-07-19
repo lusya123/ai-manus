@@ -77,6 +77,8 @@ async def _close_resource(resource: Any, *method_names: str) -> bool:
 class AgentTaskRunner(TaskRunner):
     """Agent task that can be cancelled"""
     _DELIVERABLE_ROOT = "/home/ubuntu/upload"
+    _ARTIFACT_SYNC_TIMEOUT_SECONDS = 10.0
+    _MAX_SHELL_ARTIFACT_CANDIDATES = 32
     _GENERATING_FILE_FUNCTIONS = {"file_write", "file_str_replace"}
     _ARTIFACT_EXTENSIONS = {
         ".csv", ".docx", ".html", ".htm", ".jpeg", ".jpg", ".json",
@@ -275,7 +277,11 @@ class AgentTaskRunner(TaskRunner):
             reverse=True,
         )
         pattern = re.compile(
-            rf"(?P<path>(?:~|/)[^\s\"'`<>|;&]*?\.(?:tar\.gz|{'|'.join(map(re.escape, suffixes))}))",
+            # A slash inside ``./report.md``, ``dir/report.md`` or a URL is
+            # not the beginning of an absolute sandbox path.  Without this
+            # boundary, ``./PLAN.md`` was parsed as ``/PLAN.md`` and the
+            # missing-file fallback recursively searched the filesystem root.
+            rf"(?<![\w./:~+\-])(?P<path>(?:~/|/)[^\s\"'`<>|;&]*?\.(?:tar\.gz|{'|'.join(map(re.escape, suffixes))}))",
             re.IGNORECASE,
         )
         paths: List[str] = []
@@ -329,7 +335,18 @@ class AgentTaskRunner(TaskRunner):
             self._DELIVERABLE_ROOT,
             "/tmp",
         ):
-            if candidate and candidate not in search_dirs:
+            candidate_path = PurePosixPath(candidate) if candidate else None
+            is_bounded = bool(
+                candidate_path
+                and ".." not in candidate_path.parts
+                and (
+                    str(candidate_path) == "/home/ubuntu"
+                    or str(candidate_path).startswith("/home/ubuntu/")
+                    or str(candidate_path) == "/tmp"
+                    or str(candidate_path).startswith("/tmp/")
+                )
+            )
+            if is_bounded and candidate not in search_dirs:
                 search_dirs.append(candidate)
         for search_dir in search_dirs:
             try:
@@ -490,8 +507,36 @@ class AgentTaskRunner(TaskRunner):
                     for key in ("command", "output"):
                         if isinstance(record.get(key), str):
                             text_parts.append(record[key])
-        for path in self._extract_artifact_paths("\n".join(text_parts)):
-            await self._sync_file_to_storage(path, generated=True)
+        paths = self._extract_artifact_paths("\n".join(text_parts))
+        if len(paths) > self._MAX_SHELL_ARTIFACT_CANDIDATES:
+            logger.warning(
+                "Shell artifact candidate limit reached: agent_id=%s count=%s limit=%s",
+                self._agent_id,
+                len(paths),
+                self._MAX_SHELL_ARTIFACT_CANDIDATES,
+            )
+        deadline = (
+            asyncio.get_running_loop().time()
+            + self._ARTIFACT_SYNC_TIMEOUT_SECONDS
+        )
+        for path in paths[: self._MAX_SHELL_ARTIFACT_CANDIDATES]:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            try:
+                await asyncio.wait_for(
+                    self._sync_file_to_storage(path, generated=True),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                # Artifact discovery enriches the response but is not part of
+                # the shell tool result.  It must never hold a turn open.
+                logger.warning(
+                    "Timed out syncing shell artifact: agent_id=%s path=%s",
+                    self._agent_id,
+                    path,
+                )
+                break
     
 
     # TODO: refactor this function

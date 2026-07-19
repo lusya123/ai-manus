@@ -1138,3 +1138,148 @@ async def test_shell_created_artifact_is_tracked_for_delivery():
 
     assert "/home/ubuntu/upload/shell-artifact.md" in runner._generated_artifacts
     assert runner._generated_artifacts["/home/ubuntu/upload/shell-artifact.md"].file_id == "stored_shell"
+
+
+def test_shell_artifact_extraction_does_not_promote_relative_paths_to_root():
+    runner = object.__new__(AgentTaskRunner)
+
+    paths = runner._extract_artifact_paths(
+        "\n".join(
+            [
+                "./PLAN.md",
+                "../draft.md",
+                "assets/index.html",
+                "https://example.com/download/report.pdf",
+                "/home/ubuntu/upload/result.md",
+                "~/notes.md",
+            ]
+        )
+    )
+
+    assert paths == [
+        "/home/ubuntu/upload/result.md",
+        "/home/ubuntu/notes.md",
+    ]
+
+
+async def test_missing_root_artifact_never_triggers_recursive_root_search():
+    class FakeSandbox:
+        def __init__(self):
+            self.search_dirs = []
+
+        async def file_download(self, path):
+            raise FileNotFoundError(path)
+
+        async def file_find(self, path, glob_pattern):
+            self.search_dirs.append(path)
+            return type("Result", (), {"data": {"files": []}})()
+
+    runner = object.__new__(AgentTaskRunner)
+    runner._agent_id = "agent"
+    runner._sandbox = FakeSandbox()
+
+    resolved = await runner._resolve_existing_sandbox_file("/PLAN.md")
+
+    assert resolved is None
+    assert runner._sandbox.search_dirs == [
+        "/home/ubuntu",
+        "/home/ubuntu/upload",
+        "/tmp",
+    ]
+    assert "/" not in runner._sandbox.search_dirs
+
+
+async def test_shell_artifact_sync_timeout_is_fail_open():
+    runner = object.__new__(AgentTaskRunner)
+    runner._agent_id = "agent"
+    runner._ARTIFACT_SYNC_TIMEOUT_SECONDS = 0.01
+    cancelled = asyncio.Event()
+
+    async def never_finishes(self, path, fallback_content=None, generated=False):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    runner._sync_file_to_storage = MethodType(never_finishes, runner)
+    event = ToolEvent(
+        tool_call_id="tool-timeout",
+        tool_name="shell",
+        function_name="shell_exec",
+        function_args={
+            "id": "shell-timeout",
+            "command": "touch /home/ubuntu/upload/report.md",
+        },
+        status=ToolStatus.CALLED,
+    )
+
+    await asyncio.wait_for(runner._sync_shell_artifacts(event, None), timeout=0.2)
+
+    assert cancelled.is_set()
+
+
+async def test_shell_artifact_sync_uses_one_total_timeout_budget():
+    runner = object.__new__(AgentTaskRunner)
+    runner._agent_id = "agent"
+    runner._ARTIFACT_SYNC_TIMEOUT_SECONDS = 0.025
+    runner._MAX_SHELL_ARTIFACT_CANDIDATES = 32
+    attempted = []
+
+    async def slow_sync(self, path, fallback_content=None, generated=False):
+        attempted.append(path)
+        await asyncio.sleep(0.02)
+
+    runner._sync_file_to_storage = MethodType(slow_sync, runner)
+    event = ToolEvent(
+        tool_call_id="tool-total-timeout",
+        tool_name="shell",
+        function_name="shell_exec",
+        function_args={
+            "id": "shell-total-timeout",
+            "command": " ".join(
+                f"/home/ubuntu/upload/report-{index}.md"
+                for index in range(5)
+            ),
+        },
+        status=ToolStatus.CALLED,
+    )
+
+    started = asyncio.get_running_loop().time()
+    await asyncio.wait_for(runner._sync_shell_artifacts(event, None), timeout=0.1)
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert 1 <= len(attempted) < 5
+    assert elapsed < 0.1
+
+
+async def test_shell_artifact_sync_caps_candidate_count():
+    runner = object.__new__(AgentTaskRunner)
+    runner._agent_id = "agent"
+    runner._ARTIFACT_SYNC_TIMEOUT_SECONDS = 1
+    runner._MAX_SHELL_ARTIFACT_CANDIDATES = 2
+    attempted = []
+
+    async def record_sync(self, path, fallback_content=None, generated=False):
+        attempted.append(path)
+
+    runner._sync_file_to_storage = MethodType(record_sync, runner)
+    event = ToolEvent(
+        tool_call_id="tool-candidate-limit",
+        tool_name="shell",
+        function_name="shell_exec",
+        function_args={
+            "id": "shell-candidate-limit",
+            "command": " ".join(
+                f"/home/ubuntu/upload/report-{index}.md"
+                for index in range(5)
+            ),
+        },
+        status=ToolStatus.CALLED,
+    )
+
+    await runner._sync_shell_artifacts(event, None)
+
+    assert attempted == [
+        "/home/ubuntu/upload/report-0.md",
+        "/home/ubuntu/upload/report-1.md",
+    ]

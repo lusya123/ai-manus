@@ -3,7 +3,7 @@ File Operation Service Implementation - Async Version
 """
 import os
 import re
-import glob
+import fnmatch
 import asyncio
 import subprocess
 import mimetypes
@@ -18,6 +18,51 @@ from app.core.exceptions import AppException, ResourceNotFoundException, BadRequ
 
 class FileService:
     """File Operation Service"""
+
+    _MAX_FIND_RESULTS = 1_000
+    _MAX_FIND_VISITED_ENTRIES = 100_000
+
+    @staticmethod
+    def _matches_glob(relative_path: str, pattern: str) -> bool:
+        """Match a slash-separated glob without allowing ``**`` to escape."""
+        path_parts = tuple(part for part in relative_path.split("/") if part)
+        pattern_parts = tuple(part for part in pattern.split("/") if part)
+        memo = {}
+
+        def matches(path_index: int, pattern_index: int) -> bool:
+            key = (path_index, pattern_index)
+            if key in memo:
+                return memo[key]
+            if pattern_index == len(pattern_parts):
+                result = path_index == len(path_parts)
+            elif pattern_parts[pattern_index] == "**":
+                result = matches(path_index, pattern_index + 1) or (
+                    path_index < len(path_parts)
+                    and not path_parts[path_index].startswith(".")
+                    and matches(path_index + 1, pattern_index)
+                )
+            else:
+                path_part = (
+                    path_parts[path_index]
+                    if path_index < len(path_parts)
+                    else ""
+                )
+                pattern_part = pattern_parts[pattern_index]
+                result = (
+                    path_index < len(path_parts)
+                    and (
+                        not path_part.startswith(".")
+                        or pattern_part.startswith(".")
+                    )
+                    and fnmatch.fnmatchcase(
+                        path_part, pattern_part
+                    )
+                    and matches(path_index + 1, pattern_index + 1)
+                )
+            memo[key] = result
+            return result
+
+        return matches(0, 0)
 
     async def read_file(self, file: str, start_line: Optional[int] = None, 
                  end_line: Optional[int] = None, sudo: bool = False, max_length: Optional[int] = 10000) -> FileReadResult:
@@ -237,19 +282,112 @@ class FileService:
             path: Directory path to search
             glob_pattern: File name pattern (glob syntax)
         """
+        normalized_path = os.path.realpath(
+            os.path.abspath(os.path.expanduser(path))
+        )
+        raw_glob = glob_pattern.replace("\\", "/")
+        directory_only = raw_glob.endswith("/")
+        raw_glob_parts = tuple(part for part in raw_glob.split("/") if part)
+
+        if (
+            not raw_glob
+            or os.path.isabs(raw_glob)
+            or ".." in raw_glob_parts
+        ):
+            raise BadRequestException(
+                "Glob pattern must be a relative path without parent traversal"
+            )
+        glob_parts = tuple(part for part in raw_glob_parts if part != ".")
+        if not glob_parts:
+            raise BadRequestException("Glob pattern must select a file or directory")
+        normalized_glob = "/".join(glob_parts)
+
+        # A recursive glob from the filesystem root walks mounted pseudo
+        # filesystems such as /proc and can occupy a sandbox worker for many
+        # minutes.  Root-level, non-recursive lookups remain available.
+        if normalized_path == os.path.sep and (
+            len(glob_parts) != 1 or glob_parts[0] == "**"
+        ):
+            raise BadRequestException(
+                "Only root-level, non-recursive filesystem searches are allowed"
+            )
+
         # Check if path exists
-        if not os.path.exists(path):
-            raise ResourceNotFoundException(f"Directory does not exist: {path}")
+        if not os.path.exists(normalized_path):
+            raise ResourceNotFoundException(
+                f"Directory does not exist: {normalized_path}"
+            )
         
-        # Asynchronously find files
+        # Walk explicitly instead of glob.glob(recursive=True): os.walk with
+        # followlinks=False cannot escape through a directory symlink, and the
+        # hard limits bound both CPU work and response size.
         def glob_async():
-            search_pattern = os.path.join(path, glob_pattern)
-            return glob.glob(search_pattern, recursive=True)
+            files = []
+            visited_entries = 0
+            recursive = "**" in glob_parts
+            max_depth = len(glob_parts)
+            hidden_directory_patterns = tuple(
+                part for part in glob_parts if part.startswith(".")
+            )
+
+            for current_root, directories, filenames in os.walk(
+                normalized_path,
+                followlinks=False,
+            ):
+                relative_root = os.path.relpath(current_root, normalized_path)
+                root_parts = () if relative_root == "." else tuple(
+                    relative_root.split(os.path.sep)
+                )
+                entries = [
+                    (name, True) for name in directories
+                ] + [
+                    (name, False) for name in filenames
+                ]
+
+                # Symlinked directories may be returned as matches but must
+                # never be traversed.  Ordinary ``**`` also does not enter
+                # hidden directories under Python glob semantics.
+                directories[:] = [
+                    name
+                    for name in directories
+                    if not os.path.islink(os.path.join(current_root, name))
+                    and (
+                        not name.startswith(".")
+                        or any(
+                            fnmatch.fnmatchcase(name, pattern)
+                            for pattern in hidden_directory_patterns
+                        )
+                    )
+                ]
+
+                for name, is_directory in entries:
+                    visited_entries += 1
+                    if visited_entries > self._MAX_FIND_VISITED_ENTRIES:
+                        return files
+                    relative_parts = (*root_parts, name)
+                    relative_path = "/".join(relative_parts)
+                    if (
+                        (not directory_only or is_directory)
+                        and self._matches_glob(relative_path, normalized_glob)
+                    ):
+                        matched_path = os.path.join(current_root, name)
+                        files.append(
+                            os.path.join(matched_path, "")
+                            if directory_only
+                            else matched_path
+                        )
+                        if len(files) >= self._MAX_FIND_RESULTS:
+                            return files
+
+                if not recursive and len(root_parts) >= max_depth - 1:
+                    directories.clear()
+
+            return files
         
         files = await asyncio.to_thread(glob_async)
         
         return FileFindResult(
-            path=path,
+            path=normalized_path,
             files=files
         )
 

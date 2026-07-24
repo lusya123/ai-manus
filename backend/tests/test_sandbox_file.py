@@ -17,7 +17,6 @@ logger = logging.getLogger(__name__)
 @pytest.fixture
 def sandbox_instance():
     """Create a DockerSandbox instance for testing"""
-    # Use configured local sandbox ports for testing.
     settings = get_settings()
     return DockerSandbox(
         ip=settings.sandbox_address or "127.0.0.1",

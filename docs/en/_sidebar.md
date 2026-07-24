@@ -4,6 +4,7 @@
  * 🛠️ Features
    * [✨ Demo Scenarios](/en/demo.md)
    * [🔧 MCP Configuration](/en/mcp.md)
+   * [☁️ AgentBay Cloud Sandbox](/en/agentbay.md)
 * [📋 Configuration Guide](/en/configuration.md) 
 * 👨‍💻 Development Guide
    * [⚙️ System Architecture](/en/architecture.md)

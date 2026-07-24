@@ -1,13 +1,18 @@
 from typing import Optional
 from app.domain.external.browser import Browser
-from app.domain.services.tools.base import BaseToolkit
+from app.domain.services.tools.base import BaseToolkit, tool
 from app.domain.models.tool_result import ToolResult
-from langchain.tools import tool
 
 class BrowserToolkit(BaseToolkit):
     """Browser tool class, providing browser interaction functions"""
 
     name: str = "browser"
+    instructions: str = """
+- Open every URL supplied by the user and useful original pages found through search
+- Search snippets are not sources; inspect the original page before relying on it
+- Tools expose visible elements as `index[:]<tag>text</tag>`; use indexes or coordinates to interact
+- Extracted Markdown may include off-screen text but can omit links, images, or content; scroll when needed
+"""
     
     def __init__(self, browser: Browser):
         """Initialize browser tool class
@@ -18,7 +23,7 @@ class BrowserToolkit(BaseToolkit):
         super().__init__()
         self.browser = browser
     
-    @tool(parse_docstring=True)
+    @tool(parse_docstring=True, retryable=True)
     async def browser_view(self) -> ToolResult:
         """View content of the current browser page. Use for checking the latest state of previously opened pages.
         """
@@ -154,7 +159,7 @@ class BrowserToolkit(BaseToolkit):
         """
         return await self.browser.console_exec(javascript)
     
-    @tool(parse_docstring=True)
+    @tool(parse_docstring=True, retryable=True)
     async def browser_console_view(
         self,
         max_lines: Optional[int] = None
@@ -164,4 +169,4 @@ class BrowserToolkit(BaseToolkit):
         Args:
             max_lines: (Optional) Maximum number of log lines to return.
         """
-        return await self.browser.console_view(max_lines) 
+        return await self.browser.console_view(max_lines)

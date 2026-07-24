@@ -96,6 +96,12 @@ class RefreshTokenRequest(BaseModel):
         return v
 
 
+class LogoutRequest(BaseModel):
+    """Optional refresh token used to revoke external-provider sessions."""
+
+    refresh_token: Optional[str] = None
+
+
 class SendVerificationCodeRequest(BaseModel):
     """Send verification code request schema"""
     email: str
@@ -153,7 +159,7 @@ class UserResponse(BaseModel):
     external_user: Optional[dict[str, Any]] = None
     
     @staticmethod
-    def from_user(user) -> 'UserResponse':
+    def from_domain(user) -> 'UserResponse':
         """Convert user domain model to response schema"""
         return UserResponse(
             id=user.id,

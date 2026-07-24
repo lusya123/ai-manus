@@ -39,7 +39,7 @@ async def test_claw_stream_sends_temporary_thinking_then_visible_text():
 
 def test_claw_service_exposes_pending_thinking_before_visible_answer():
     service = ClawService(FakeDomain())
-    state = service._chat_states["user-1"] = _ChatState()
+    state = service._chat_states[("user-1", "default")] = _ChatState()
     state.pending_thinking = "private"
 
     assert service.get_pending_thinking_content("user-1") == "private"

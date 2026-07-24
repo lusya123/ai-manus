@@ -48,13 +48,13 @@
             <div class="flex items-center gap-0.5 w-full sm:flex-1">
               <div class="w-6 h-6"><Bot :size="24" /></div>
               <div>
-                <p class="text-sm text-[var(--text-primary)]">{{ replayCompleted ? 'Manus 任务回放完成。' : 'Manus 正在回放任务...' }}</p>
+                <p class="text-sm text-[var(--text-primary)]">{{ replayCompleted ? t('Manus task replay completed.') : t('Manus is replaying the task...') }}</p>
               </div>
             </div>
             <div class="flex items-center flex-row gap-[8px] max-sm:w-full">
               <button @click="replayCompleted ? replay() : (jumpToEnd = true)"
                 class="inline-flex items-center justify-center whitespace-nowrap font-medium transition-colors hover:opacity-90 active:opacity-80 bg-[var(--Button-primary-brand)] text-[var(--text-white)] h-[36px] rounded-[10px] gap-[6px] text-sm min-w-16 px-[14px] py-[6px] max-sm:w-1/2"><span
-                  class="text-sm">{{ replayCompleted ? '重放' : '跳转到结果' }}</span></button>
+                  class="text-sm">{{ replayCompleted ? t('Replay') : t('Jump to result') }}</span></button>
             </div>
           </div>
         </div>
@@ -97,16 +97,9 @@ import { useRouter } from 'vue-router';
 import { useI18n } from 'vue-i18n';
 import ChatMessage from '../components/ChatMessage.vue';
 import * as agentApi from '../api/agent';
-import { Message, MessageContent, ToolContent, StepContent, AttachmentsContent, isConsecutiveAssistant } from '../types/message';
-import {
-  StepEventData,
-  ToolEventData,
-  MessageEventData,
-  ErrorEventData,
-  TitleEventData,
-  PlanEventData,
-  AgentSSEEvent,
-} from '../types/event';
+import { Message, ToolContent, isConsecutiveAssistant } from '../types/message';
+import { PlanEventData } from '../types/event';
+import { useAgentEvents } from '../composables/useAgentEvents';
 import ToolPanel from '../components/ToolPanel.vue'
 import PlanPanel from '../components/PlanPanel.vue';
 import { ArrowDown, FileSearch, Link, Bot } from 'lucide-vue-next';
@@ -172,6 +165,21 @@ const toolPanel = ref<InstanceType<typeof ToolPanel>>()
 const simpleBarRef = ref<InstanceType<typeof SimpleBar>>();
 let countdownTimer: number | null = null;
 
+// Shared SSE event -> message list conversion
+const { handleEvent, resetEventHistory } = useAgentEvents(
+  { messages, title, plan, isLoading, lastEventId, lastTool, lastNoMessageTool },
+  {
+    onToolActivity: (tool: ToolContent) => {
+      // Public tool arguments and most results are intentionally redacted.
+      // Only open the workspace for content the shared mapper explicitly
+      // deemed safe (currently screenshots and sanitized local previews).
+      if (realTime.value && tool.content) {
+        toolPanel.value?.showToolPanel(tool, false);
+      }
+    },
+  }
+);
+
 // Watch message changes and automatically scroll to bottom
 watch(messages, async () => {
   await nextTick();
@@ -182,122 +190,9 @@ watch(messages, async () => {
 
 
 
-const getLastStep = (): StepContent | undefined => {
-  return messages.value.filter(message => message.type === 'step').pop()?.content as StepContent;
-}
-
-// Handle message event
-const handleMessageEvent = (messageData: MessageEventData) => {
-  messages.value.push({
-    type: messageData.role,
-    content: {
-      ...messageData
-    } as MessageContent,
-  });
-
-  if (messageData.attachments?.length > 0) {
-    messages.value.push({
-      type: 'attachments',
-      content: {
-        ...messageData
-      } as AttachmentsContent,
-    });
-  }
-}
-
-// Handle tool event
-const handleToolEvent = (toolData: ToolEventData) => {
-  const lastStep = getLastStep();
-  let toolContent: ToolContent = {
-    ...toolData
-  }
-  if (lastTool.value && lastTool.value.tool_call_id === toolContent.tool_call_id) {
-    Object.assign(lastTool.value, toolContent);
-  } else {
-    if (lastStep?.status === 'running') {
-      lastStep.tools.push(toolContent);
-    } else {
-      messages.value.push({
-        type: 'tool',
-        content: toolContent,
-      });
-    }
-    lastTool.value = toolContent;
-  }
-  if (toolContent.name !== 'message') {
-    lastNoMessageTool.value = toolContent;
-    if (realTime.value) {
-      toolPanel.value?.showToolPanel(toolContent, false);
-    }
-  }
-}
-
-// Handle step event
-const handleStepEvent = (stepData: StepEventData) => {
-  const lastStep = getLastStep();
-  if (stepData.status === 'running') {
-    messages.value.push({
-      type: 'step',
-      content: {
-        ...stepData,
-        tools: []
-      } as StepContent,
-    });
-  } else if (stepData.status === 'completed') {
-    if (lastStep) {
-      lastStep.status = stepData.status;
-    }
-  } else if (stepData.status === 'failed') {
-    isLoading.value = false;
-  }
-}
-
-// Handle error event
-const handleErrorEvent = (errorData: ErrorEventData) => {
-  isLoading.value = false;
-  messages.value.push({
-    type: 'assistant',
-    content: {
-      content: errorData.error,
-      timestamp: errorData.timestamp
-    } as MessageContent,
-  });
-}
-
-// Handle title event
-const handleTitleEvent = (titleData: TitleEventData) => {
-  title.value = titleData.title;
-}
-
-// Handle plan event
-const handlePlanEvent = (planData: PlanEventData) => {
-  plan.value = planData;
-}
-
-// Main event handler function
-const handleEvent = (event: AgentSSEEvent) => {
-  if (event.event === 'message') {
-    handleMessageEvent(event.data as MessageEventData);
-  } else if (event.event === 'tool') {
-    handleToolEvent(event.data as ToolEventData);
-  } else if (event.event === 'step') {
-    handleStepEvent(event.data as StepEventData);
-  } else if (event.event === 'done') {
-    //isLoading.value = false;
-  } else if (event.event === 'wait') {
-    // TODO: handle wait event
-  } else if (event.event === 'error') {
-    handleErrorEvent(event.data as ErrorEventData);
-  } else if (event.event === 'title') {
-    handleTitleEvent(event.data as TitleEventData);
-  } else if (event.event === 'plan') {
-    handlePlanEvent(event.data as PlanEventData);
-  }
-  lastEventId.value = event.data.event_id;
-}
-
 // Reset all refs to their initial values
 const resetState = () => {
+  resetEventHistory();
   // Reset reactive state to initial values
   Object.assign(state, createInitialState());
 };
@@ -387,6 +282,7 @@ onUnmounted(() => {
 });
 
 const handleToolClick = (tool: ToolContent) => {
+  if (!tool.content) return;
   realTime.value = false;
   if (sessionId.value) {
     toolPanel.value?.showToolPanel(tool, false);
@@ -395,7 +291,7 @@ const handleToolClick = (tool: ToolContent) => {
 
 const jumpToRealTime = () => {
   realTime.value = true;
-  if (lastNoMessageTool.value) {
+  if (lastNoMessageTool.value?.content) {
     toolPanel.value?.showToolPanel(lastNoMessageTool.value, false);
   }
 }
@@ -431,5 +327,3 @@ const handleCopyLink = async () => {
   }
 }
 </script>
-
-<style scoped></style>

@@ -1,11 +1,18 @@
-from typing import Any, Optional, List
 import asyncio
 import logging
+import os
+from typing import Any, Optional, List
+
+# browser-use configures root/CDP handlers as an import side effect unless this
+# is set first. The application owns logging so signed AgentBay gateway URLs can
+# be filtered consistently.
+os.environ["BROWSER_USE_SETUP_LOGGING"] = "false"
 
 from browser_use.browser.session import BrowserSession, CDPSession
 from browser_use.dom.views import EnhancedDOMTreeNode
 
 from app.domain.models.tool_result import ToolResult
+from app.domain.utils.error_reporting import safe_exception_summary
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +59,7 @@ class BrowserUseBrowser:
                     logger.error(
                         "Failed to initialise BrowserSession after %d attempts: %s",
                         max_retries,
-                        exc,
+                        safe_exception_summary(exc),
                     )
                     raise
                 retry_delay = min(retry_delay * 2, 10.0)
@@ -61,20 +68,29 @@ class BrowserUseBrowser:
                     attempt + 1,
                     max_retries,
                     retry_delay,
-                    exc,
+                    safe_exception_summary(exc),
                 )
                 await asyncio.sleep(retry_delay)
 
         raise last_error
 
     async def cleanup(self) -> None:
-        """Stop the browser session and release resources."""
-        if self._session is not None:
-            try:
-                await self._session.stop()
-            except Exception as exc:
-                logger.error("Error stopping BrowserSession: %s", exc)
-            finally:
+        """Stop the browser session, retaining an unknown handle for retry."""
+        session = self._session
+        if session is None:
+            return
+        try:
+            await session.stop()
+        except Exception as exc:
+            summary = safe_exception_summary(exc)
+            logger.error("Error stopping BrowserSession: %s", summary)
+            # Keep the exact session reference.  AgentTaskRunner's bounded,
+            # strongly-retained cleanup bundle will retry this adapter.
+            raise RuntimeError(
+                f"BrowserSession cleanup incomplete: {summary}"
+            ) from None
+        else:
+            if self._session is session:
                 self._session = None
 
     # ------------------------------------------------------------------
@@ -204,7 +220,10 @@ class BrowserUseBrowser:
 
             return self._format_selector_map(selector_map)
         except Exception as exc:
-            logger.warning("Failed to get interactive elements: %s", exc)
+            logger.warning(
+                "Failed to get interactive elements: %s",
+                safe_exception_summary(exc),
+            )
             return []
 
     async def _dispatch_mouse_event(

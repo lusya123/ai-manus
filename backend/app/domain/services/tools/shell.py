@@ -1,13 +1,18 @@
 from typing import Optional
 from app.domain.external.sandbox import Sandbox
-from app.domain.services.tools.base import BaseToolkit
-from langchain.tools import tool
+from app.domain.services.tools.base import BaseToolkit, tool
 from app.domain.models.tool_result import ToolResult
 
 class ShellToolkit(BaseToolkit):
     """Shell tool class, providing Shell interaction related functions"""
 
     name: str = "shell"
+    instructions: str = """
+- Avoid interactive confirmation; use appropriate non-interactive flags
+- Avoid excessive output and save large results to files
+- Use `bc` for simple arithmetic and saved Python files for complex calculations
+- Save code before execution; never pipe code inline into an interpreter
+"""
     
     def __init__(self, sandbox: Sandbox):
         """Initialize Shell tool class
@@ -34,7 +39,7 @@ class ShellToolkit(BaseToolkit):
         """
         return await self.sandbox.exec_command(id, exec_dir, command)
     
-    @tool(parse_docstring=True)
+    @tool(parse_docstring=True, retryable=True)
     async def shell_view(self, id: str) -> ToolResult:
         """View the content of a specified shell session. Use for checking command execution results or monitoring output.
         
@@ -43,7 +48,7 @@ class ShellToolkit(BaseToolkit):
         """
         return await self.sandbox.view_shell(id)
     
-    @tool(parse_docstring=True)
+    @tool(parse_docstring=True, retryable=True)
     async def shell_wait(
         self,
         id: str,

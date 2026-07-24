@@ -1,3 +1,5 @@
+import json
+
 from app.domain.models.event import MessageEvent
 from app.domain.utils.model_output import extract_model_thinking_text
 
@@ -31,7 +33,7 @@ def test_message_event_ignores_tool_use_blocks():
     assert event.message == "final answer"
 
 
-def test_message_event_ignores_unknown_typed_blocks_and_keeps_nested_text():
+def test_message_event_preserves_unknown_typed_json_and_nested_text():
     event = MessageEvent(
         message=[
             {"type": "server_tool_use", "text": "internal payload"},
@@ -39,7 +41,32 @@ def test_message_event_ignores_unknown_typed_blocks_and_keeps_nested_text():
         ]
     )
 
-    assert event.message == "nested answer"
+    unknown, nested = event.message.splitlines()
+    assert json.loads(unknown) == {
+        "type": "server_tool_use",
+        "text": "internal payload",
+    }
+    assert nested == "nested answer"
+
+
+def test_unknown_typed_json_recursively_redacts_private_reasoning():
+    event = MessageEvent(
+        message={
+            "type": "future_provider_block",
+            "answer": "visible",
+            "thinking": "private",
+            "nested": [
+                {"type": "reasoning", "text": "private too"},
+                {"value": "kept"},
+            ],
+        }
+    )
+
+    assert json.loads(event.message) == {
+        "type": "future_provider_block",
+        "answer": "visible",
+        "nested": [{"value": "kept"}],
+    }
 
 
 def test_message_event_strips_plain_thinking_tags():

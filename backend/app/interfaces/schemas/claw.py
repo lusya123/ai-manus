@@ -16,7 +16,7 @@ class ClawResponse(BaseModel):
     updated_at: datetime
 
     @staticmethod
-    def from_claw(claw) -> 'ClawResponse':
+    def from_domain(claw) -> 'ClawResponse':
         return ClawResponse(
             id=claw.id,
             user_id=claw.user_id,
@@ -27,11 +27,6 @@ class ClawResponse(BaseModel):
             created_at=claw.created_at,
             updated_at=claw.updated_at,
         )
-
-
-class ClawApiKeyResponse(BaseModel):
-    """API key response schema"""
-    api_key: str
 
 
 class ClawChatRequest(BaseModel):

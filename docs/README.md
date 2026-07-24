@@ -25,9 +25,9 @@ AI Manus 中每个服务与工具都包含一个 Built-in 版本，可以做到�
 ## 核心功能
 
  * **部署：**最小只需要一个 LLM 服务即可完成部署，不需要依赖其它外部服务。
- * **工具：**支持 Terminal、Browser、File、Web Search、消息工具，并支持实查看和接管。
+ * **工具：**支持 Terminal、Browser、File、Web Search、消息工具，并支持实时查看和接管，支持外部 MCP 工具集成。
  * **Claw：**集成 [OpenClaw](https://github.com/anthropics/openclaw) AI 助手，一键部署、用户隔离常驻容器、可选过期策略、完整聊天历史。
- * **沙盒：**每个 Task 会分配单独的一个沙盒，沙盒在本地 Dock 环境里面运行。
+ * **沙盒：**每个 Task 会分配独立沙盒，可使用本地 Docker 或可选的[阿里云无影 AgentBay](agentbay.md)。
  * **任务会话：**通过 Mongo/Redis 对会话历史进行管理，支持后台任务。
  * **对话：**支持停止与打断，支持文件上传与下载。
  * **多语言：**支持中文与英文。

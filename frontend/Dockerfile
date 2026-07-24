@@ -1,5 +1,5 @@
 # Use Node.js as base image
-FROM node:18-alpine as build-stage
+FROM node:20.19-alpine as build-stage
 
 # Set working directory
 WORKDIR /app
@@ -33,4 +33,4 @@ RUN chmod +x /docker-entrypoint.sh
 EXPOSE 80
 
 # Start nginx with environment variable substitution
-CMD ["/docker-entrypoint.sh"] 
+CMD ["/docker-entrypoint.sh"]

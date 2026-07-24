@@ -11,7 +11,12 @@ class FileReadRequest(BaseModel):
     start_line: Optional[int] = Field(None, description="Start line (0-based)")
     end_line: Optional[int] = Field(None, description="End line (not inclusive)")
     sudo: Optional[bool] = Field(False, description="Whether to use sudo privileges")
-    max_length: Optional[int] = Field(10000, description="Maximum length of the content to return")
+    max_length: Optional[int] = Field(
+        10000,
+        ge=1,
+        le=1_000_000,
+        description="Maximum length of the content to return",
+    )
 
 class FileWriteRequest(BaseModel):
     """File write request"""
@@ -34,11 +39,21 @@ class FileReplaceRequest(BaseModel):
 class FileSearchRequest(BaseModel):
     """File content search request"""
     file: str = Field(..., description="Absolute file path")
-    regex: str = Field(..., description="Regular expression pattern")
+    regex: str = Field(
+        ...,
+        min_length=1,
+        max_length=2_048,
+        description="Regular expression pattern",
+    )
     sudo: Optional[bool] = Field(False, description="Whether to use sudo privileges")
 
 
 class FileFindRequest(BaseModel):
     """File find request"""
     path: str = Field(..., description="Directory path to search")
-    glob: str = Field(..., description="Filename pattern (glob syntax)")
+    glob: str = Field(
+        ...,
+        min_length=1,
+        max_length=2_048,
+        description="Filename pattern (glob syntax)",
+    )

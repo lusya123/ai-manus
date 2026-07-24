@@ -1,6 +1,6 @@
 import smtplib
 import logging
-import random
+import secrets
 import asyncio
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
@@ -26,7 +26,7 @@ class EmailService:
     
     def _generate_verification_code(self) -> str:
         """Generate 6-digit verification code"""
-        return f"{random.randint(100000, 999999)}"
+        return str(secrets.randbelow(900000) + 100000)
     
     async def _store_verification_code(self, email: str, code: str) -> None:
         """Store verification code with expiration time in cache"""
@@ -44,40 +44,22 @@ class EmailService:
         await self.cache.set(key, code_data, ttl=self.VERIFICATION_CODE_EXPIRY_SECONDS)
     
     async def verify_code(self, email: str, code: str) -> bool:
-        """Verify if the provided code is valid for the email"""
+        """Atomically verify and consume a one-time password-reset code."""
         key = f"{self.VERIFICATION_CODE_PREFIX}{email}"
-        
-        # Get stored data from cache
-        stored_data = await self.cache.get(key)
-        if not stored_data:
+        consume = getattr(self.cache, "consume_verification_code", None)
+        if not callable(consume):
+            logger.error(
+                "Cache does not support atomic verification-code consumption"
+            )
             return False
-        
-        # Check if code has expired (cache TTL should handle this, but double-check)
-        expires_at = datetime.fromisoformat(stored_data["expires_at"])
-        if datetime.now() > expires_at:
-            await self.cache.delete(key)
+        try:
+            return bool(await consume(key, code, 3))
+        except Exception as exc:
+            logger.error(
+                "Verification-code authorization unavailable: %s",
+                type(exc).__name__,
+            )
             return False
-        
-        # Check attempts limit (max 3 attempts)
-        if stored_data["attempts"] >= 3:
-            await self.cache.delete(key)
-            return False
-        
-        # Increment attempt count
-        stored_data["attempts"] += 1
-        
-        # Check if code matches
-        if stored_data["code"] == code:
-            # Remove the code after successful verification
-            await self.cache.delete(key)
-            return True
-        
-        # Update attempt count in cache
-        remaining_ttl = int((expires_at - datetime.now()).total_seconds())
-        if remaining_ttl > 0:
-            await self.cache.set(key, stored_data, ttl=remaining_ttl)
-        
-        return False
     
     def _create_verification_email(self, email: str, code: str) -> MIMEMultipart:
         """Create verification email content"""
@@ -134,11 +116,11 @@ class EmailService:
         
         # Generate verification code
         code = self._generate_verification_code()
-        logger.debug(f"Generated verification code: {code}")
+        logger.debug("Generated password-reset verification code")
         
         # Create email message
         msg = self._create_verification_email(email, code)
-        logger.debug(f"Created email message: {msg}")
+        logger.debug("Created password-reset email message")
         
         # Send email using SMTP
         await self._send_smtp_email(msg, email)
@@ -146,27 +128,33 @@ class EmailService:
         # Store verification code
         await self._store_verification_code(email, code)
         
-        logger.info(f"Verification code sent to {email}")
+        logger.info("Password-reset verification code sent")
     
     async def _send_smtp_email(self, msg: MIMEMultipart, email: str) -> None:
         """Send email using SMTP (runs in thread pool to avoid blocking)"""
-        logger.debug(f"Sending email to {email}")
-        server = None
-        try:
-            # Create SMTP server connection
-            logger.debug(f"Creating SMTP server connection to {self.settings.email_host}:{self.settings.email_port}")
-            server = smtplib.SMTP_SSL(self.settings.email_host, self.settings.email_port)
-            logger.debug(f"SMTP server created, {server}")
-            result = server.login(self.settings.email_username, self.settings.email_password)
-            logger.debug(f"SMTP server login result: {result}")
-            
-            # Send email
-            text = msg.as_string()
-            result = server.sendmail(msg['From'], email, text)
-            logger.debug(f"SMTP server sendmail result: {result}")
-        finally:
-            if server:
-                server.quit()
+        def send_sync() -> None:
+            logger.debug("Sending password-reset email")
+            server = None
+            try:
+                logger.debug("Creating SMTP server connection")
+                server = smtplib.SMTP_SSL(
+                    self.settings.email_host, self.settings.email_port
+                )
+                logger.debug("SMTP server connection created")
+                server.login(
+                    self.settings.email_username,
+                    self.settings.email_password,
+                )
+                server.sendmail(msg["From"], email, msg.as_string())
+                logger.debug("SMTP message accepted for delivery")
+            finally:
+                if server:
+                    server.quit()
+
+        # smtplib is synchronous; keep DNS, connect, TLS, login, and send off
+        # the FastAPI event loop so one slow mail server cannot stall all API
+        # requests handled by this process.
+        await asyncio.to_thread(send_sync)
     
     async def cleanup_expired_codes(self) -> None:
         """Clean up expired verification codes - Cache TTL handles this automatically"""

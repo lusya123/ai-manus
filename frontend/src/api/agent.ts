@@ -1,18 +1,22 @@
 // Backend API service
 import { apiClient, API_CONFIG, ApiResponse, createSSEConnection, SSECallbacks } from './client';
+import type { ApiClientRequestConfig } from './client';
 import { AgentSSEEvent } from '../types/event';
 import { CreateSessionResponse, GetSessionResponse, ShellViewResponse, FileViewResponse, ListSessionResponse, SignedUrlResponse, ShareSessionResponse, SharedSessionResponse } from '../types/response';
 import type { FileInfo } from './file';
 import { getStoredAgentConfig } from './agentConfig';
 import type { StoredAgentConfig } from './agentConfig';
+import { createUuid } from '../utils/uuid';
 
-type ChatAttachment = Pick<FileInfo, 'file_id' | 'filename'>;
+
 
 /**
  * Create Session
  * @returns Session
  */
-export async function createSession(modelConfig: StoredAgentConfig | null = getStoredAgentConfig()): Promise<CreateSessionResponse> {
+export async function createSession(
+  modelConfig: StoredAgentConfig | null = getStoredAgentConfig(),
+): Promise<CreateSessionResponse> {
   const body = modelConfig ? { model_config: modelConfig } : undefined;
   const response = await apiClient.put<ApiResponse<CreateSessionResponse>>('/sessions', body);
   return response.data.data;
@@ -80,6 +84,15 @@ export const getVNCUrl = async (
 }
 
 /**
+ * File attachment reference sent with a chat request.
+ * Mirrors the backend `ChatAttachment` schema.
+ */
+export interface ChatAttachment {
+  file_id: string;
+  filename: string;
+}
+
+/**
  * Chat with Session (using SSE to receive streaming responses)
  * @returns A function to cancel the SSE connection
  */
@@ -88,8 +101,14 @@ export const chatWithSession = async (
   message: string = '',
   eventId?: string,
   attachments?: ChatAttachment[],
-  callbacks?: SSECallbacks<AgentSSEEvent['data']>
+  callbacks?: SSECallbacks<AgentSSEEvent['data']>,
+  submissionId?: string,
 ): Promise<() => void> => {
+  // Create once per logical send. createSSEConnection reuses this frozen body
+  // for network/auth retries, so a lost response cannot create a second turn.
+  const logicalSubmissionId = message
+    ? (submissionId ?? createUuid())
+    : undefined;
   return createSSEConnection<AgentSSEEvent['data']>(
     `/sessions/${sessionId}/chat`,
     {
@@ -98,6 +117,7 @@ export const chatWithSession = async (
         message, 
         timestamp: Math.floor(Date.now() / 1000), 
         event_id: eventId,
+        submission_id: logicalSubmissionId,
         attachments
       }
     },
@@ -133,14 +153,20 @@ export async function viewFile(sessionId: string, file: string): Promise<FileVie
   return response.data.data;
 }
 
+/** Create a short-lived signed URL for an agent-generated web preview. */
 export async function createPreviewUrl(
   sessionId: string,
   url: string,
-  expireMinutes: number = 15
+  options: { expireMinutes?: number; publicAccess?: boolean } = {},
 ): Promise<SignedUrlResponse> {
+  const expireMinutes = options.expireMinutes ?? 15;
+  const requestConfig: ApiClientRequestConfig | undefined = options.publicAccess
+    ? { __skipAuth: true }
+    : undefined;
   const response = await apiClient.post<ApiResponse<SignedUrlResponse>>(
     `/sessions/${sessionId}/preview-url`,
-    { url, expire_minutes: expireMinutes }
+    { url, expire_minutes: expireMinutes },
+    requestConfig,
   );
   return response.data.data;
 }

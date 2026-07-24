@@ -1,14 +1,19 @@
-from fastapi import APIRouter, Depends, UploadFile, File
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, status
 from fastapi.responses import StreamingResponse
 import logging
 
 from app.application.services.file_service import FileService
 from app.application.errors.exceptions import NotFoundError
-from app.interfaces.dependencies import get_file_service, get_current_user, get_optional_current_user, verify_signature
+from app.interfaces.dependencies import get_file_service, get_current_user, verify_signature
 from app.domain.models.user import User
 from app.interfaces.schemas.base import APIResponse
 from app.interfaces.schemas.file import FileInfoResponse
 from app.interfaces.schemas.resource import AccessTokenRequest, SignedUrlResponse
+from app.domain.external.file import (
+    FileStorageBusyError,
+    FileStorageQuotaExceededError,
+    FileTooLargeError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,14 +27,25 @@ async def upload_file(
 ) -> APIResponse[FileInfoResponse]:
     """Upload file"""
     # Upload file
-    result = await file_service.upload_file(
-        file_data=file.file,
-        filename=file.filename,
-        user_id=current_user.id,
-        content_type=file.content_type
-    )
+    try:
+        result = await file_service.upload_file(
+            file_data=file.file,
+            filename=file.filename or "file",
+            user_id=current_user.id,
+            content_type=file.content_type
+        )
+    except (FileTooLargeError, FileStorageQuotaExceededError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=str(exc),
+        ) from exc
+    except FileStorageBusyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="File storage is busy; please retry",
+        ) from exc
     
-    return APIResponse.success(await FileInfoResponse.from_file_info(result))
+    return APIResponse.success(await FileInfoResponse.from_domain(result))
 
 @router.get("/{file_id}")
 async def download_file_with_signature(
@@ -41,7 +57,7 @@ async def download_file_with_signature(
     
     # Download file (authentication is handled by middleware for non-token requests)
     try:
-        file_data, file_info = await file_service.download_file(file_id)
+        file_data, file_info = await file_service.download_file_by_capability(file_id)
     except FileNotFoundError:
         raise NotFoundError("File not found")
     except PermissionError:
@@ -66,13 +82,13 @@ async def download_file_with_signature(
 async def download_file(
     file_id: str,
     file_service: FileService = Depends(get_file_service),
-    current_user: User = Depends(get_optional_current_user)
+    current_user: User = Depends(get_current_user)
 ):
-    """Download file with optional access token"""
+    """Download an owned file using normal bearer authentication."""
     
     # Download file (authentication is handled by middleware for non-token requests)
     try:
-        file_data, file_info = await file_service.download_file(file_id, current_user.id if current_user else None)
+        file_data, file_info = await file_service.download_file(file_id, current_user.id)
     except FileNotFoundError:
         raise NotFoundError("File not found")
     except PermissionError:
@@ -116,7 +132,7 @@ async def get_file_info(
     if not file_info:
         raise NotFoundError("File not found")
     
-    return APIResponse.success(await FileInfoResponse.from_file_info(file_info))
+    return APIResponse.success(await FileInfoResponse.from_domain(file_info))
 
 
 @router.post("/{file_id}/signed-url", response_model=APIResponse[SignedUrlResponse])

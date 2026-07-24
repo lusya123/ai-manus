@@ -16,13 +16,20 @@ from app.application.services.file_service import FileService
 from app.application.services.auth_service import AuthService
 from app.application.services.token_service import TokenService
 from app.application.services.email_service import EmailService
+from app.domain.utils.error_reporting import safe_exception_summary
+from app.infrastructure.logging import redact_capability_text
 from app.infrastructure.external.cache import get_cache
+from app.infrastructure.external.llm import get_llm_factory
 
 # Import all required dependencies for agent service
-from app.infrastructure.external.sandbox.docker_sandbox import DockerSandbox
+from app.domain.external.task import Task
+from app.domain.services.agent_task_runner import AgentTaskRunnerFactory
+from app.infrastructure.external.sandbox import get_sandbox_provider
 from app.infrastructure.external.task.redis_task import RedisStreamTask
+from app.infrastructure.external.coordination import RedisSessionLifecycleLease
 from app.infrastructure.repositories.mongo_agent_repository import MongoAgentRepository
 from app.infrastructure.repositories.mongo_session_repository import MongoSessionRepository
+from app.infrastructure.repositories.mongo_turn_submission_repository import MongoTurnSubmissionRepository
 from app.infrastructure.repositories.file_mcp_repository import FileMCPRepository
 from app.infrastructure.repositories.user_repository import MongoUserRepository
 from app.infrastructure.repositories.claw_repository import ClawRepository as MongoClawRepository
@@ -36,6 +43,25 @@ logger = logging.getLogger(__name__)
 # Security scheme - Bearer Token only
 security_bearer = HTTPBearer(auto_error=False)
 
+def _get_task_cls() -> type[Task]:
+    """Select the task backend implementation from the TASK_BACKEND setting."""
+    settings = get_settings()
+    backend = (settings.task_backend or "local").lower()
+    if backend == "celery":
+        from app.infrastructure.external.task.celery_task import CeleryTask
+        logger.info("Using Celery task backend")
+        return CeleryTask
+    if backend != "local":
+        logger.warning("Unknown TASK_BACKEND '%s', falling back to 'local'", backend)
+    if settings.backend_replica_count > 1:
+        raise RuntimeError(
+            "TASK_BACKEND=local only supports one backend process because its "
+            "task registry is process-local; set TASK_BACKEND=celery before "
+            "using BACKEND_REPLICA_COUNT>1"
+        )
+    return RedisStreamTask
+
+
 @lru_cache()
 def get_agent_service() -> AgentService:
     """
@@ -45,25 +71,76 @@ def get_agent_service() -> AgentService:
     necessary dependencies. Uses lru_cache for singleton pattern.
     """
     logger.info("Creating AgentService instance")
-    
+
     # Create all dependencies
+    settings = get_settings()
     agent_repository = MongoAgentRepository()
     session_repository = MongoSessionRepository()
-    sandbox_cls = DockerSandbox
-    task_cls = RedisStreamTask
+    turn_submission_repository = MongoTurnSubmissionRepository()
+    sandbox_cls = get_sandbox_provider()
+    task_cls = _get_task_cls()
     file_storage = get_file_storage()
     search_engine = get_search_engine()
     mcp_repository = FileMCPRepository()
+    llm_factory = get_llm_factory()
+    if (settings.sandbox_provider or "docker").strip().lower() == "agentbay":
+        from app.infrastructure.external.sandbox.agentbay_provisioner import (
+            AgentBayProvisioner,
+        )
+        from app.infrastructure.repositories.external.sandbox.mongo_agentbay_quota import (
+            MongoAgentBayQuotaLedger,
+        )
+
+        ledger = MongoAgentBayQuotaLedger(
+            deployment_id=str(settings.agentbay_deployment_id),
+            max_total=settings.agentbay_max_sessions_total,
+            max_per_user=settings.agentbay_max_sessions_per_user,
+            config_version=settings.agentbay_quota_config_version,
+            command_timeout_seconds=(
+                settings.agentbay_quota_command_timeout_seconds
+            ),
+        )
+        sandbox_provisioner = AgentBayProvisioner(
+            ledger=ledger,
+            session_repository=session_repository,
+            deployment_id=str(settings.agentbay_deployment_id),
+            sandbox_cls=sandbox_cls,
+        )
+    else:
+        from app.infrastructure.external.sandbox.passthrough_provisioner import (
+            PassthroughSandboxProvisioner,
+        )
+
+        sandbox_provisioner = PassthroughSandboxProvisioner(
+            sandbox_cls, session_repository
+        )
+    
+    # Register the factory used to rebuild task runners on the execution side.
+    # For the local backend the runner is rebuilt in this process; for the
+    # celery backend workers register their own factory (see app/worker.py).
+    task_cls.set_runner_factory(AgentTaskRunnerFactory(
+        agent_repository=agent_repository,
+        session_repository=session_repository,
+        turn_submission_repository=turn_submission_repository,
+        sandbox_cls=sandbox_cls,
+        file_storage=file_storage,
+        mcp_repository=mcp_repository,
+        llm_factory=llm_factory,
+        search_engine=search_engine,
+    ))
     
     # Create AgentService instance
     return AgentService(
         agent_repository=agent_repository,
         session_repository=session_repository,
+        turn_submission_repository=turn_submission_repository,
         sandbox_cls=sandbox_cls,
         task_cls=task_cls,
         file_storage=file_storage,
         search_engine=search_engine,
         mcp_repository=mcp_repository,
+        session_lifecycle_lease=RedisSessionLifecycleLease(),
+        sandbox_provisioner=sandbox_provisioner,
     )
 
 
@@ -187,7 +264,9 @@ async def get_current_user(
         return user
         
     except Exception as e:
-        logger.warning(f"Authentication failed: {e}")
+        logger.warning(
+            "Authentication failed: %s", safe_exception_summary(e)
+        )
         raise UnauthorizedError("Authentication failed")
 
 
@@ -228,7 +307,10 @@ async def get_optional_current_user(
             return user
             
     except Exception as e:
-        logger.warning(f"Optional authentication failed: {e}")
+        logger.warning(
+            "Optional authentication failed: %s",
+            safe_exception_summary(e),
+        )
         
     return None
 
@@ -273,14 +355,20 @@ async def _verify_signature(
         HTTPException: If signature is missing or invalid (status code 401)
     """
     if not signature:
-        logger.error(f"Missing signature: {request.url}")
+        logger.error(
+            "Missing signature for path: %s",
+            redact_capability_text(request.url.path),
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing signature"
         )
     
     if not token_service.verify_signed_url(str(request.url)):
-        logger.error(f"Invalid signature: {request.url}")
+        logger.error(
+            "Invalid signature for path: %s",
+            redact_capability_text(request.url.path),
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid signature"

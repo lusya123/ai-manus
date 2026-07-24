@@ -4,12 +4,24 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       target: build-stage  # Use build stage image instead of production image
-    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0"]  # Start in development mode and listen on all network interfaces
+    # The anonymous node_modules volume can outlive an image rebuild. Refresh it
+    # whenever package-lock.json changes so Vite never starts with stale/missing
+    # dependencies and serves only its import-error overlay.
+    command:
+      - /bin/sh
+      - -c
+      - |
+        lock_hash="$$(sha256sum package-lock.json | cut -d ' ' -f 1)"
+        if [ "$$(cat node_modules/.manus-package-lock.sha256 2>/dev/null)" != "$$lock_hash" ]; then
+          npm ci
+          printf '%s\n' "$$lock_hash" > node_modules/.manus-package-lock.sha256
+        fi
+        exec npm run dev -- --host 0.0.0.0
     volumes:
       - ./frontend:/app  # Mount source code directory
       - /app/node_modules  # Avoid overwriting container's node_modules
     ports:
-      - "${FRONTEND_PORT:-5173}:5173"  # Vite default development port
+      - "${DEV_BIND_ADDRESS:-127.0.0.1}:${FRONTEND_PORT:-5173}:5173"  # Vite default development port
     environment:
       - NODE_ENV=development
       #- VITE_API_URL=http://127.0.0.1:8000
@@ -26,10 +38,12 @@ services:
       dockerfile: Dockerfile
     command:
       [
-        "uv", "run", 
+        "/app/.venv/bin/python", "-m",
         "debugpy", "--listen", "0.0.0.0:5678", "-m", # Enable debug
-        "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload",
-        "--timeout-graceful-shutdown","0"
+        "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--ws-max-size", "131072",
+        # Give cancellation acknowledgements, artifact compensation and DB
+        # shutdown the same bounded window exercised by real deployments.
+        "--timeout-graceful-shutdown", "30"
       ]
     volumes:
       - ./backend:/app  # Mount source code directory
@@ -38,8 +52,8 @@ services:
       - /app/__pycache__  # Avoid overwriting cache files
       - /app/.venv  # Avoid overwriting virtual environment
     ports:
-      - "${BACKEND_PORT:-8000}:8000"
-      - "5678:5678" # Debug port
+      - "${DEV_BIND_ADDRESS:-127.0.0.1}:${BACKEND_PORT:-8000}:8000"
+      - "${DEV_BIND_ADDRESS:-127.0.0.1}:${DEBUGPY_HOST_PORT:-5678}:5678" # Debug port
     depends_on:
       sandbox:
         condition: service_started
@@ -54,13 +68,35 @@ services:
         condition: service_started
         required: true
     restart: unless-stopped
+    sysctls:
+      net.ipv4.ip_forward: "0"
+      net.ipv4.conf.all.forwarding: "0"
+      net.ipv4.conf.default.forwarding: "0"
+      net.ipv6.conf.all.forwarding: "0"
+      net.ipv6.conf.default.forwarding: "0"
+    stop_grace_period: 60s
     networks:
       - manus-network
+      - manus-data-network
     env_file:
       - .env
     environment:
+      # The development topology may use a descriptive value in a personal
+      # .env. Security validation accepts only this explicit bounded enum.
+      - DEPLOYMENT_ENVIRONMENT=development
+      - SANDBOX_PROVIDER=docker # Fixed development sandbox; never inherit billable AgentBay mode
       - SANDBOX_ADDRESS=sandbox # Use single container as sandbox
+      # These are container-network ports, not the configurable host mappings.
+      # Pin them so a developer .env with e.g. SANDBOX_API_PORT=18080 cannot
+      # make the backend wait on a port that the fixed sandbox never exposes.
+      - SANDBOX_API_PORT=8080
+      - SANDBOX_CDP_PORT=9222
+      - SANDBOX_VNC_PORT=5901
+      - SANDBOX_NETWORK=${DEV_SANDBOX_NETWORK:-manus-network-dev}
       - CLAW_ADDRESS=claw       # Use single fixed claw container in development
+      - CLAW_NETWORK=${DEV_CLAW_NETWORK:-manus-network-dev}
+      - RUNTIME_NETWORK_ISOLATION=true
+      - RUNTIME_DEPLOYMENT_ID=${RUNTIME_DEPLOYMENT_ID:-ai-manus-dev}
       - MONGODB_URI=mongodb://mongodb:27017
       - REDIS_HOST=redis
       - REDIS_PORT=6379
@@ -86,13 +122,16 @@ services:
       - /app/__pycache__  # Avoid overwriting cache files
       - /app/.venv  # Avoid overwriting virtual environment
     ports:
-      - "${SANDBOX_CDP_PORT:-9222}:9222"
-      - "5902:5900"
-      - "${SANDBOX_VNC_PORT:-5901}:5901"
-      - "${SANDBOX_API_PORT:-8080}:8080"
+      - "${DEV_BIND_ADDRESS:-127.0.0.1}:${SANDBOX_HOST_CDP_PORT:-9222}:9222"
+      - "${DEV_BIND_ADDRESS:-127.0.0.1}:${SANDBOX_HOST_RFB_PORT:-5902}:5900"
+      - "${DEV_BIND_ADDRESS:-127.0.0.1}:${SANDBOX_HOST_VNC_PORT:-5901}:5901"
+      - "${DEV_BIND_ADDRESS:-127.0.0.1}:${SANDBOX_HOST_API_PORT:-8080}:8080"
     environment:
       - UVI_ARGS="--reload"
       - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
+    mem_limit: ${SANDBOX_MEMORY_LIMIT:-2g}
+    cpus: ${SANDBOX_CPU_LIMIT:-2.0}
+    pids_limit: ${SANDBOX_PIDS_LIMIT:-512}
     restart: unless-stopped
     networks:
       - manus-network
@@ -103,7 +142,7 @@ services:
       dockerfile: Dockerfile
     hostname: claw
     ports:
-      - "18788:18788" # manus-claw HTTP server
+      - "${DEV_BIND_ADDRESS:-127.0.0.1}:${CLAW_HOST_PORT:-18788}:18788" # manus-claw HTTP server
     environment:
       - CLAW_TTL_SECONDS=0        # No TTL in development (0 = unlimited)
       - MANUS_API_BASE_URL=http://backend:8000
@@ -116,6 +155,7 @@ services:
     build:
       context: ./mockserver
       dockerfile: Dockerfile
+    command: ["./dev.sh"]
     volumes:
       - ./mockserver:/app  # Mount source code directory
       - /app/__pycache__  # Avoid overwriting cache files
@@ -133,23 +173,34 @@ services:
       - mongodb_data:/data/db
     restart: unless-stopped
     ports:
-      - "27017:27017"
+      - "${DEV_BIND_ADDRESS:-127.0.0.1}:${MONGODB_HOST_PORT:-27017}:27017"
     networks:
-      - manus-network
+      - manus-data-network
 
   redis:
     image: redis:7.0
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis_data:/data
     restart: unless-stopped
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      - "${DEV_BIND_ADDRESS:-127.0.0.1}:${REDIS_HOST_PORT:-6379}:6379"
     networks:
-      - manus-network
+      - manus-data-network
 
 volumes:
   mongodb_data:
-    name: manus-mongodb-data
+    name: ${DEV_RESOURCE_PREFIX:-manus}-mongodb-data-dev
+  redis_data:
+    name: ${DEV_RESOURCE_PREFIX:-manus}-redis-data-dev
 
 networks:
+  # User-controlled development runtimes and the backend communicate here.
   manus-network:
-    name: manus-network
+    name: ${DEV_RESOURCE_PREFIX:-manus}-network-dev
     driver: bridge
+  # MongoDB and Redis are intentionally unreachable from sandbox/Claw.
+  manus-data-network:
+    name: ${DEV_RESOURCE_PREFIX:-manus}-data-network-dev
+    driver: bridge
+    internal: true

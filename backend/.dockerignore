@@ -1,7 +1,12 @@
 .venv
+.env
+.env.*
+!.env.example
+.git/
 __pycache__/
 .pytest_cache/
 *.py[cod]
+*.log
 .DS_Store
 dist/
 build/

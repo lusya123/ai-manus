@@ -42,10 +42,13 @@
                 <SelectValue :placeholder="t('Select provider')" />
               </SelectTrigger>
               <SelectContent :side-offset="5">
-                <SelectItem value="openai">{{ t('OpenAI compatible') }}</SelectItem>
-                <SelectItem value="anthropic">{{ t('Anthropic') }}</SelectItem>
-                <SelectItem value="google_genai">{{ t('Google') }}</SelectItem>
-                <SelectItem value="custom">{{ t('Custom provider') }}</SelectItem>
+                <SelectItem
+                  v-for="provider in providerOptions"
+                  :key="provider.value"
+                  :value="provider.value"
+                >
+                  {{ provider.label }}
+                </SelectItem>
               </SelectContent>
             </Select>
           </div>
@@ -58,17 +61,6 @@
               v-model="form.model_name"
               class="h-full min-w-1 flex-1 bg-transparent disabled:cursor-not-allowed placeholder:text-[var(--text-disable)]"
               :placeholder="t('Enter model name')"
-            />
-          </div>
-        </div>
-
-        <div v-if="form.model_provider === 'custom'" class="flex flex-col gap-2">
-          <div class="text-sm font-medium text-[var(--text-primary)]">{{ t('Provider') }}</div>
-          <div class="rounded-[10px] overflow-hidden text-sm leading-[22px] text-[var(--text-primary)] h-10 flex items-center bg-[var(--fill-tsp-white-main)] pt-2 pr-3 pb-2 pl-4 focus-within:ring-[1.5px] focus-within:ring-[var(--border-dark)] w-full">
-            <input
-              v-model="customProvider"
-              class="h-full min-w-1 flex-1 bg-transparent disabled:cursor-not-allowed placeholder:text-[var(--text-disable)]"
-              :placeholder="t('Enter provider')"
             />
           </div>
         </div>
@@ -121,7 +113,7 @@
           </button>
           <button
             type="button"
-            class="inline-flex items-center justify-center whitespace-nowrap font-medium transition-colors hover:opacity-90 active:opacity-80 px-[12px] rounded-[10px] gap-[6px] text-sm min-w-16 text-white bg-[var(--Button-primray-black)] h-[32px]"
+            class="inline-flex items-center justify-center whitespace-nowrap font-medium transition-colors hover:opacity-90 active:opacity-80 px-[12px] rounded-[10px] gap-[6px] text-sm min-w-16 text-white bg-[var(--Button-primary-black)] h-[32px]"
             @click="saveConfig"
           >
             <Save class="size-4" />
@@ -134,7 +126,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { Eye, EyeOff, RotateCcw, Save } from 'lucide-vue-next'
 import {
@@ -146,13 +138,18 @@ import {
 } from '@/components/ui/select'
 import {
   clearStoredAgentConfig,
+  CUSTOM_STORED_MODEL_ID,
   getStoredAgentConfig,
+  saveSelectedModelId,
   saveStoredAgentConfig,
+  SYSTEM_MODEL_ID,
 } from '@/api/agentConfig'
 import type { StoredAgentConfig } from '@/api/agentConfig'
+import { getCachedClientConfig } from '@/api/config'
 import { showErrorToast, showSuccessToast } from '@/utils/toast'
 
 const CUSTOM_MODEL_VALUE = '__custom__'
+const DEFAULT_SUPPORTED_PROVIDERS = ['openai', 'anthropic', 'deepseek', 'ollama']
 
 type ModelMode = 'system' | 'custom'
 
@@ -165,18 +162,31 @@ interface ModelOption {
 const { t } = useI18n()
 const storedConfig = getStoredAgentConfig()
 const savedConfig = ref<StoredAgentConfig | null>(storedConfig)
-const knownProviders = ['openai', 'anthropic', 'google_genai']
+const supportedProviders = ref([...DEFAULT_SUPPORTED_PROVIDERS])
 const initialProvider = storedConfig?.model_provider || 'openai'
 
 const mode = ref<ModelMode>(storedConfig ? 'custom' : 'system')
 const showApiKey = ref(false)
-const customProvider = ref(knownProviders.includes(initialProvider) ? '' : initialProvider)
 const form = reactive<StoredAgentConfig>({
   api_key: storedConfig?.api_key || '',
   api_base: storedConfig?.api_base || '',
   model_name: storedConfig?.model_name || 'gpt-4o',
-  model_provider: knownProviders.includes(initialProvider) ? initialProvider : 'custom',
+  model_provider: DEFAULT_SUPPORTED_PROVIDERS.includes(initialProvider)
+    ? initialProvider
+    : 'openai',
 })
+
+const providerLabels: Record<string, string> = {
+  openai: 'OpenAI compatible',
+  anthropic: 'Anthropic',
+  deepseek: 'DeepSeek',
+  ollama: 'Ollama',
+}
+
+const providerOptions = computed(() => supportedProviders.value.map((value) => ({
+  value,
+  label: t(providerLabels[value] || value),
+})))
 
 const modelOptions: ModelOption[] = [
   { value: 'gpt-4o', label: 'GPT-4o', provider: 'openai' },
@@ -190,13 +200,6 @@ const selectedModel = ref(
     ? form.model_name
     : CUSTOM_MODEL_VALUE
 )
-
-const effectiveProvider = computed(() => {
-  if (form.model_provider === 'custom') {
-    return customProvider.value.trim()
-  }
-  return form.model_provider
-})
 
 function cleanValue(value?: string) {
   const trimmedValue = value?.trim()
@@ -220,7 +223,7 @@ const currentCustomConfig = computed<StoredAgentConfig>(() => ({
   api_key: cleanValue(form.api_key),
   api_base: cleanValue(form.api_base),
   model_name: cleanValue(form.model_name),
-  model_provider: cleanValue(effectiveProvider.value),
+  model_provider: cleanValue(form.model_provider),
 }))
 
 const isSavedCustomConfig = computed(() => {
@@ -235,7 +238,7 @@ const isSavedCustomConfig = computed(() => {
   )
 })
 
-function handleModelSelect(value: any) {
+function handleModelSelect(value: unknown) {
   if (typeof value !== 'string') return
   selectedModel.value = value
   if (value === CUSTOM_MODEL_VALUE) {
@@ -256,9 +259,9 @@ function resetToSystem() {
   form.api_key = ''
   form.api_base = ''
   form.model_name = 'gpt-4o'
-  form.model_provider = 'openai'
-  customProvider.value = ''
+  form.model_provider = supportedProviders.value[0] || 'openai'
   clearStoredAgentConfig()
+  saveSelectedModelId(SYSTEM_MODEL_ID)
   savedConfig.value = null
   showSuccessToast(t('Model settings reset'))
 }
@@ -266,6 +269,7 @@ function resetToSystem() {
 function saveConfig() {
   if (mode.value === 'system') {
     clearStoredAgentConfig()
+    saveSelectedModelId(SYSTEM_MODEL_ID)
     savedConfig.value = null
     showSuccessToast(t('Model settings saved'))
     return
@@ -277,18 +281,69 @@ function saveConfig() {
     return
   }
 
-  const provider = effectiveProvider.value
+  const provider = form.model_provider?.trim()
   if (!provider) {
     showErrorToast(t('Provider is required'))
     return
   }
 
-  savedConfig.value = saveStoredAgentConfig({
-    api_key: form.api_key,
-    api_base: form.api_base,
+  if (!supportedProviders.value.includes(provider)) {
+    showErrorToast(t('Unsupported provider'))
+    return
+  }
+
+  const apiBase = form.api_base?.trim()
+  if (!apiBase) {
+    showErrorToast(t('API Base URL is required'))
+    return
+  }
+  try {
+    const parsed = new URL(apiBase)
+    if (
+      !['http:', 'https:'].includes(parsed.protocol)
+      || parsed.username
+      || parsed.password
+      || parsed.search
+      || parsed.hash
+    ) {
+      throw new Error('invalid API base')
+    }
+  } catch {
+    showErrorToast(t('API Base URL is invalid'))
+    return
+  }
+
+  const apiKey = form.api_key?.trim()
+  if (!apiKey) {
+    showErrorToast(t('API key is required'))
+    return
+  }
+
+  const saved = saveStoredAgentConfig({
+    api_key: apiKey,
+    api_base: apiBase,
     model_name: modelName,
     model_provider: provider,
   })
+  if (!saved) {
+    showErrorToast(t('Model configuration is incomplete'))
+    return
+  }
+  savedConfig.value = saved
+  saveSelectedModelId(CUSTOM_STORED_MODEL_ID)
   showSuccessToast(t('Model settings saved'))
 }
+
+onMounted(async () => {
+  const config = await getCachedClientConfig()
+  const configuredProviders = (config?.supported_byok_providers || [])
+    .map((provider) => provider.trim().toLowerCase())
+    .filter(Boolean)
+  if (configuredProviders.length > 0) {
+    supportedProviders.value = configuredProviders
+  }
+  if (!supportedProviders.value.includes(form.model_provider || '')) {
+    form.model_provider = supportedProviders.value[0] || 'openai'
+  }
+})
 </script>

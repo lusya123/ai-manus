@@ -33,8 +33,20 @@ class Session(BaseModel):
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:16])
     user_id: str  # User ID that owns this session
     sandbox_id: Optional[str] = Field(default=None)  # Identifier for the sandbox environment
+    # Persist the allocator identity so changing the deployment-wide provider
+    # cannot silently overwrite an existing billable sandbox pointer.
+    sandbox_provider: Optional[str] = None
+    # Durable provider-delete fence. While true, no chat/provisioning path may
+    # adopt this runtime; only exact cleanup may resume and clear the flag.
+    sandbox_destroying: bool = False
+    # Durable whole-session deletion fence. Once claimed it is never cleared:
+    # retries resume cleanup and the final Mongo delete is conditional on it.
+    deleting: bool = False
     agent_id: str
     task_id: Optional[str] = None
+    # Sandbox generation captured when task_id was bound. A mismatch forces
+    # retirement instead of reusing a worker built for an older runtime.
+    task_sandbox_id: Optional[str] = None
     title: Optional[str] = None
     unread_message_count: int = 0
     latest_message: Optional[str] = None
@@ -45,6 +57,9 @@ class Session(BaseModel):
     files: List[FileInfo] = Field(default_factory=list)
     status: SessionStatus = SessionStatus.PENDING
     is_shared: bool = False  # Whether this session is shared publicly
+    # Rotated on every share/unshare transition so previously issued public
+    # capabilities cannot revive if a session is shared again.
+    share_epoch: str = Field(default_factory=lambda: uuid.uuid4().hex)
 
     def get_last_plan(self) -> Optional[Plan]:
         """Get the last plan from the events"""

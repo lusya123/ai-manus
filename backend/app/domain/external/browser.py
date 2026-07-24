@@ -3,6 +3,10 @@ from app.domain.models.tool_result import ToolResult
 
 class Browser(Protocol):
     """Browser service gateway interface"""
+
+    async def cleanup(self) -> None:
+        """Close this browser/CDP client without stopping the sandbox."""
+        ...
     
     async def view_page(self) -> ToolResult:
         """View current page content"""

@@ -1,34 +1,106 @@
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing import Optional, List
-from app.interfaces.schemas.event import AgentSSEEvent
-from app.domain.models.session import SessionStatus
+from uuid import UUID
+from app.core.config import get_settings
+from app.interfaces.schemas.event import AgentSSEEvent, SharedAgentSSEEvent
+from app.domain.models.file import FileInfo
+from app.domain.models.session import SessionStatus, SessionSummary
+from app.domain.utils.time import epoch_seconds
 
 
 class ChatAttachment(BaseModel):
-    """Attachment reference sent with a chat message."""
-    file_id: str
-    filename: Optional[str] = None
+    """File attachment reference in a chat request"""
+    model_config = ConfigDict(extra="forbid")
+
+    file_id: str = Field(min_length=1, max_length=256)
+    filename: Optional[str] = Field(default=None, max_length=512)
+
+    @model_validator(mode="after")
+    def validate_configured_lengths(self) -> "ChatAttachment":
+        settings = get_settings()
+        if len(self.file_id) > settings.chat_attachment_file_id_max_chars:
+            raise ValueError("file_id is too long")
+        if (
+            self.filename is not None
+            and len(self.filename) > settings.chat_attachment_filename_max_chars
+        ):
+            raise ValueError("filename is too long")
+        return self
+
+    def to_domain(self) -> FileInfo:
+        return FileInfo(file_id=self.file_id, filename=self.filename)
 
 
 class ChatRequest(BaseModel):
     """Chat request schema"""
+    model_config = ConfigDict(extra="forbid")
+
     timestamp: Optional[int] = None
     message: Optional[str] = None
-    attachments: Optional[List[ChatAttachment]] = None
-    event_id: Optional[str] = None
+    attachments: Optional[List[ChatAttachment]] = Field(default=None, max_length=10)
+    event_id: Optional[str] = Field(default=None, max_length=128)
+    submission_id: Optional[UUID] = None
+
+    @field_validator("message")
+    @classmethod
+    def validate_message_bytes(cls, message: Optional[str]) -> Optional[str]:
+        if message is not None and len(message.encode("utf-8")) > get_settings().chat_max_message_bytes:
+            raise ValueError("message is too large")
+        return message
+
+    @model_validator(mode="after")
+    def validate_submission(self) -> "ChatRequest":
+        settings = get_settings()
+        if self.attachments and len(self.attachments) > settings.chat_max_attachments:
+            raise ValueError("too many attachments")
+        if self.message and self.submission_id is None:
+            raise ValueError("submission_id is required when message is present")
+        return self
 
 
 class AgentModelConfigRequest(BaseModel):
     """Per-session model credentials imported from Sub2API."""
-    model_id: Optional[str] = None
-    api_key: Optional[str] = None
-    api_base: Optional[str] = None
-    model_name: Optional[str] = None
-    model_provider: Optional[str] = None
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    model_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    api_key: Optional[str] = Field(default=None, min_length=1, max_length=8192, repr=False)
+    api_base: Optional[str] = Field(default=None, min_length=1, max_length=2048)
+    model_name: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$",
+    )
+    model_provider: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z][a-z0-9_-]*$",
+    )
+
+    @model_validator(mode="after")
+    def validate_selection_mode(self) -> "AgentModelConfigRequest":
+        custom_fields = ("api_key", "api_base", "model_name", "model_provider")
+        provided_custom = [name for name in custom_fields if getattr(self, name)]
+        if self.model_id and provided_custom:
+            raise ValueError("model_id cannot be combined with custom model credentials")
+        if provided_custom and len(provided_custom) != len(custom_fields):
+            missing = ", ".join(
+                name for name in custom_fields if not getattr(self, name)
+            )
+            raise ValueError(f"Custom model configuration is missing: {missing}")
+        return self
 
 
 class AgentModelConfigResponse(BaseModel):
-    """Per-session model metadata exposed to the frontend."""
+    """Per-session model metadata safe to expose to the frontend."""
+
     model_id: Optional[str] = None
     api_base: Optional[str] = None
     model_name: Optional[str] = None
@@ -36,18 +108,19 @@ class AgentModelConfigResponse(BaseModel):
 
 
 class CreateSessionRequest(BaseModel):
-    """Create session request schema"""
-    agent_model_config: Optional[AgentModelConfigRequest] = Field(default=None, alias="model_config")
+    agent_model_config: Optional[AgentModelConfigRequest] = Field(
+        default=None, alias="model_config"
+    )
+
+
+class PreviewUrlRequest(BaseModel):
+    url: str
+    expire_minutes: int = Field(15, ge=1, le=15)
 
 
 class ShellViewRequest(BaseModel):
     """Shell view request schema"""
     session_id: str
-
-class PreviewUrlRequest(BaseModel):
-    """Interactive web preview URL request schema"""
-    url: str
-    expire_minutes: int = Field(15, description="Token expiration time in minutes (max 15 minutes)", ge=1, le=15)
 
 
 class CreateSessionResponse(BaseModel):
@@ -57,14 +130,16 @@ class CreateSessionResponse(BaseModel):
 
 class GetSessionResponse(BaseModel):
     """Get session response schema"""
-    model_config = ConfigDict(populate_by_name=True)
-
     session_id: str
     title: Optional[str] = None
     status: SessionStatus
+    model_config = ConfigDict(populate_by_name=True)
+
     events: List[AgentSSEEvent] = Field(default_factory=list)
     is_shared: bool = False
-    agent_model_config: Optional[AgentModelConfigResponse] = Field(default=None, alias="model_config")
+    agent_model_config: Optional[AgentModelConfigResponse] = Field(
+        default=None, alias="model_config"
+    )
 
 
 class ListSessionItem(BaseModel):
@@ -76,6 +151,22 @@ class ListSessionItem(BaseModel):
     status: SessionStatus
     unread_message_count: int
     is_shared: bool = False
+
+    @staticmethod
+    def from_domain(summary: SessionSummary) -> 'ListSessionItem':
+        return ListSessionItem(
+            session_id=summary.id,
+            title=summary.title,
+            status=summary.status,
+            unread_message_count=summary.unread_message_count,
+            latest_message=summary.latest_message,
+            latest_message_at=(
+                epoch_seconds(summary.latest_message_at)
+                if summary.latest_message_at
+                else None
+            ),
+            is_shared=summary.is_shared
+        )
 
 
 class ListSessionResponse(BaseModel):
@@ -108,5 +199,5 @@ class SharedSessionResponse(BaseModel):
     session_id: str
     title: Optional[str] = None
     status: SessionStatus
-    events: List[AgentSSEEvent] = Field(default_factory=list)
+    events: List[SharedAgentSSEEvent] = Field(default_factory=list)
     is_shared: bool

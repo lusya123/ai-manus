@@ -1,6 +1,18 @@
 export default {
   'Hello': 'Hello',
   'What can I do for you?': 'What can I do for you?',
+  // Home suggestion chips
+  'Create slides': 'Create slides',
+  'Build website': 'Build website',
+  'Design': 'Design',
+  'Create games': 'Create games',
+  'Deep research': 'Deep research',
+  'Analyze data': 'Analyze data',
+  'Generate image': 'Generate image',
+  'Write report': 'Write report',
+  'More': 'More',
+  'Collapse sidebar': 'Collapse sidebar',
+  'Expand sidebar': 'Expand sidebar',
   'Failed to create agent, please try again later': 'Failed to create agent, please try again later',
   'New Chat': 'New Chat',
   'New Task': 'New Task',
@@ -31,7 +43,7 @@ export default {
   'Open workspace': 'Open workspace',
   'Open Manus workspace': 'Open Manus workspace',
   'Hide workspace': 'Hide workspace',
-  'No Manus workspace yet': 'No Manus workspace is available yet. It will appear here after Manus uses a tool.',
+  'No Manus workspace yet': 'There is no workspace to open yet. It will become available after Manus uses a tool.',
   'Open file': 'Open file',
   'Failed to load file content': 'Failed to load file content',
   'Give Manus a task to work on...': 'Give Manus a task to work on...',
@@ -51,7 +63,6 @@ export default {
   'Viewing webpage': 'Viewing webpage',
   'Navigating to webpage': 'Navigating to webpage',
   'Restarting browser': 'Restarting browser',
-  'Showing preview': 'Showing preview',
   'Clicking element': 'Clicking element',
   'Entering text': 'Entering text',
   'Moving mouse': 'Moving mouse',
@@ -61,6 +72,7 @@ export default {
   'Scrolling down': 'Scrolling down',
   'Executing JS code': 'Executing JS code',
   'Viewing console output': 'Viewing console output',
+  'Showing preview': 'Showing preview',
   // Search tools
   'Searching web': 'Searching web',
   // Message tools
@@ -70,6 +82,7 @@ export default {
   'Terminal': 'Terminal',
   'File': 'File',
   'Browser': 'Browser',
+  'Preview': 'Preview',
   'Information': 'Information',
   'Message': 'Message',
   // Dialog
@@ -86,6 +99,10 @@ export default {
   'Take Over': 'Take Over',
   'Open preview': 'Open preview',
   'Preparing preview': 'Preparing preview',
+  'Preview unavailable': 'Preview unavailable',
+  'Retry': 'Retry',
+  'You are signed out of Manus': 'You are signed out of Manus',
+  'Continue with Sub2API': 'Continue with Sub2API',
   // Session File List
   'All Files in This Task': 'All Files in This Task',
   'No Content': 'No Content',
@@ -138,6 +155,9 @@ export default {
   'Logout': 'Logout',
   'Unknown User': 'Unknown User',
   'No email': 'No email',
+  'Sub2API Console': 'Sub2API Console',
+  'Model Marketplace': 'Model Marketplace',
+  'Use Token': 'Use Token',
   // Settings Dialog
   'Settings': 'Settings',
   'Account': 'Account',
@@ -175,6 +195,11 @@ export default {
   'Model settings saved': 'Model settings saved',
   'Model name is required': 'Model name is required',
   'Provider is required': 'Provider is required',
+  'Unsupported provider': 'This provider is not supported by the server',
+  'API Base URL is required': 'API Base URL is required',
+  'API Base URL is invalid': 'Enter a valid HTTP(S) API Base URL without credentials, query, or fragment',
+  'API key is required': 'API key is required',
+  'Model configuration is incomplete': 'Model configuration is incomplete',
   // Profile Settings
   'Name': 'Name',
   'Full name updated successfully': 'Full name updated successfully',
@@ -244,6 +269,10 @@ export default {
   'Link copied to clipboard': 'Link copied to clipboard',
   'Failed to copy link': 'Failed to copy link',
   'You are viewing a completed Manus task. Replay will start automatically in {countdown} seconds.': 'You are viewing a completed Manus task. Replay will start automatically in {countdown} seconds.',
+  'Manus task replay completed.': 'Manus task replay completed.',
+  'Manus is replaying the task...': 'Manus is replaying the task...',
+  'Replay': 'Replay',
+  'Jump to result': 'Jump to result',
   // Claw Page
   'Deploy OpenClaw Instantly': 'Deploy OpenClaw Instantly',
   'OpenClaw is an AI assistant with unique personality and long-term memory, one-click deploy to sandbox cloud, no complex setup, 24/7 online': 'OpenClaw is an AI assistant with unique personality and long-term memory, one-click deploy to sandbox cloud, no complex setup, 24/7 online',
@@ -267,4 +296,4 @@ export default {
   'Please check {count} attachment(s) I sent': 'Please check {count} attachment(s) I sent',
   'WebSocket not connected, please try again later': 'WebSocket not connected, please try again later',
   'Claw has expired, please recreate.': 'Claw has expired, please recreate.',
-} 
+}

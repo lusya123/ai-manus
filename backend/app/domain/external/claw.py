@@ -4,6 +4,10 @@ from dataclasses import dataclass
 from app.domain.models.claw import ClawMessage
 
 
+class ClawResponseTooLargeError(RuntimeError):
+    """Raised when a streamed Claw answer exceeds its configured byte cap."""
+
+
 @dataclass
 class ClawInstanceInfo:
     """Connection info returned after creating a claw instance."""
@@ -24,8 +28,13 @@ class ClawRuntime(Protocol):
         """Create a new claw instance. Returns connection info."""
         ...
 
-    async def destroy(self, instance_name: Optional[str]) -> None:
-        """Destroy a claw instance (best-effort, should not raise)."""
+    async def destroy(self, instance_name: Optional[str]) -> bool:
+        """Destroy a claw instance.
+
+        Returns ``True`` when the instance is gone (including already absent)
+        and ``False`` when cleanup failed.  Implementations may raise for
+        unexpected failures; callers must retain ownership for retry.
+        """
         ...
 
     async def wait_for_ready(self, base_url: str) -> bool:

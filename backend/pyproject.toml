@@ -8,6 +8,7 @@ dependencies = [
     "async-lru>=2.0.0",
     "beanie>=1.25.0",
     "beautifulsoup4>=4.12.0",
+    "celery>=5.4.0",
     "curl-cffi>=0.14.0",
     "cryptography>=3.4.8",
     "debugpy>=1.8.17",
@@ -38,6 +39,7 @@ dependencies = [
     "sse-starlette>=3.0.3",
     "uvicorn>=0.38.0",
     "websockets>=15.0.1",
+    "wuying-agentbay-sdk>=0.22.0",
 ]
 
 [dependency-groups]

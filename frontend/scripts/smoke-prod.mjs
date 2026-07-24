@@ -26,7 +26,7 @@ function findChromeExecutable() {
   return candidates.find((candidate) => existsSync(candidate));
 }
 
-function frontendConfigResponse() {
+function frontendConfigResponse(overrides = {}) {
   return {
     code: 0,
     msg: "success",
@@ -47,12 +47,21 @@ function frontendConfigResponse() {
         model_provider: "openai",
         api_base: null,
       },
-      available_models: [],
+      available_models: [
+        {
+          id: "smoke-model",
+          label: "Smoke Model",
+          model_name: "smoke-model-name",
+          model_provider: "openai",
+          api_base: null,
+        },
+      ],
+      ...overrides,
     },
   };
 }
 
-async function installApiMocks(page) {
+async function installApiMocks(page, options = {}) {
   await page.route("**/api/**", async (route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -61,7 +70,29 @@ async function installApiMocks(page) {
       await route.fulfill({
         status: 200,
         contentType: "application/json",
-        body: JSON.stringify(frontendConfigResponse()),
+        body: JSON.stringify(frontendConfigResponse(options.configData)),
+      });
+      return;
+    }
+
+    if (url.pathname === "/api/v1/auth/me" && request.method() === "GET") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          code: 0,
+          msg: "success",
+          data: {
+            id: "smoke-user",
+            fullname: "Smoke User",
+            email: "smoke@example.test",
+            role: "user",
+            is_active: true,
+            created_at: "2026-01-01T00:00:00Z",
+            updated_at: "2026-01-01T00:00:00Z",
+            auth_provider: "sub2api",
+          },
+        }),
       });
       return;
     }
@@ -81,6 +112,7 @@ async function installApiMocks(page) {
       }
 
       if (request.method() === "PUT") {
+        options.onCreateSession?.(request.postDataJSON());
         await route.fulfill({
           status: 200,
           contentType: "application/json",
@@ -102,6 +134,7 @@ async function installApiMocks(page) {
     }
 
     if (url.pathname === "/api/v1/sessions/smoke-session/chat" && request.method() === "POST") {
+      options.onChatSubmission?.(request.postDataJSON());
       await route.fulfill({
         status: 200,
         contentType: "text/event-stream",
@@ -151,7 +184,25 @@ async function installApiMocks(page) {
 async function verifyEnterSubmits(browser, consoleErrors, pageErrors, requestFailures) {
   const routePath = "/ enter-submit";
   const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
-  await installApiMocks(page);
+  let createSessionBody = null;
+  let chatSubmissionBody = null;
+  await installApiMocks(page, {
+    onCreateSession: (body) => {
+      createSessionBody = body;
+    },
+    onChatSubmission: (body) => {
+      chatSubmissionBody = body;
+    },
+  });
+  await page.addInitScript(() => {
+    // Simulate the deployed HTTP IP origin, where randomUUID is unavailable
+    // even though getRandomValues remains usable.
+    Object.defineProperty(globalThis.crypto, "randomUUID", {
+      configurable: true,
+      value: undefined,
+    });
+    localStorage.setItem("manus_selected_model_id", "smoke-model");
+  });
 
   page.on("console", (message) => {
     if (message.type() === "error") {
@@ -178,9 +229,65 @@ async function verifyEnterSubmits(browser, consoleErrors, pageErrors, requestFai
     { timeout: 20_000 },
   );
 
+  if (createSessionBody?.model_config?.model_id !== "smoke-model") {
+    throw new Error(`Selected model was not sent when creating a session: ${JSON.stringify(createSessionBody)}`);
+  }
+  if (chatSubmissionBody?.message !== draft) {
+    throw new Error(`Initial chat message was not submitted: ${JSON.stringify(chatSubmissionBody)}`);
+  }
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(chatSubmissionBody?.submission_id || "")) {
+    throw new Error(`Chat submission did not include an RFC 4122 v4 UUID: ${JSON.stringify(chatSubmissionBody)}`);
+  }
+
   const state = await page.evaluate(() => ({
     path: window.location.pathname,
     bodyText: document.body.innerText.slice(0, 500),
+  }));
+  await page.close();
+  return state;
+}
+
+async function verifyExternalHandoff(browser, consoleErrors, pageErrors, requestFailures) {
+  const routePath = "/ external-handoff";
+  const handoffState = "smoke-external-auth-state";
+  const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+  await installApiMocks(page, {
+    configData: {
+      auth_provider: "sub2api",
+      sub2api_login_url: "https://accounts.example.test/login",
+    },
+  });
+  await page.addInitScript((state) => {
+    sessionStorage.setItem("sub2api_external_auth_state", state);
+  }, handoffState);
+
+  page.on("console", (message) => {
+    if (message.type() === "error") consoleErrors.push(`[${routePath}] ${message.text()}`);
+  });
+  page.on("pageerror", (error) => {
+    pageErrors.push(`[${routePath}] ${error.stack || error.message}`);
+  });
+  page.on("requestfailed", (request) => {
+    requestFailures.push(
+      `[${routePath}] ${request.method()} ${request.url()} ${request.failure()?.errorText || ""}`.trim(),
+    );
+  });
+
+  await page.goto(
+    `${BASE_URL}/?keep=yes#manus_access_token=smoke-access-secret&manus_model_id=smoke-model&state=${handoffState}`,
+    { waitUntil: "domcontentloaded", timeout: 30_000 },
+  );
+  await page.waitForFunction(() => (
+    window.location.search === "?keep=yes"
+    && localStorage.getItem("access_token") === "smoke-access-secret"
+    && localStorage.getItem("manus_selected_model_id") === "smoke-model"
+  ), { timeout: 20_000 });
+
+  const state = await page.evaluate(() => ({
+    path: window.location.pathname,
+    search: window.location.search,
+    importedAccessToken: localStorage.getItem("access_token") === "smoke-access-secret",
+    selectedModelId: localStorage.getItem("manus_selected_model_id"),
   }));
   await page.close();
   return state;
@@ -259,6 +366,7 @@ async function main() {
     }
 
     checkedRoutes.push(await verifyEnterSubmits(browser, consoleErrors, pageErrors, requestFailures));
+    checkedRoutes.push(await verifyExternalHandoff(browser, consoleErrors, pageErrors, requestFailures));
 
     if (pageErrors.length || consoleErrors.length || requestFailures.length) {
       throw new Error(JSON.stringify({ checkedRoutes, pageErrors, consoleErrors, requestFailures }, null, 2));

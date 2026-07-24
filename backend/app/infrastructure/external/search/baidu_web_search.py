@@ -9,6 +9,7 @@ from curl_cffi.requests import AsyncSession
 from app.domain.external.search import SearchEngine
 from app.domain.models.search import SearchResultItem, SearchResults
 from app.domain.models.tool_result import ToolResult
+from app.domain.utils.error_reporting import safe_exception_summary
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +144,8 @@ class BaiduWebSearchEngine(SearchEngine):
                             )
                     except Exception as e:
                         logger.warning(
-                            f"Failed to parse Baidu search result item: {e}"
+                            "Failed to parse Baidu search result item: %s",
+                            safe_exception_summary(e),
                         )
                         continue
 
@@ -183,7 +185,10 @@ class BaiduWebSearchEngine(SearchEngine):
                 return ToolResult(success=True, data=results)
 
         except Exception as e:
-            logger.error(f"Baidu Web Search failed: {e}")
+            error_summary = safe_exception_summary(e)
+            logger.error(
+                "Baidu Web Search failed: %s", error_summary
+            )
             error_results = SearchResults(
                 query=query,
                 date_range=date_range,
@@ -192,7 +197,7 @@ class BaiduWebSearchEngine(SearchEngine):
             )
             return ToolResult(
                 success=False,
-                message=f"Baidu Web Search failed: {e}",
+                message=f"Baidu Web Search failed: {error_summary}",
                 data=error_results,
             )
 

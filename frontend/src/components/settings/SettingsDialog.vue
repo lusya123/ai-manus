@@ -5,7 +5,6 @@
       <DialogDescription></DialogDescription>
       
       <SettingsTabs 
-        :key="tabsKey"
         :tabs="tabs" 
         :default-tab="defaultTab"
         :current-sub-page="currentSubPage"
@@ -38,7 +37,7 @@
 
 <script setup lang="ts">
 import { ref, watch } from 'vue'
-import { BrainCircuit, Settings2, UserRound } from 'lucide-vue-next'
+import { BrainCircuit, UserRound, Settings2 } from 'lucide-vue-next'
 import {
   Dialog,
   DialogContent,
@@ -58,13 +57,9 @@ const { isSettingsDialogOpen, defaultTab } = useSettingsDialog()
 
 // Navigation state for sub-pages
 const currentSubPage = ref<string | null>(null)
-const tabsKey = ref(0)
 
-watch([isSettingsDialogOpen, defaultTab], ([isOpen]) => {
-  if (isOpen) {
-    currentSubPage.value = null
-    tabsKey.value += 1
-  }
+watch(isSettingsDialogOpen, (isOpen) => {
+  if (isOpen) currentSubPage.value = null
 })
 
 // Tab configuration
@@ -96,8 +91,7 @@ const subPageConfigs: SubPageConfig[] = [
 ]
 
 // Handle tab change
-const onTabChange = (tabId: string) => {
-  console.log('Tab changed to:', tabId)
+const onTabChange = (_tabId: string) => {
   // Reset sub-page when changing tabs
   currentSubPage.value = null
 }

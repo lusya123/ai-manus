@@ -4,6 +4,7 @@ from redis.exceptions import ConnectionError, TimeoutError
 from redis.retry import Retry
 import logging
 from app.core.config import get_settings
+from app.domain.utils.error_reporting import safe_exception_summary
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ class RedisClient:
                 password=self._settings.redis_password,
                 decode_responses=True,
                 socket_connect_timeout=self._settings.redis_socket_connect_timeout,
+                socket_timeout=self._settings.redis_socket_timeout,
                 socket_keepalive=True,
                 health_check_interval=self._settings.redis_health_check_interval,
                 max_connections=self._settings.redis_max_connections,
@@ -39,7 +41,9 @@ class RedisClient:
             await self._client.ping()
             logger.info("Successfully connected to Redis")
         except Exception as e:
-            logger.error(f"Failed to connect to Redis: {str(e)}")
+            logger.error(
+                "Failed to connect to Redis: %s", safe_exception_summary(e)
+            )
             raise
     
     async def shutdown(self) -> None:

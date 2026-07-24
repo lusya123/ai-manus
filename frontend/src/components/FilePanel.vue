@@ -42,9 +42,7 @@
       </div>
     </div>
   </div>
-  <button
-    v-if="visible && !isShow && fileInfo"
-    @click="showFilePanel(fileInfo)"
+  <button v-if="visible && !isShow && fileInfo" @click="showFilePanel(fileInfo)"
     class="fixed right-4 bottom-24 z-40 h-10 px-3 rounded-full inline-flex items-center gap-2 bg-[var(--background-white-main)] text-[var(--text-primary)] border border-[var(--border-main)] shadow-[0px_5px_16px_0px_var(--shadow-S),0px_0px_1.25px_0px_var(--shadow-S)] hover:bg-[var(--background-gray-main)] cursor-pointer"
     :title="$t('Open file')">
     <FileText class="size-4 text-[var(--icon-secondary)]" />
@@ -71,7 +69,6 @@ const {
   showFilePanel,
   hideFilePanel
 } = useFilePanel()
-
 const route = useRoute()
 
 const filePanelRef = ref<HTMLElement>()
@@ -109,9 +106,7 @@ onUnmounted(() => {
   eventBus.off(EVENT_SHOW_TOOL_PANEL, handleToolPanelShown)
 })
 
-watch(() => route.fullPath, () => {
-  clearFilePanel()
-})
+watch(() => route.fullPath, clearFilePanel)
 
 defineExpose({
   showFilePanel,

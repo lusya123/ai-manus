@@ -1,6 +1,13 @@
-from typing import Protocol, Any, Awaitable, Optional, Callable
+from typing import Any, Dict, Optional, Protocol
 from abc import ABC, abstractmethod
 from app.domain.external.message_queue import MessageQueue
+
+
+class RunnerCleanupCapacityError(RuntimeError):
+    """Transient backpressure before any per-runner handles are allocated."""
+
+    transient = True
+    retryable = True
 
 
 class TaskRunner(ABC):
@@ -22,16 +29,17 @@ class TaskRunner(ABC):
     
     @abstractmethod
     async def destroy(self) -> None:
-        """Destroy the task and release resources.
-        
-        Called when the task needs to be destroyed.
-        This method is responsible for cleaning up and releasing all resources used by the task,
-        including but not limited to:
-        - Closing network connections
-        - Freeing memory
-        - Cleaning up temporary files
-        - Stopping background processes etc.
+        """Close task-runner handles without deleting persisted providers.
+
+        Destructive sandbox lifecycle belongs to ``SandboxProvisioner`` under
+        the session's distributed lease. This legacy method remains only for
+        compatibility with task backends that still call ``destroy``.
         """
+        ...
+
+    @abstractmethod
+    async def aclose(self) -> None:
+        """Close per-run client handles without deleting persisted resources."""
         ...
 
     @abstractmethod
@@ -43,6 +51,22 @@ class TaskRunner(ABC):
         """
         ...
 
+
+class TaskRunnerFactory(ABC):
+    """Factory that rebuilds a TaskRunner from serializable parameters.
+
+    Task backends receive only JSON-serializable parameters when a task is
+    created, so that execution can happen in another process (e.g. a Celery
+    worker). The factory is responsible for reconstructing the runner with
+    all its live dependencies on the side that actually executes the task.
+    """
+
+    @abstractmethod
+    async def create_runner(self, params: Dict[str, Any]) -> TaskRunner:
+        """Create a task runner from serializable parameters."""
+        ...
+
+
 class Task(Protocol):
     """Protocol defining the interface for task management operations."""
     
@@ -50,11 +74,24 @@ class Task(Protocol):
         """Run a task."""
         ...
     
-    def cancel(self) -> bool:
+    async def cancel(self) -> bool:
         """Cancel a task.
 
         Returns:
             bool: True if the task is cancelled, False otherwise
+        """
+        ...
+
+    async def wait_for_done(self, timeout_seconds: float) -> bool:
+        """Wait for the execution side to acknowledge completion.
+
+        Cancellation is only a request for remote task backends.  Callers
+        that are about to release resources owned by a task must wait for
+        this acknowledgement first so a still-running worker cannot access a
+        sandbox after it has been destroyed.
+
+        Returns:
+            bool: ``True`` when the task is done, ``False`` on timeout.
         """
         ...
     
@@ -73,8 +110,7 @@ class Task(Protocol):
         """Task ID."""
         ...
     
-    @property
-    def done(self) -> bool:
+    async def is_done(self) -> bool:
         """Check if the task is done.
 
         Returns:
@@ -83,7 +119,12 @@ class Task(Protocol):
         ...
     
     @classmethod
-    def get(cls, task_id: str) -> Optional["Task"]:
+    def set_runner_factory(cls, factory: TaskRunnerFactory) -> None:
+        """Register the factory used to rebuild task runners on the execution side."""
+        ...
+    
+    @classmethod
+    async def get(cls, task_id: str) -> Optional["Task"]:
         """Get a task by its ID.
 
         Returns:
@@ -92,15 +133,22 @@ class Task(Protocol):
         ...
     
     @classmethod
-    def create(cls, runner: TaskRunner) -> "Task":
-        """Create a new task instance with the specified task runner.
+    def create(cls, params: Dict[str, Any]) -> "Task":
+        """Create a new task instance from serializable runner parameters.
 
         Args:
-            runner (TaskRunner): The task runner that will execute this task
+            params (Dict[str, Any]): JSON-serializable parameters used by the
+                registered TaskRunnerFactory to rebuild the runner where the
+                task is executed.
 
         Returns:
             Task: New task instance
         """
+        ...
+
+    @classmethod
+    def recover(cls, task_id: str, params: Dict[str, Any]) -> "Task":
+        """Reconstruct a handle for persisted streams after a process restart."""
         ...
 
     @classmethod

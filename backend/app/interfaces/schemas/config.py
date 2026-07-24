@@ -2,7 +2,6 @@ from pydantic import BaseModel
 
 
 class ModelOptionResponse(BaseModel):
-    """Model option exposed to the frontend model picker."""
     id: str
     label: str
     model_name: str
@@ -13,6 +12,7 @@ class ModelOptionResponse(BaseModel):
 class ClientConfigResponse(BaseModel):
     """Client runtime configuration response schema"""
     auth_provider: str
+    registration_enabled: bool
     sub2api_login_url: str | None = None
     sub2api_console_url: str | None = None
     sub2api_marketplace_url: str | None = None
@@ -23,3 +23,4 @@ class ClientConfigResponse(BaseModel):
     claw_enabled: bool
     default_model: ModelOptionResponse
     available_models: list[ModelOptionResponse]
+    supported_byok_providers: list[str]

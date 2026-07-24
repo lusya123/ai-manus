@@ -135,13 +135,13 @@ async def download_file(path: str):
     Download file using FileResponse
     """
     # Check if file exists (this will raise appropriate exception if not found)
-    file_service.ensure_file(path)
+    safe_path = file_service.ensure_file(path)
     
     # Determine filename from path
     filename = path.split('/')[-1]
     
     return FileResponse(
-        path=path,
+        path=safe_path,
         filename=filename,
         media_type='application/octet-stream'
     )

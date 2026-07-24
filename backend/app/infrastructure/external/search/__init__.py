@@ -61,7 +61,7 @@ def get_search_engine() -> Optional[SearchEngine]:
             logger.warning("Serper Search Engine not initialized: missing API key (SERPER_API_KEY)")
     elif settings.search_provider == "custom":
         if settings.search_api_url:
-            logger.info(f"Initializing Custom Search Engine (url={settings.search_api_url})")
+            logger.info("Initializing Custom Search Engine")
             return CustomSearchEngine(
                 api_url=settings.search_api_url,
                 api_key=settings.search_api_key or "",

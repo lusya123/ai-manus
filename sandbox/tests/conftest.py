@@ -29,7 +29,10 @@ def _load_root_env_value(key: str) -> str | None:
 
 
 # Base URL for API testing
-BASE_URL = f"http://localhost:{os.getenv('SANDBOX_API_PORT') or _load_root_env_value('SANDBOX_API_PORT') or '8080'}"
+BASE_URL = (
+    "http://localhost:"
+    f"{os.getenv('SANDBOX_HOST_API_PORT') or _load_root_env_value('SANDBOX_HOST_API_PORT') or '8080'}"
+)
 
 @pytest.fixture
 def client():

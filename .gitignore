@@ -125,4 +125,10 @@ mcp.json
 !frontend/src/lib/
 
 uv.lock
+!backend/uv.lock
+!sandbox/uv.lock
 specs
+
+# AgentBay 联调临时工作区(不入库)
+.agentbay-work/
+.gstack/

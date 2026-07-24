@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.v1 import shell, supervisor, file, proxy
+from app.api.v1 import file, proxy, shell, supervisor
 
 api_router = APIRouter()
 api_router.include_router(shell.router, prefix="/shell", tags=["shell"])

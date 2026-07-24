@@ -6,6 +6,7 @@ from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
 from app.core.config import get_settings
 from app.domain.models.tool_result import ToolResult
+from app.domain.utils.error_reporting import safe_exception_summary
 import logging
 
 # Set up logger for this module
@@ -13,11 +14,17 @@ logger = logging.getLogger(__name__)
 
 class PlaywrightBrowser:
     """Playwright client that provides specific implementation of browser operations"""
+
+    _MAX_CLEANUP_FAILURE_DETAILS = 8
     
     def __init__(self, cdp_url: str):
         self.browser: Optional[Browser] = None
         self.page: Optional[Page] = None
         self.playwright = None
+        # A page close can fail after its parent browser has closed.  Retain
+        # that exact handle so the runner's cleanup bundle can retry it
+        # without repeating already-successful browser/playwright closes.
+        self._cleanup_pages: List[Page] = []
         self.settings = get_settings()
         kwargs = dict(
             model=self.settings.model_name,
@@ -69,50 +76,122 @@ class PlaywrightBrowser:
                 
                 # Return error if maximum retry count is reached
                 if attempt == max_retries - 1:
-                    logger.error(f"Initialization failed (retried {max_retries} times): {e}")
+                    logger.error(
+                        "Browser initialization failed after %d attempts: %s",
+                        max_retries,
+                        safe_exception_summary(e),
+                    )
                     return False
                 
                 # Otherwise increase waiting time (exponential backoff strategy)
                 retry_delay = min(retry_delay * 2, 10)  # Maximum wait 10 seconds
-                logger.warning(f"Initialization failed, will retry in {retry_delay} seconds: {e}")
+                logger.warning(
+                    "Browser initialization failed; retrying in %s seconds: %s",
+                    retry_delay,
+                    safe_exception_summary(e),
+                )
                 await asyncio.sleep(retry_delay)
 
     async def cleanup(self):
-        """Clean up Playwright resources, first close all tabs, then close the browser"""
-        try:
-            # If browser exists, first close all tabs
-            if self.browser:
-                # Get all contexts
-                contexts = self.browser.contexts
-                if contexts:
-                    for context in contexts:
-                        # Get all pages in the context
+        """Best-effort every layer while retaining handles with unknown outcomes.
+
+        The runner cleanup bundle retries this method when it raises.  Each
+        successful layer is cleared immediately, so a retry cannot double
+        close it; a failed or cancelled layer keeps its exact handle.
+        """
+        failure_count = 0
+        failure_details: List[str] = []
+
+        def record_failure(resource: str, error: Exception) -> None:
+            nonlocal failure_count
+            failure_count += 1
+            if len(failure_details) < self._MAX_CLEANUP_FAILURE_DETAILS:
+                failure_details.append(
+                    f"{resource}={safe_exception_summary(error)}"
+                )
+
+        cleanup_pages = list(getattr(self, "_cleanup_pages", []))
+
+        def remember_page(page: Page) -> None:
+            if not any(candidate is page for candidate in cleanup_pages):
+                cleanup_pages.append(page)
+
+        if self.page is not None:
+            remember_page(self.page)
+
+        browser = self.browser
+        if browser is not None:
+            try:
+                contexts = browser.contexts
+            except Exception as error:
+                record_failure("browser-contexts", error)
+            else:
+                for context in contexts:
+                    try:
                         pages = context.pages
-                        # Close all pages
-                        for page in pages:
-                            # Avoid closing self.page multiple times
-                            if page != self.page or (self.page and not self.page.is_closed()):
-                                await page.close()
-            
-            # Ensure the current page is closed (if it exists and is not closed)
-            if self.page and not self.page.is_closed():
-                await self.page.close()
-                
-            # Close the browser
-            if self.browser:
-                await self.browser.close()
-                
-            # Stop playwright
-            if self.playwright:
-                await self.playwright.stop()
-                
-        except Exception as e:
-            logger.error(f"Error occurred when cleaning up resources: {e}")
-        finally:
-            # Reset references
-            self.page = None
-            self.browser = None
-            self.playwright = None
+                    except Exception as error:
+                        record_failure("browser-pages", error)
+                        continue
+                    for page in pages:
+                        remember_page(page)
+
+        # Publish every discovered handle before the first await.  If this
+        # cleanup task is cancelled, the coordinator can retry all resources
+        # whose outcomes are not known.
+        self._cleanup_pages = cleanup_pages
+        for page in tuple(cleanup_pages):
+            try:
+                if not page.is_closed():
+                    await page.close()
+            except Exception as error:
+                record_failure("page", error)
+            else:
+                self._cleanup_pages = [
+                    candidate
+                    for candidate in self._cleanup_pages
+                    if candidate is not page
+                ]
+                if self.page is page:
+                    self.page = None
+
+        # Parent layers are independent best-effort cleanup.  Their success
+        # must not be hidden by a page failure, and their references are only
+        # cleared after a known successful outcome.
+        if browser is not None:
+            try:
+                await browser.close()
+            except Exception as error:
+                record_failure("browser", error)
+            else:
+                if self.browser is browser:
+                    self.browser = None
+
+        playwright = self.playwright
+        if playwright is not None:
+            try:
+                await playwright.stop()
+            except Exception as error:
+                record_failure("playwright", error)
+            else:
+                if self.playwright is playwright:
+                    self.playwright = None
+
+        if failure_count:
+            omitted = failure_count - len(failure_details)
+            detail = ", ".join(failure_details)
+            if omitted:
+                detail = f"{detail}, +{omitted} more"
+            logger.error(
+                "Playwright cleanup incomplete: failure_count=%d failures=%s",
+                failure_count,
+                detail,
+            )
+            # Do not chain the provider exception: exception messages can
+            # contain signed CDP URLs.  The type-only summaries above are
+            # sufficient for diagnosis and bounded retry logging.
+            raise RuntimeError(
+                f"Playwright cleanup incomplete ({failure_count}: {detail})"
+            ) from None
     
     async def _ensure_browser(self):
         """Ensure the browser is started"""
@@ -422,7 +501,10 @@ class PlaywrightBrowser:
             try:
                 await self.page.goto(url, timeout=timeout)
             except Exception as e:
-                logger.warning(f"Failed to navigate to {url}: {str(e)}")
+                logger.warning(
+                    "Browser navigation failed: %s",
+                    safe_exception_summary(e),
+                )
             return ToolResult(
                 success=True,
                 data={

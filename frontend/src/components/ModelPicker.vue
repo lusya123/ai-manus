@@ -66,7 +66,7 @@ const selectedOptionTitle = computed(() => {
   return selectedOption.value.label;
 });
 
-function handleChange(value: any) {
+function handleChange(value: unknown) {
   if (typeof value === 'string') {
     emit('update:selectedModelId', value);
   }

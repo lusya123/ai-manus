@@ -8,7 +8,7 @@
       </div>
     </div>
     <a
-      v-if="previewSrc"
+      v-if="previewSrc && canOpenExternally"
       :href="previewSrc"
       target="_blank"
       rel="noopener noreferrer"
@@ -24,9 +24,19 @@
       :key="previewSrc"
       :src="previewSrc"
       class="w-full h-full border-0 bg-white"
-      sandbox="allow-downloads allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts"
+      sandbox="allow-downloads allow-forms allow-scripts"
       referrerpolicy="no-referrer"
     />
+    <div v-else-if="previewError" class="h-full flex flex-col gap-3 items-center justify-center text-sm text-[var(--text-tertiary)]">
+      <span>{{ t('Preview unavailable') }}</span>
+      <button
+        type="button"
+        class="h-8 px-3 rounded-lg border border-[var(--border-btn-main)] text-[var(--text-primary)] hover:bg-[var(--fill-tsp-white-light)]"
+        @click="loadPreview"
+      >
+        {{ t('Retry') }}
+      </button>
+    </div>
     <div v-else class="h-full flex items-center justify-center text-sm text-[var(--text-tertiary)]">
       {{ t('Preparing preview') }}
     </div>
@@ -50,6 +60,9 @@ const props = defineProps<{
 
 const { t } = useI18n();
 const previewSrc = ref('');
+const previewError = ref(false);
+const isProxiedPreview = ref(false);
+let previewRequestId = 0;
 
 const rawUrl = computed(() => {
   return props.toolContent?.content?.url || props.toolContent?.args?.url || '';
@@ -57,6 +70,15 @@ const rawUrl = computed(() => {
 
 const previewTitle = computed(() => {
   return props.toolContent?.content?.title || props.toolContent?.args?.title || rawUrl.value || 'Preview';
+});
+
+const canOpenExternally = computed(() => {
+  if (!previewSrc.value || isProxiedPreview.value) return false;
+  try {
+    return new URL(previewSrc.value, window.location.origin).origin !== window.location.origin;
+  } catch {
+    return false;
+  }
 });
 
 const withApiHost = (url: string) => {
@@ -67,16 +89,34 @@ const withApiHost = (url: string) => {
 };
 
 const loadPreview = async () => {
+  const requestId = ++previewRequestId;
   previewSrc.value = '';
+  previewError.value = false;
+  isProxiedPreview.value = false;
   if (!props.sessionId || !rawUrl.value) {
     return;
   }
 
   try {
-    const signed = await createPreviewUrl(props.sessionId, rawUrl.value);
-    previewSrc.value = withApiHost(signed.signed_url);
+    const signed = await createPreviewUrl(props.sessionId, rawUrl.value, {
+      publicAccess: props.isShare,
+    });
+    if (requestId === previewRequestId) {
+      const resolvedUrl = withApiHost(signed.signed_url);
+      previewSrc.value = resolvedUrl;
+      try {
+        isProxiedPreview.value = /\/api\/v1\/sessions\/[^/]+\/preview\//.test(
+          new URL(resolvedUrl, window.location.origin).pathname,
+        );
+      } catch {
+        isProxiedPreview.value = true;
+      }
+    }
   } catch (error) {
     console.error('Failed to create preview URL:', error);
+    if (requestId === previewRequestId) {
+      previewError.value = true;
+    }
   }
 };
 

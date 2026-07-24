@@ -19,13 +19,19 @@
     2. Web's NoVNC component forwards to Sandbox through Server's WebSocket Forward, enabling browser viewing.
 - Other tools: Other tools work on similar principles.
 
+### Docker Network Boundary
+
+- `manus-network` is the runtime network for Frontend, Backend, and Sandbox/Claw containers that execute user/model-driven code.
+- `manus-data-network` is an `internal` data network used only by Backend, MongoDB, and Redis.
+- Backend is the sole application service attached to both networks. Sandbox and Claw must never join the data network, preventing arbitrary shell/tool code from bypassing Backend to read or mutate users, sessions, revocation state, or task state.
+
 ## Claw (Manus × Claw)
 
 Claw is AI Manus's deeply integrated [OpenClaw](https://github.com/anthropics/openclaw) AI assistant module, delivering the **Manus × Claw** experience as a standalone chat interface.
 
 **Architecture Overview:**
 
-- **claw/ container image:** Built on `ghcr.io/openclaw/openclaw:latest`, includes the `manus-claw` Node plugin, and runs the OpenClaw Gateway; production defaults to persistent containers, with TTL available only as an explicit optional policy.
+- **claw/ container image:** Built on `ghcr.io/openclaw/openclaw:latest`, includes the `manus-claw` Node plugin, and runs the OpenClaw Gateway; containers are persistent by default and TTL is an explicit optional policy.
 - **Backend integration:** Server dynamically creates per-user Claw Docker containers (or connects to a fixed dev instance), manages state in the MongoDB `claws` collection, merges MongoDB history with OpenClaw `.jsonl` session files, and exposes REST + WebSocket + file upload/resolve + OpenAI-compatible LLM proxy endpoints.
 - **Frontend integration:** When `claw_enabled` is turned on, a "Manus Claw" entry appears in the sidebar, routing to the `/chat/claw` page with real-time chat over WebSocket.
 - **manus-claw plugin:** Bridges the OpenClaw Gateway with the Manus backend, providing an HTTP server, the `manus_upload_file` tool, file resolution, and session history reads.

@@ -15,6 +15,9 @@ class _AgentRepo:
     async def save(self, agent):
         self.saved.append(agent)
 
+    async def delete(self, agent_id):
+        self.saved = [agent for agent in self.saved if agent.id != agent_id]
+
 
 @pytest.fixture(autouse=True)
 def settings(monkeypatch):
@@ -22,6 +25,13 @@ def settings(monkeypatch):
     monkeypatch.setenv("API_BASE", "https://env.example")
     monkeypatch.setenv("MODEL_NAME", "env-model")
     monkeypatch.setenv("MODEL_PROVIDER", "openai")
+    monkeypatch.setenv("JWT_SECRET_KEY", "test-only-model-credential-secret-32-bytes")
+    monkeypatch.setattr(
+        "app.infrastructure.external.llm.security.socket.getaddrinfo",
+        lambda *args, **kwargs: [
+            (2, 1, 6, "", ("93.184.216.34", args[1]))
+        ],
+    )
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
@@ -52,6 +62,7 @@ async def test_create_agent_uses_per_session_sub2api_model_config():
     assert agent.api_base == "https://xuedingtoken.com"
     assert agent.model_name == "claude-opus-4-6"
     assert agent.model_provider == "anthropic"
+    assert agent.is_byok is True
     assert repo.saved == [agent]
 
 
@@ -83,7 +94,8 @@ async def test_create_agent_resolves_configured_model_id(monkeypatch):
 
     agent = await service._create_agent(SimpleNamespace(model_id="sonnet-4-6"))
 
-    assert agent.api_key == "sk-sonnet"
+    assert agent.api_key is None
+    assert agent.model_id == "sonnet-4-6"
     assert agent.api_base == "https://anthropic.example/v1"
     assert agent.model_name == "claude-sonnet-4-6"
     assert agent.model_provider == "anthropic"
@@ -118,7 +130,8 @@ async def test_create_agent_falls_back_to_environment_model_config():
 
     agent = await service._create_agent(None)
 
-    assert agent.api_key == "env-key"
+    assert agent.api_key is None
+    assert agent.is_byok is False
     assert agent.api_base == "https://env.example"
     assert agent.model_name == "env-model"
     assert agent.model_provider == "openai"

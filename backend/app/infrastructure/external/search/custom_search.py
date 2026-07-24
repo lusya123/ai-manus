@@ -14,8 +14,7 @@ Authentication modes
   request.  Set ``SEARCH_API_KEY_HEADER=X-API-KEY`` and leave the prefix empty for
   services like Serper.dev / Brave.
 - Query-param: pass the key as a URL parameter by setting
-  ``SEARCH_API_KEY_PARAM=api_key`` (used e.g. by SerpAPI). When this is set,
-  header authentication is skipped.
+  ``SEARCH_API_KEY_PARAM=api_key`` (used e.g. by SerpAPI).
 
 Response field mapping
 ----------------------
@@ -58,6 +57,7 @@ import httpx
 from app.domain.external.search import SearchEngine
 from app.domain.models.search import SearchResultItem, SearchResults
 from app.domain.models.tool_result import ToolResult
+from app.domain.utils.error_reporting import safe_exception_summary
 
 logger = logging.getLogger(__name__)
 
@@ -174,8 +174,9 @@ class CustomSearchEngine(SearchEngine):
             raw_results = _get_nested(data, self.result_field)
             if not isinstance(raw_results, list):
                 logger.warning(
-                    f"Custom search: expected list at field '{self.result_field}', "
-                    f"got {type(raw_results).__name__}. Response keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}"
+                    "Custom search response did not contain a result list: "
+                    "response_type=%s",
+                    type(raw_results).__name__,
                 )
                 raw_results = []
 
@@ -200,7 +201,10 @@ class CustomSearchEngine(SearchEngine):
             return ToolResult(success=True, data=results)
 
         except Exception as e:
-            logger.error(f"Custom Search failed (url={self.api_url}): {e}")
+            error_summary = safe_exception_summary(e)
+            logger.error(
+                "Custom Search failed: %s", error_summary
+            )
             error_results = SearchResults(
                 query=query,
                 date_range=date_range,
@@ -209,7 +213,7 @@ class CustomSearchEngine(SearchEngine):
             )
             return ToolResult(
                 success=False,
-                message=f"Custom Search failed: {e}",
+                message=f"Custom Search failed: {error_summary}",
                 data=error_results,
             )
 

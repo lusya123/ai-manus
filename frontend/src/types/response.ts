@@ -17,7 +17,7 @@ export interface GetSessionResponse {
     status: SessionStatus;
     events: AgentSSEEvent[];
     is_shared: boolean;
-    model_config: SessionModelConfig | null;
+    model_config?: SessionModelConfig | null;
 }
 
 export interface SessionModelConfig {

@@ -11,11 +11,6 @@ def build_runtime_environment_prompt(sandbox: Any = None) -> str:
     """Build deployment/runtime context that can change per environment."""
     settings = get_settings()
 
-    sandbox_id = getattr(sandbox, "id", None) if sandbox else None
-    sandbox_api_url = getattr(sandbox, "base_url", None) if sandbox else None
-    sandbox_cdp_url = getattr(sandbox, "cdp_url", None) if sandbox else None
-    sandbox_vnc_url = getattr(sandbox, "vnc_url", None) if sandbox else None
-
     lines = [
         "<runtime_environment>",
         "Deployment:",
@@ -34,12 +29,10 @@ def build_runtime_environment_prompt(sandbox: Any = None) -> str:
         _line("Claw internal/container URL", settings.claw_internal_url),
         "",
         "Current sandbox:",
-        _line("Sandbox ID", sandbox_id),
-        _line("Sandbox API URL used by backend", sandbox_api_url),
+        _line("Sandbox provider", settings.sandbox_provider),
+        "- Sandbox gateway addresses and capability tokens are managed by the backend and are intentionally not exposed to the model.",
         _line("Sandbox API port", settings.sandbox_api_port),
-        _line("Sandbox Chrome CDP URL", sandbox_cdp_url),
         _line("Sandbox Chrome CDP port", settings.sandbox_cdp_port),
-        _line("Sandbox VNC URL", sandbox_vnc_url),
         _line("Sandbox VNC port", settings.sandbox_vnc_port),
         "",
         "Networking rules:",

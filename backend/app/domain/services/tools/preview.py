@@ -1,14 +1,18 @@
 from typing import Optional
 
 from app.domain.models.tool_result import ToolResult
-from app.domain.services.tools.base import BaseToolkit
-from langchain.tools import tool
+from app.domain.services.tools.base import BaseToolkit, tool
 
 
 class PreviewToolkit(BaseToolkit):
     """Tool class for showing user-facing interactive web deliverables."""
 
     name: str = "preview"
+    instructions: str = """
+- Use preview only for an interactive website, app, dashboard, prototype, game, or local project the user should inspect
+- Do not preview ordinary research pages, documentation, login flows, or third-party pages used only by the agent
+- Start local deliverable servers on a reachable host such as 0.0.0.0, verify the URL, then preview it
+"""
 
     def __init__(self):
         super().__init__()

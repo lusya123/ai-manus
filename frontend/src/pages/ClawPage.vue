@@ -6,15 +6,7 @@
       <div
         v-if="hasClaw"
         class="sm:min-w-[390px] flex flex-row items-center justify-between pt-3 pb-1 gap-1 sticky top-0 z-10 bg-[var(--background-gray-main)] flex-shrink-0">
-        <div class="flex items-center flex-1">
-          <div
-            v-if="!isLeftPanelShow"
-            class="flex h-7 w-7 items-center justify-center cursor-pointer rounded-md hover:bg-[var(--fill-tsp-gray-main)]"
-            @click="toggleLeftPanel"
-          >
-            <PanelLeft class="size-5 text-[var(--icon-secondary)]" />
-          </div>
-        </div>
+        <div class="flex items-center flex-1"></div>
         <div class="max-w-full sm:max-w-[768px] sm:min-w-[390px] flex w-full flex-col gap-[4px] overflow-hidden">
           <div class="text-[var(--text-primary)] text-lg font-medium w-full flex flex-row items-center justify-between flex-1 min-w-0 gap-2">
             <div class="flex flex-row items-center gap-[6px] flex-1 min-w-0">
@@ -137,11 +129,11 @@
             </button>
             <ChatBox
               v-model="inputMessage"
+              v-model:attachments="attachments"
               :rows="1"
               :isRunning="false"
               :hideStopButton="true"
               :allowSendFilesOnly="true"
-              :attachments="attachments"
               @submit="handleSubmit"
             />
           </div>
@@ -154,7 +146,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue';
-import { PanelLeft, Code, MessageSquarePlus, ArrowDown } from 'lucide-vue-next';
+import { Code, MessageSquarePlus, ArrowDown } from 'lucide-vue-next';
 import { useI18n } from 'vue-i18n';
 import SimpleBar from '../components/SimpleBar.vue';
 import ChatBox from '../components/ChatBox.vue';
@@ -162,7 +154,6 @@ import ChatMessage from '../components/ChatMessage.vue';
 import LoadingIndicator from '../components/ui/LoadingIndicator.vue';
 import ClawIcon from '../components/icons/ClawIcon.vue';
 import openclawColorImage from '../assets/openclaw-color.png';
-import { useLeftPanel } from '../composables/useLeftPanel';
 import { useFilePanel } from '../composables/useFilePanel';
 import { useDialog } from '../composables/useDialog';
 import {
@@ -175,7 +166,6 @@ import type { FileInfo } from '../api/file';
 import { showErrorToast } from '../utils/toast';
 
 const { t } = useI18n();
-const { isLeftPanelShow, toggleLeftPanel } = useLeftPanel();
 const { hideFilePanel } = useFilePanel();
 const { showConfirmDialog } = useDialog();
 
@@ -237,7 +227,11 @@ const handleExpired = async () => {
   streamingAssistantIdx.value = -1;
   thinkingMessageIdx.value = -1;
   stopStatusPolling();
-  try { await deleteClaw(); } catch {}
+  try {
+    await deleteClaw();
+  } catch {
+    // The claw may already be gone once it expires; nothing to clean up
+  }
   clawData.value = null;
   clawStatus.value = 'stopped';
   messages.value = [];
@@ -337,9 +331,7 @@ const handleWSEvent = (chunk: ClawEvent) => {
   }
 
   if (chunk.type === 'thinking') {
-    if (streamingAssistantIdx.value >= 0 || !chunk.content) {
-      return;
-    }
+    if (streamingAssistantIdx.value >= 0 || !chunk.content) return;
     if (thinkingMessageIdx.value < 0) {
       thinkingMessageIdx.value = messages.value.length;
       messages.value.push({
@@ -348,7 +340,7 @@ const handleWSEvent = (chunk: ClawEvent) => {
       });
     }
     const thinkingMessage = messages.value[thinkingMessageIdx.value];
-    if (thinkingMessage) {
+    if (thinkingMessage?.type === 'thinking') {
       (thinkingMessage.content as MessageContent).content += chunk.content;
     }
     return;
@@ -384,7 +376,13 @@ const handleWSEvent = (chunk: ClawEvent) => {
   if (chunk.type === 'status') {
     const newStatus = chunk.status!;
     clawStatus.value = newStatus;
-    if (newStatus === 'stopped' || newStatus === 'error') {
+    if (newStatus === 'destroying') {
+      clawWS?.disconnect();
+      clawWS = null;
+      isLoadingClaw.value = true;
+      startStatusPolling();
+    }
+    if (newStatus === 'destroying' || newStatus === 'stopped' || newStatus === 'error') {
       streamingAssistantIdx.value = -1;
       removeThinkingMessage();
       isWaitingResponse.value = false;
@@ -434,7 +432,7 @@ const hasStreamingContent = computed(() => {
 const hasThinkingContent = computed(() => {
   if (thinkingMessageIdx.value < 0) return false;
   const msg = messages.value[thinkingMessageIdx.value];
-  return msg && msg.type === 'thinking' && (msg.content as MessageContent).content.length > 0;
+  return Boolean(msg?.type === 'thinking' && (msg.content as MessageContent).content.length > 0);
 });
 
 const removeThinkingMessage = () => {
@@ -442,9 +440,7 @@ const removeThinkingMessage = () => {
   if (index < 0) return;
   if (messages.value[index]?.type === 'thinking') {
     messages.value.splice(index, 1);
-    if (streamingAssistantIdx.value > index) {
-      streamingAssistantIdx.value -= 1;
-    }
+    if (streamingAssistantIdx.value > index) streamingAssistantIdx.value -= 1;
   }
   thinkingMessageIdx.value = -1;
 };
@@ -486,7 +482,7 @@ const loadClaw = async () => {
       return;
     }
 
-    if (claw.status === 'creating') {
+    if (claw.status === 'creating' || claw.status === 'destroying') {
       startStatusPolling();
       return;
     }
@@ -534,9 +530,22 @@ const startStatusPolling = () => {
         await deleteClaw().catch(() => {});
         clawData.value = null;
         isLoadingClaw.value = false;
+      } else if (claw.status === 'stopped') {
+        stopStatusPolling();
+        clawData.value = null;
+        isLoadingClaw.value = false;
+      } else {
+        isLoadingClaw.value = true;
       }
-    } catch {
-      stopStatusPolling();
+    } catch (err: any) {
+      if (err?.code === 404 || err?.code === 40400) {
+        stopStatusPolling();
+        clawData.value = null;
+        clawStatus.value = 'stopped';
+        isLoadingClaw.value = false;
+      } else {
+        console.error('Failed to poll claw status:', err);
+      }
     }
   }, 3000);
 };

@@ -41,6 +41,7 @@ _HIDDEN_TOKEN_BODY_RE = re.compile(
     r"(?:<\|(?:end|stop)_of_(?:thinking|thought|reasoning)\|>|$)",
     re.IGNORECASE | re.DOTALL,
 )
+_DROP_VALUE = object()
 
 
 def sanitize_model_text(text: str) -> str:
@@ -127,8 +128,16 @@ def _normalize_model_dict(value: dict[str, Any]) -> str:
     value_type = value.get("type")
     if value_type in HIDDEN_CONTENT_TYPES:
         return ""
+
+    # Unknown typed blocks are forward-compatible model output, not
+    # necessarily private reasoning.  Preserve them as redacted JSON instead
+    # of silently deleting data from providers that introduce a new block
+    # type.  Explicitly hidden block types above remain fully suppressed.
     if value_type and value_type not in VISIBLE_CONTENT_TYPES:
-        return ""
+        redacted = _redact_hidden_payload(value)
+        if redacted is _DROP_VALUE:
+            return ""
+        return json.dumps(redacted, ensure_ascii=False)
 
     if isinstance(value.get("text"), str):
         return sanitize_model_text(value["text"])
@@ -136,10 +145,40 @@ def _normalize_model_dict(value: dict[str, Any]) -> str:
         return normalize_model_content(value["content"])
     if "message" in value and isinstance(value["message"], (str, list, dict)):
         return normalize_model_content(value["message"])
-    if any(key in value for key in _HIDDEN_KEYS):
+    redacted = _redact_hidden_payload(value)
+    if redacted is _DROP_VALUE:
         return ""
+    return json.dumps(redacted, ensure_ascii=False)
 
-    return sanitize_model_text(json.dumps(value, ensure_ascii=False))
+
+def _redact_hidden_payload(value: Any) -> Any:
+    """Copy arbitrary JSON-like data while removing private reasoning.
+
+    This is used only when there is no known visible text/content projection.
+    It keeps unknown provider fields losslessly enough for display/debugging,
+    while recursively dropping hidden keys and hidden typed blocks.
+    """
+    if isinstance(value, dict):
+        if value.get("type") in HIDDEN_CONTENT_TYPES:
+            return _DROP_VALUE
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if key in _HIDDEN_KEYS:
+                continue
+            redacted = _redact_hidden_payload(item)
+            if redacted is not _DROP_VALUE:
+                result[key] = redacted
+        return result
+    if isinstance(value, list):
+        result = []
+        for item in value:
+            redacted = _redact_hidden_payload(item)
+            if redacted is not _DROP_VALUE:
+                result.append(redacted)
+        return result
+    if isinstance(value, str):
+        return sanitize_model_text(value)
+    return value
 
 
 def _should_parse_json_string(value: str) -> bool:

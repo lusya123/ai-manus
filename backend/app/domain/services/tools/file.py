@@ -1,13 +1,19 @@
 from typing import Optional, Dict, Any
 from app.domain.external.sandbox import Sandbox
-from app.domain.services.tools.base import BaseToolkit
+from app.domain.services.tools.base import BaseToolkit, tool
 from app.domain.models.tool_result import ToolResult
-from langchain.tools import tool
 
 class FileToolkit(BaseToolkit):
     """File tool class, providing file operation functions"""
 
     name: str = "file"
+    instructions: str = """
+- Prefer file tools over shell redirection to avoid escaping errors
+- Save useful intermediate results and keep different reference types separate
+- Only read text, code, or Markdown files; never read binary data as text
+- Put final user-facing files under /home/ubuntu/upload unless another absolute path was requested
+- Verify every deliverable exists and contains the expected content before attaching it
+"""
     
     def __init__(self, sandbox: Sandbox):
         """Initialize file tool class
@@ -18,7 +24,7 @@ class FileToolkit(BaseToolkit):
         super().__init__()
         self.sandbox = sandbox
         
-    @tool(parse_docstring=True)
+    @tool(parse_docstring=True, retryable=True)
     async def file_read(
         self,
         file: str,
@@ -49,8 +55,7 @@ class FileToolkit(BaseToolkit):
         content: str,
         append: Optional[bool] = False,
         leading_newline: Optional[bool] = False,
-        trailing_newline: Optional[bool] = False,
-        sudo: Optional[bool] = False
+        trailing_newline: Optional[bool] = False
     ) -> ToolResult:
         """Overwrite or append content to a file. Use for creating new files, appending content, or modifying existing files.
         
@@ -60,7 +65,6 @@ class FileToolkit(BaseToolkit):
             append: (Optional) Whether to use append mode
             leading_newline: (Optional) Whether to add a leading newline
             trailing_newline: (Optional) Whether to add a trailing newline
-            sudo: (Optional) Whether to use sudo privileges
         """
         # Prepare content
         final_content = content
@@ -76,7 +80,6 @@ class FileToolkit(BaseToolkit):
             append=append,
             leading_newline=False,  # Already handled in final_content
             trailing_newline=False,  # Already handled in final_content
-            sudo=sudo
         )
     
     @tool(parse_docstring=True)
@@ -84,8 +87,7 @@ class FileToolkit(BaseToolkit):
         self,
         file: str,
         old_str: str,
-        new_str: str,
-        sudo: Optional[bool] = False
+        new_str: str
     ) -> ToolResult:
         """Replace specified string in a file. Use for updating specific content in files or fixing errors in code.
         
@@ -93,17 +95,15 @@ class FileToolkit(BaseToolkit):
             file: Absolute path of the file to perform replacement on
             old_str: Original string to be replaced
             new_str: New string to replace with
-            sudo: (Optional) Whether to use sudo privileges
         """
         # Directly call sandbox's file_replace method
         return await self.sandbox.file_replace(
             file=file,
             old_str=old_str,
             new_str=new_str,
-            sudo=sudo
         )
     
-    @tool(parse_docstring=True)
+    @tool(parse_docstring=True, retryable=True)
     async def file_find_in_content(
         self,
         file: str,
@@ -124,7 +124,7 @@ class FileToolkit(BaseToolkit):
             sudo=sudo
         )
     
-    @tool(parse_docstring=True)
+    @tool(parse_docstring=True, retryable=True)
     async def file_find_by_name(
         self,
         path: str,
@@ -140,4 +140,4 @@ class FileToolkit(BaseToolkit):
         return await self.sandbox.file_find(
             path=path,
             glob_pattern=glob
-        ) 
+        )

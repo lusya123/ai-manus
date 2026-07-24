@@ -174,7 +174,7 @@ class RobustJsonParser(Runnable[AIMessage, AIMessage]):
     # ------------------------------------------------------------------
 
     def _promote_content_tool_use_blocks(self, message: AIMessage) -> AIMessage:
-        """Promote Anthropic tool_use content blocks when LangChain misses them."""
+        """Promote Anthropic ``tool_use`` blocks when LangChain misses them."""
         if message.tool_calls or not isinstance(message.content, list):
             return message
 
@@ -191,7 +191,11 @@ class RobustJsonParser(Runnable[AIMessage, AIMessage]):
             name = block.get("name")
             args = block.get("input")
             if isinstance(args, str):
-                args = self._stage1_partial_json(args) or self._stage2_json_markdown(args) or args
+                args = (
+                    self._stage1_partial_json(args)
+                    or self._stage2_json_markdown(args)
+                    or args
+                )
             if isinstance(name, str) and isinstance(args, dict):
                 tool_calls.append(
                     create_tool_call(name=name, args=args, id=block.get("id"))
@@ -208,7 +212,6 @@ class RobustJsonParser(Runnable[AIMessage, AIMessage]):
 
         if not tool_calls and not invalid_tool_calls:
             return message
-
         if tool_calls:
             logger.info(
                 "Promoted %d Anthropic tool_use content block(s) to tool_calls",

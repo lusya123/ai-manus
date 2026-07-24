@@ -256,13 +256,15 @@ class TestAuthRoutes:
         assert response.status_code == 200
         data = response.json()
         assert data["code"] == 0
-        assert "authenticated" in data["data"]
-        assert "auth_provider" in data["data"]
+        assert data["data"] == {"auth_provider": "password"}
 
     def test_get_current_user_info(self, client, authenticated_user):
         """Test get current user information"""
         url = f"{BASE_URL}/auth/me"
-        logger.info(f"authenticated_user: {authenticated_user}")
+        logger.info(
+            "Authenticated test user: %s",
+            authenticated_user["user_data"]["email"],
+        )
         headers = {"Authorization": f"Bearer {authenticated_user['access_token']}"}
         
         response = client.get(url, headers=headers)
@@ -334,7 +336,7 @@ class TestAuthRoutes:
         assert response.status_code == 200
         data = response.json()
         assert data["code"] == 0
-        assert data["data"]["message"] == "Logout successful"
+        assert data["data"] == {}
 
     def test_logout_unauthorized(self, client):
         """Test logout without authentication"""

@@ -1,13 +1,19 @@
 from typing import Optional
 from app.domain.external.search import SearchEngine
-from app.domain.services.tools.base import BaseToolkit
-from langchain.tools import tool
+from app.domain.services.tools.base import BaseToolkit, tool
 from app.domain.models.tool_result import ToolResult
 
 class SearchToolkit(BaseToolkit):
     """Search tool class, providing search engine interaction functions"""
 
     name: str = "search"
+    instructions: str = """
+- Prefer the dedicated search tool over visiting a search-engine results page
+- Snippets are not valid sources; open original pages with browser tools
+- Visit multiple original sources for comprehensive or important claims
+- Search one entity or attribute at a time with concise queries
+- Prefer authoritative current sources over internal model knowledge
+"""
     
     def __init__(self, search_engine: SearchEngine):
         """Initialize search tool class
@@ -18,7 +24,7 @@ class SearchToolkit(BaseToolkit):
         super().__init__()
         self.search_engine = search_engine
     
-    @tool(parse_docstring=True)
+    @tool(parse_docstring=True, retryable=True)
     async def info_search_web(
         self,
         query: str,
@@ -30,4 +36,4 @@ class SearchToolkit(BaseToolkit):
             query: Search query in Google search style, using 3-5 keywords.
             date_range: (Optional) Time range filter for search results.
         """
-        return await self.search_engine.search(query, date_range) 
+        return await self.search_engine.search(query, date_range)

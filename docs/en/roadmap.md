@@ -6,7 +6,7 @@
 
  * [x] Integrated [OpenClaw](https://github.com/anthropics/openclaw) AI assistant
  * [x] One-click deployment with per-user isolated containers
- * [x] Persistent containers with optional expiry policy
+ * [x] Persistent containers with optional expiry policies
  * [x] Full chat history (MongoDB + OpenClaw session merge)
  * [x] File upload and download
  * [x] OpenAI-compatible LLM proxy
@@ -40,7 +40,8 @@
  * [ ] Support Windows & mobile access
  * [x] Support Bing, Google, Tavily and other search providers
  * [ ] Support Alibaba Cloud and other file storage providers
- * [ ] Support e2b and other sandbox providers
+ * [x] Support Alibaba Cloud Wuying AgentBay sandboxes
+ * [ ] Support e2b and more sandbox providers
  * [ ] Support mem0 memory providers
  * [ ] Replace background tasks with celery tasks
  * [ ] Enterprise-level security construction for sandbox

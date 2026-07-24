@@ -33,4 +33,24 @@ class ServerError(AppException):
 
 class UnauthorizedError(AppException):
     def __init__(self, msg: str = "Authentication required"):
-        super().__init__(code=401, msg=msg, status_code=401) 
+        super().__init__(code=401, msg=msg, status_code=401)
+
+
+class ForbiddenError(AppException):
+    def __init__(self, msg: str = "Access forbidden"):
+        super().__init__(code=403, msg=msg, status_code=403)
+
+
+class ConflictError(AppException):
+    def __init__(self, msg: str = "Resource is busy or conflicted"):
+        super().__init__(code=409, msg=msg, status_code=409)
+
+
+class ServiceUnavailableError(AppException):
+    def __init__(self, msg: str = "Service temporarily unavailable"):
+        super().__init__(code=503, msg=msg, status_code=503)
+
+
+class TooManyRequestsError(AppException):
+    def __init__(self, msg: str = "Too many requests"):
+        super().__init__(code=429, msg=msg, status_code=429)

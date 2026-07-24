@@ -9,15 +9,13 @@ RUN apt-get update && apt-get install -y curl
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y nodejs
 
-# Install uv
-RUN pip install uv
+# Match CI and Sandbox so lockfile installation remains reproducible across
+# local builds, release builds, and rollback rebuilds.
+RUN pip install uv==0.7.12
 
-# Configure uv to use Aliyun mirror
-ENV UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
-
-# Install dependencies
-COPY pyproject.toml ./
-RUN uv sync --no-dev
+# Install the exact dependency graph reviewed in source control.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
 
 # Copy project files
 COPY . .
@@ -28,5 +26,6 @@ ENV PYTHONPATH=/app
 # Expose port
 EXPOSE 8000
 
-# Start command
-CMD ["uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"] 
+# Run the environment resolved at image-build time without a runtime dependency
+# sync. Production startup must not fetch or add the default dev group.
+CMD ["/app/.venv/bin/uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--ws-max-size", "131072"]

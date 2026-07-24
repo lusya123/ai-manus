@@ -13,10 +13,237 @@ import httpx
 
 from app.application.services.claw_service import ClawService
 from app.core.config import get_settings
+from app.infrastructure.external.llm.security import provider_api_base, provider_api_key
+from app.domain.utils.error_reporting import safe_exception_summary
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["openai-proxy"])
+
+
+# This endpoint is reachable by a capability injected into a Claw runtime.
+# Keep hard structural bounds in addition to the deployment's MAX_TOKENS cap:
+# an accidentally exposed runtime key must not become an unbounded JSON/parser
+# or upstream fan-out primitive.
+CLAW_PROXY_MAX_REQUEST_BYTES = 1024 * 1024
+CLAW_PROXY_MAX_MESSAGES = 256
+CLAW_PROXY_MAX_TOOLS = 128
+CLAW_PROXY_MAX_STOP_SEQUENCES = 16
+
+_ALLOWED_CHAT_COMPLETION_FIELDS = {
+    "messages",
+    "model",
+    "stream",
+    "stream_options",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "temperature",
+    "top_p",
+    "frequency_penalty",
+    "presence_penalty",
+    "stop",
+    "max_tokens",
+    "max_completion_tokens",
+    "response_format",
+    "seed",
+    "n",
+}
+_MULTI_COMPLETION_FIELDS = (
+    "n",
+    "best_of",
+    "candidate_count",
+    "num_return_sequences",
+)
+
+
+class _ProxyRequestError(ValueError):
+    def __init__(self, status_code: int, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+        self.message = message
+
+
+async def _read_limited_json_body(request: Request) -> dict:
+    """Decode one JSON object without buffering an unbounded request body."""
+
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            declared_length = int(content_length)
+        except ValueError as exc:
+            raise _ProxyRequestError(
+                status.HTTP_400_BAD_REQUEST, "Invalid Content-Length header"
+            ) from exc
+        if declared_length < 0:
+            raise _ProxyRequestError(
+                status.HTTP_400_BAD_REQUEST, "Invalid Content-Length header"
+            )
+        if declared_length > CLAW_PROXY_MAX_REQUEST_BYTES:
+            raise _ProxyRequestError(
+                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                "Request body is too large",
+            )
+
+    raw_body = bytearray()
+    async for chunk in request.stream():
+        if not chunk:
+            continue
+        if len(raw_body) + len(chunk) > CLAW_PROXY_MAX_REQUEST_BYTES:
+            raise _ProxyRequestError(
+                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                "Request body is too large",
+            )
+        raw_body.extend(chunk)
+
+    try:
+        body = json.loads(raw_body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _ProxyRequestError(
+            status.HTTP_400_BAD_REQUEST, "Invalid request body"
+        ) from exc
+    if not isinstance(body, dict):
+        raise _ProxyRequestError(
+            status.HTTP_400_BAD_REQUEST,
+            "Request body must be a JSON object",
+        )
+    return body
+
+
+def _positive_int(value: Any, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise _ProxyRequestError(
+            status.HTTP_400_BAD_REQUEST,
+            f"{field_name} must be a positive integer",
+        )
+    return value
+
+
+def _normalize_proxy_request(body: dict, settings) -> dict:
+    """Apply the deployment's routing and spend policy to a Claw request."""
+
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise _ProxyRequestError(
+            status.HTTP_400_BAD_REQUEST,
+            "messages must be a non-empty array",
+        )
+    if len(messages) > CLAW_PROXY_MAX_MESSAGES:
+        raise _ProxyRequestError(
+            status.HTTP_400_BAD_REQUEST,
+            f"messages may contain at most {CLAW_PROXY_MAX_MESSAGES} items",
+        )
+    if any(not isinstance(message, dict) for message in messages):
+        raise _ProxyRequestError(
+            status.HTTP_400_BAD_REQUEST,
+            "Every message must be a JSON object",
+        )
+
+    # Request bytes protect the parser; this tighter budget protects upstream
+    # input-token spend.  It includes tool/response schemas, which can dwarf the
+    # visible chat text in agent requests.
+    input_payload = {"messages": messages}
+    for field_name in ("tools", "response_format"):
+        if field_name in body:
+            input_payload[field_name] = body[field_name]
+    input_bytes = len(
+        json.dumps(
+            input_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    max_input_bytes = max(1024, int(settings.claw_proxy_max_input_bytes))
+    if input_bytes > max_input_bytes:
+        raise _ProxyRequestError(
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            "Prompt and tool schemas exceed the configured input budget",
+        )
+
+    tools = body.get("tools")
+    if tools is not None:
+        if not isinstance(tools, list):
+            raise _ProxyRequestError(
+                status.HTTP_400_BAD_REQUEST, "tools must be an array"
+            )
+        if len(tools) > CLAW_PROXY_MAX_TOOLS:
+            raise _ProxyRequestError(
+                status.HTTP_400_BAD_REQUEST,
+                f"tools may contain at most {CLAW_PROXY_MAX_TOOLS} items",
+            )
+
+    stream = body.get("stream", False)
+    if not isinstance(stream, bool):
+        raise _ProxyRequestError(
+            status.HTTP_400_BAD_REQUEST, "stream must be a boolean"
+        )
+
+    stop = body.get("stop")
+    if stop is not None:
+        if isinstance(stop, list):
+            if len(stop) > CLAW_PROXY_MAX_STOP_SEQUENCES or any(
+                not isinstance(item, str) for item in stop
+            ):
+                raise _ProxyRequestError(
+                    status.HTTP_400_BAD_REQUEST,
+                    "stop contains too many or invalid sequences",
+                )
+        elif not isinstance(stop, str):
+            raise _ProxyRequestError(
+                status.HTTP_400_BAD_REQUEST,
+                "stop must be a string or an array of strings",
+            )
+
+    # Chat-completions parameters such as ``n`` and provider-specific aliases
+    # can multiply generation cost even when each individual completion has a
+    # token cap.  The Claw protocol only needs one completion per turn.
+    for field_name in _MULTI_COMPLETION_FIELDS:
+        if field_name not in body:
+            continue
+        if _positive_int(body[field_name], field_name) != 1:
+            raise _ProxyRequestError(
+                status.HTTP_400_BAD_REQUEST,
+                f"{field_name} must be 1",
+            )
+
+    if "max_tokens" in body and "max_completion_tokens" in body:
+        raise _ProxyRequestError(
+            status.HTTP_400_BAD_REQUEST,
+            "Use only one completion token limit",
+        )
+
+    configured_token_cap = _positive_int(settings.max_tokens, "MAX_TOKENS")
+    token_field = None
+    requested_tokens = configured_token_cap
+    if "max_tokens" in body:
+        token_field = "max_tokens"
+        requested_tokens = _positive_int(body[token_field], token_field)
+    elif "max_completion_tokens" in body:
+        token_field = "max_completion_tokens"
+        requested_tokens = _positive_int(body[token_field], token_field)
+
+    normalized = {
+        key: value
+        for key, value in body.items()
+        if key in _ALLOWED_CHAT_COMPLETION_FIELDS
+    }
+    # The URL, credentials and provider are selected exclusively from Settings;
+    # the caller can neither select an expensive catalog model nor smuggle a
+    # provider/base-url override in extra fields.
+    normalized["model"] = settings.model_name
+    normalized["stream"] = stream
+    normalized["n"] = 1
+
+    effective_token_limit = min(requested_tokens, configured_token_cap)
+    if settings.model_provider.lower() == "anthropic":
+        normalized.pop("max_completion_tokens", None)
+        normalized["max_tokens"] = effective_token_limit
+    else:
+        effective_field = token_field or "max_tokens"
+        normalized.pop("max_tokens", None)
+        normalized.pop("max_completion_tokens", None)
+        normalized[effective_field] = effective_token_limit
+    return normalized
 
 
 def _extract_bearer_token(request: Request) -> Optional[str]:
@@ -188,19 +415,30 @@ def _openai_to_anthropic_request(request_body: dict, settings) -> dict:
 
 def _anthropic_headers(settings) -> dict:
     return {
-        "Content-Type": "application/json",
-        "x-api-key": settings.api_key or "",
-        "anthropic-version": "2023-06-01",
         **(settings.extra_headers or {}),
+        "Content-Type": "application/json",
+        "x-api-key": provider_api_key(settings, "anthropic") or "",
+        "anthropic-version": "2023-06-01",
     }
 
 
 def _openai_headers(settings) -> dict:
     return {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {settings.api_key}",
         **(settings.extra_headers or {}),
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {provider_api_key(settings, settings.model_provider) or ''}",
     }
+
+
+def _configured_llm_api_base(settings) -> str:
+    """Return the provider's explicit base or its canonical official default."""
+
+    provider = settings.model_provider.lower()
+    return provider_api_base(settings, provider, settings.api_base) or (
+        "https://api.anthropic.com"
+        if provider == "anthropic"
+        else "https://api.openai.com"
+    )
 
 
 def _anthropic_stop_reason(stop_reason: str | None) -> str | None:
@@ -366,6 +604,17 @@ def _anthropic_stream_event_to_openai_chunks(event: dict, state: dict) -> list[d
     if event_type == "message_stop":
         return ["[DONE]"]
 
+    if event_type == "error":
+        return [
+            {
+                "error": {
+                    "message": "LLM backend streaming request failed",
+                    "type": "api_error",
+                }
+            },
+            "[DONE]",
+        ]
+
     return []
 
 
@@ -374,9 +623,8 @@ async def _stream_llm_response(
     settings,
 ) -> AsyncIterator[bytes]:
     """Stream LLM response from the configured backend"""
-    api_base = settings.api_base or "https://api.openai.com"
-
-    is_anthropic = settings.model_provider == "anthropic"
+    is_anthropic = settings.model_provider.lower() == "anthropic"
+    api_base = _configured_llm_api_base(settings)
     headers = _anthropic_headers(settings) if is_anthropic else _openai_headers(settings)
     target_url = _anthropic_messages_url(api_base) if is_anthropic else _openai_chat_url(api_base)
     outgoing_body = _openai_to_anthropic_request(request_body, settings) if is_anthropic else request_body
@@ -389,10 +637,12 @@ async def _stream_llm_response(
             headers=headers,
         ) as resp:
             if not resp.is_success:
-                error_body = await resp.aread()
-                error_msg = error_body.decode("utf-8", errors="replace")
+                logger.error(
+                    "[openai-proxy] streaming backend rejected request: HTTP %s",
+                    resp.status_code,
+                )
                 sse_error = (
-                    f'data: {json.dumps({"error": {"message": f"LLM backend error: {error_msg}", "type": "api_error"}})}\n\n'
+                    f'data: {json.dumps({"error": {"message": "LLM backend request failed", "type": "api_error"}})}\n\n'
                     f"data: [DONE]\n\n"
                 )
                 yield sse_error.encode("utf-8")
@@ -427,13 +677,50 @@ async def _stream_llm_response(
                     yield chunk
 
 
+async def _safe_stream_llm_response(
+    request_body: dict,
+    settings,
+) -> AsyncIterator[bytes]:
+    """Turn failures raised after response headers into explicit SSE errors."""
+
+    try:
+        async for chunk in _stream_llm_response(request_body, settings):
+            yield chunk
+    except Exception as exc:
+        logger.error(
+            "[openai-proxy] streaming LLM request failed: %s",
+            safe_exception_summary(exc),
+        )
+        yield _sse({
+            "error": {
+                "message": "LLM backend streaming request failed",
+                "type": "api_error",
+            }
+        })
+        yield _sse("[DONE]")
+
+
+async def _stream_with_quota_release(
+    request_body: dict,
+    settings,
+    claw_service: ClawService,
+    user_id: str,
+    lease_token: str,
+) -> AsyncIterator[bytes]:
+    try:
+        async for chunk in _safe_stream_llm_response(request_body, settings):
+            yield chunk
+    finally:
+        await claw_service.release_proxy_quota(user_id, lease_token)
+
+
 async def _get_llm_response(
     request_body: dict,
     settings,
 ) -> dict:
     """Get non-streaming LLM response"""
-    api_base = settings.api_base or "https://api.openai.com"
-    is_anthropic = settings.model_provider == "anthropic"
+    is_anthropic = settings.model_provider.lower() == "anthropic"
+    api_base = _configured_llm_api_base(settings)
     headers = _anthropic_headers(settings) if is_anthropic else _openai_headers(settings)
     target_url = _anthropic_messages_url(api_base) if is_anthropic else _openai_chat_url(api_base)
     outgoing_body = _openai_to_anthropic_request(request_body, settings) if is_anthropic else request_body
@@ -471,38 +758,88 @@ async def chat_completions(request: Request):
     if not user_id:
         return _openai_error_response(status.HTTP_401_UNAUTHORIZED, "Invalid API key", "auth_error")
 
-    try:
-        body = await request.json()
-    except Exception:
-        return _openai_error_response(status.HTTP_400_BAD_REQUEST, "Invalid request body", "invalid_request_error")
+    lease_token = await claw_service.acquire_proxy_quota(user_id)
+    if not lease_token:
+        return _openai_error_response(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "Claw model proxy rate or concurrency limit exceeded",
+            "rate_limit_error",
+        )
 
     settings = get_settings()
-
-    # Override model with configured model name
-    if settings.model_name and body.get("model") in ("default", "manus-proxy/default", None):
-        body = {**body, "model": settings.model_name}
+    try:
+        body = await _read_limited_json_body(request)
+        body = _normalize_proxy_request(body, settings)
+    except _ProxyRequestError as exc:
+        await claw_service.release_proxy_quota(user_id, lease_token)
+        return _openai_error_response(
+            exc.status_code, exc.message, "invalid_request_error"
+        )
+    except Exception as exc:
+        await claw_service.release_proxy_quota(user_id, lease_token)
+        logger.error(
+            "[openai-proxy] failed while reading request body: %s",
+            safe_exception_summary(exc),
+        )
+        return _openai_error_response(
+            status.HTTP_400_BAD_REQUEST,
+            "Invalid request body",
+            "invalid_request_error",
+        )
 
     is_stream = body.get("stream", False)
 
-    logger.info(f"[openai-proxy] user={user_id} model={body.get('model')} stream={is_stream}")
+    logger.info(
+        "[openai-proxy] user=%s model=%s provider=%s max_tokens=%s stream=%s",
+        user_id,
+        body.get("model"),
+        settings.model_provider,
+        body.get("max_tokens", body.get("max_completion_tokens")),
+        is_stream,
+    )
 
-    try:
-        if is_stream:
+    if is_stream:
+        try:
             return StreamingResponse(
-                _stream_llm_response(body, settings),
+                _stream_with_quota_release(
+                    body,
+                    settings,
+                    claw_service,
+                    user_id,
+                    lease_token,
+                ),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
                     "X-Accel-Buffering": "no",
                 },
             )
-        else:
-            result = await _get_llm_response(body, settings)
-            return JSONResponse(content=result)
+        except Exception:
+            await claw_service.release_proxy_quota(user_id, lease_token)
+            raise
 
+    try:
+        result = await _get_llm_response(body, settings)
+        return JSONResponse(content=result)
     except httpx.HTTPStatusError as e:
-        logger.error(f"[openai-proxy] LLM backend error: {e.response.status_code} {e.response.text}")
-        return _openai_error_response(e.response.status_code, f"LLM backend error: {e.response.text}", "api_error")
+        logger.error(
+            "[openai-proxy] LLM backend error: %s",
+            safe_exception_summary(e),
+        )
+        return _openai_error_response(
+            e.response.status_code,
+            "LLM backend request failed",
+            "api_error",
+        )
     except Exception as e:
-        logger.error(f"[openai-proxy] Unexpected error: {str(e)}")
-        return _openai_error_response(status.HTTP_500_INTERNAL_SERVER_ERROR, str(e), "api_error")
+        logger.error(
+            "[openai-proxy] unexpected error: %s",
+            safe_exception_summary(e),
+        )
+        return _openai_error_response(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "LLM proxy request failed",
+            "api_error",
+        )
+    finally:
+        await claw_service.release_proxy_quota(user_id, lease_token)

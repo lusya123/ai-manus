@@ -24,6 +24,7 @@ class ClawMessage(BaseModel):
 class ClawStatus(str, Enum):
     CREATING = "creating"
     RUNNING = "running"
+    DESTROYING = "destroying"
     STOPPED = "stopped"
     ERROR = "error"
 
@@ -34,8 +35,15 @@ class Claw(BaseModel):
     user_id: str
     container_name: Optional[str] = None
     container_ip: Optional[str] = None
-    api_key: str  # Per-user OpenAI-compatible API key for LLM proxy
+    # Runtime capability plaintext exists only while a runtime is being
+    # provisioned.  It is excluded from repr/model serialization and is never
+    # reconstructed from MongoDB; durable storage contains only a keyed HMAC.
+    api_key: Optional[str] = Field(default=None, repr=False, exclude=True)
     status: ClawStatus = ClawStatus.CREATING
+    # Monotonic optimistic-concurrency token for lifecycle mutations. Legacy
+    # Mongo records deserialize as revision zero and are upgraded on first
+    # successful compare-and-set update.
+    revision: int = Field(default=0, ge=0)
     error_message: Optional[str] = None
     expires_at: Optional[datetime] = None
     last_activity_at: Optional[datetime] = None

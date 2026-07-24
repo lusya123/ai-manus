@@ -1,6 +1,17 @@
 #!/bin/bash
 set -e
 
+# If arguments are provided, run them instead of the gateway. This makes the
+# compose "prevent claw from starting" override (entrypoint/command:
+# /bin/sh -c "exit 0") work even with compose implementations that pass the
+# override as container args to the image entrypoint instead of replacing it.
+if [ "$#" -gt 0 ]; then
+    exec "$@"
+fi
+
+# The generated configuration contains both gateway and Manus bearer tokens.
+umask 077
+
 CONFIG_DIR="/home/node/.openclaw"
 CONFIG_FILE="${CONFIG_DIR}/openclaw.json"
 mkdir -p "${CONFIG_DIR}/workspace"
@@ -11,7 +22,9 @@ if [ -z "${OPENCLAW_GATEWAY_TOKEN}" ]; then
     export OPENCLAW_GATEWAY_TOKEN
 fi
 
-echo "[entrypoint] Gateway token: ${OPENCLAW_GATEWAY_TOKEN}"
+# OPENCLAW_GATEWAY_TOKEN is a bearer capability. Never print it, even in
+# development logs.
+echo "[entrypoint] Gateway token configured"
 echo "[entrypoint] Manus API base URL: ${MANUS_API_BASE_URL:-http://backend:8000}/v1"
 
 # Write openclaw.json configuration
@@ -96,8 +109,31 @@ EOF
 
 echo "[entrypoint] Configuration written to ${CONFIG_FILE}"
 
-# TTL auto-shutdown (must be set up before starting OpenClaw)
+# Start OpenClaw gateway as a child process so this script stays PID 1 and can
+# act as a watchdog: forward shutdown signals and force-kill if the gateway
+# does not exit within the grace period. This guarantees the container always
+# exits when the TTL expires (or on docker stop), even if the Node process
+# hangs during graceful shutdown.
 CLAW_TTL_SECONDS="${CLAW_TTL_SECONDS:-0}"
+CLAW_SHUTDOWN_GRACE_SECONDS="${CLAW_SHUTDOWN_GRACE_SECONDS:-30}"
+
+openclaw gateway &
+GATEWAY_PID=$!
+
+shutdown_gateway() {
+    echo "[entrypoint] Shutting down OpenClaw gateway (pid ${GATEWAY_PID})"
+    kill -TERM "${GATEWAY_PID}" 2>/dev/null || true
+    for _ in $(seq 1 "${CLAW_SHUTDOWN_GRACE_SECONDS}"); do
+        if ! kill -0 "${GATEWAY_PID}" 2>/dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "[entrypoint] Gateway did not stop within ${CLAW_SHUTDOWN_GRACE_SECONDS}s, force killing"
+    kill -KILL "${GATEWAY_PID}" 2>/dev/null || true
+}
+trap shutdown_gateway TERM INT
+
 if [ "${CLAW_TTL_SECONDS}" -gt 0 ] 2>/dev/null; then
     echo "[entrypoint] TTL set to ${CLAW_TTL_SECONDS} seconds, will shutdown automatically"
     (
@@ -107,5 +143,10 @@ if [ "${CLAW_TTL_SECONDS}" -gt 0 ] 2>/dev/null; then
     ) &
 fi
 
-# Start OpenClaw gateway
-exec openclaw gateway
+# Preserve the gateway's real exit status. A second wait after a normal exit
+# would report 127 (the child was already reaped) and hide the actual failure.
+set +e
+wait "${GATEWAY_PID}"
+EXIT_CODE=$?
+echo "[entrypoint] OpenClaw gateway exited with code ${EXIT_CODE}"
+exit "${EXIT_CODE}"

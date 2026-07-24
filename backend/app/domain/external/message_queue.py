@@ -30,6 +30,27 @@ class MessageQueue(Protocol):
             Tuple[str, Any]: (Message ID, Message content), returns (None, None) if queue is empty
         """
         ...
+
+    async def read_group(
+        self,
+        group: str,
+        consumer: str,
+        *,
+        min_idle_ms: int = 30_000,
+        block_ms: Optional[int] = None,
+    ) -> Tuple[str, Any]:
+        """Claim stale pending input first, then read one new group entry."""
+        ...
+
+    async def ack(self, group: str, message_id: str) -> bool:
+        """Acknowledge an input only after its Mongo terminal state commits."""
+        ...
+
+    async def quarantine(
+        self, group: str, message_id: str, *, reason: str, payload_digest: str
+    ) -> bool:
+        """Record an unprocessable entry in a dead-letter stream, then ACK it."""
+        ...
     
     async def clear(self) -> None:
         """Clear all messages from the queue"""

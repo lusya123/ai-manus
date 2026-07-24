@@ -9,7 +9,7 @@ services:
           - linux/amd64
           - linux/arm64
     ports:
-      - "5173:80"
+      - "${FRONTEND_HOST_PORT:-5173}:80"
     depends_on:
       - backend
     restart: unless-stopped
@@ -33,13 +33,40 @@ services:
       - mongodb
       - redis
     restart: unless-stopped
+    # The backend is multi-homed onto per-runtime control bridges. It is an
+    # application gateway, never an IP router between users or datastores.
+    sysctls:
+      net.ipv4.ip_forward: "0"
+      net.ipv4.conf.all.forwarding: "0"
+      net.ipv4.conf.default.forwarding: "0"
+      net.ipv6.conf.all.forwarding: "0"
+      net.ipv6.conf.default.forwarding: "0"
+    # The application drains active agent work, Claw resources, and committed
+    # artifact publishes before Mongo/GridFS is closed.  Docker's 10-second
+    # default would SIGKILL that bounded shutdown path during deployments.
+    stop_grace_period: 60s
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       #- ./mcp.json:/etc/mcp.json # Mount MCP servers directory
     networks:
       - manus-network
+      - manus-data-network
     env_file:
       - .env
+    environment:
+      # User-controlled runtimes must stay on the runtime network. They must
+      # never join the MongoDB/Redis data network.
+      # Unless explicitly overridden, dynamically-created runtime images must
+      # match the same registry/tag used by the pre-pulled Compose services.
+      - SANDBOX_IMAGE=${SANDBOX_IMAGE:-${IMAGE_REGISTRY:-simpleyyt}/manus-sandbox:${IMAGE_TAG:-latest}}
+      - CLAW_IMAGE=${CLAW_IMAGE:-${IMAGE_REGISTRY:-simpleyyt}/manus-claw:${IMAGE_TAG:-latest}}
+      - SANDBOX_NETWORK=${SANDBOX_NETWORK:-manus-network}
+      - CLAW_NETWORK=${CLAW_NETWORK:-manus-network}
+      - RUNTIME_NETWORK_ISOLATION=true
+      - RUNTIME_DEPLOYMENT_ID=${RUNTIME_DEPLOYMENT_ID:-ai-manus}
+      # Internal runtime control bridges make host publication unnecessary and
+      # avoid a second path into user-owned Claw instances.
+      - CLAW_PUBLISH_HOST_PORTS=false
 
   sandbox:
     image: ${IMAGE_REGISTRY:-simpleyyt}/manus-sandbox:${IMAGE_TAG:-latest}
@@ -77,19 +104,33 @@ services:
     #ports:
     #  - "27017:27017"
     networks:
-      - manus-network
+      - manus-data-network
 
   redis:
     image: redis:7.0
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis_data:/data
     restart: unless-stopped
     networks:
-      - manus-network
+      - manus-data-network
 
 volumes:
   mongodb_data:
-    name: manus-mongodb-data
+    name: ${CORE_RESOURCE_PREFIX:-manus}-mongodb-data
+  redis_data:
+    name: ${CORE_RESOURCE_PREFIX:-manus}-redis-data
 
 networks:
+  # Trusted control-plane services communicate here. Dynamic sandbox/Claw
+  # containers each receive separate control+egress bridges at runtime; this
+  # named network is only a fail-closed path for one retained legacy runtime.
   manus-network:
-    name: manus-network
+    name: ${CORE_RESOURCE_PREFIX:-manus}-network
     driver: bridge
+  # Backend is the only application service allowed to bridge into this
+  # internal datastore network.
+  manus-data-network:
+    name: ${CORE_RESOURCE_PREFIX:-manus}-data-network
+    driver: bridge
+    internal: true

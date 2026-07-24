@@ -4,7 +4,7 @@
     <div
       class="md:w-[221px] overflow-x-auto md:overflow-x-visible border-r border-[var(--border-main)] pb-2 md:pb-0 relative">
       <div class="items-center hidden px-5 pt-5 pb-3 md:flex">
-        <div class="flex">
+        <div class="flex gap-0.5 w-fit items-center">
           <Bot :size="30" />
           <ManusLogoTextIcon width="69.47368421052632" height="30" />
         </div>
@@ -24,7 +24,7 @@
               :class="[
                 'flex px-1 py-2 items-center text-[14px] leading-5 text-[var(--text-primary)] max-md:whitespace-nowrap md:h-8 md:gap-2 md:self-stretch md:px-4 md:rounded-lg hover:bg-[var(--fill-tsp-white-main)]',
                 {
-                  'md:bg-[var(--fill-tsp-white-main)] font-medium max-md:border-b-[2px] max-md:border-[var(--Button-primray-black)]': activeTab === tab.id
+                  'md:bg-[var(--fill-tsp-white-main)] font-medium max-md:border-b-[2px] max-md:border-[var(--Button-primary-black)]': activeTab === tab.id
                 }
               ]">
               <span class="hidden md:block" :class="activeTab === tab.id ? 'text-[var(--icon-primary)]' : 'text-[var(--icon-secondary)]'">

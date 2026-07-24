@@ -17,23 +17,39 @@ services:
       - sandbox
       - claw
     restart: unless-stopped
+    sysctls:
+      net.ipv4.ip_forward: "0"
+      net.ipv4.conf.all.forwarding: "0"
+      net.ipv4.conf.default.forwarding: "0"
+      net.ipv6.conf.all.forwarding: "0"
+      net.ipv6.conf.default.forwarding: "0"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       #- ./mcp.json:/etc/mcp.json # Mount MCP servers directory
     networks:
       - manus-network
-    environment:
-      # OpenAI API base URL
-      - API_BASE=https://api.openai.com/v1
-      # OpenAI API key, replace with your own
-      - API_KEY=sk-xxxx
-      # LLM model name
-      - MODEL_NAME=gpt-4o
-      # LLM temperature parameter, controls randomness
-      #- TEMPERATURE=0.7
-      # Maximum tokens for LLM response
-      #- MAX_TOKENS=2000
+      - manus-data-network
+    env_file:
+      # All configuration is loaded from the .env file, see .env.example
       # More configuration options: https://docs.ai-manus.com/#/configuration
+      - .env
+    environment:
+      # Keep deployment security and runtime isolation as explicit overrides.
+      - API_KEY=${API_KEY:?required}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:?required}
+      - REGISTRATION_ENABLED=false
+      - DEPLOYMENT_ENVIRONMENT=production
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:?required}
+      - SANDBOX_IMAGE=simpleyyt/manus-sandbox
+      - SANDBOX_NETWORK=manus-network
+      - SANDBOX_MEMORY_LIMIT=2g
+      - SANDBOX_CPU_LIMIT=2.0
+      - SANDBOX_PIDS_LIMIT=512
+      - CLAW_IMAGE=simpleyyt/manus-claw
+      - CLAW_NETWORK=manus-network
+      - RUNTIME_NETWORK_ISOLATION=true
+      - RUNTIME_DEPLOYMENT_ID=${RUNTIME_DEPLOYMENT_ID:-ai-manus}
+      - CLAW_PUBLISH_HOST_PORTS=false
 
   sandbox:
     image: simpleyyt/manus-sandbox
@@ -57,19 +73,32 @@ services:
     #ports:
     #  - "27017:27017"
     networks:
-      - manus-network
+      - manus-data-network
 
   redis:
     image: redis:7.0
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis_data:/data
     restart: unless-stopped
     networks:
-      - manus-network
+      - manus-data-network
 
 volumes:
   mongodb_data:
     name: manus-mongodb-data
+  redis_data:
+    name: manus-redis-data
 
 networks:
+  # Frontend, backend, and user-controlled sandbox/Claw runtimes communicate
+  # here. No datastore is attached to this network.
   manus-network:
     name: manus-network
     driver: bridge
+  # Backend is the only application service allowed to bridge into this
+  # internal datastore network.
+  manus-data-network:
+    name: manus-data-network
+    driver: bridge
+    internal: true

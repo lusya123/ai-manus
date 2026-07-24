@@ -3,14 +3,7 @@
     <div ref="chatContainerRef" class="relative flex flex-col h-full flex-1 min-w-0 px-5">
       <div ref="observerRef"
         class="sm:min-w-[390px] flex flex-row items-center justify-between pt-3 pb-1 gap-1 sticky top-0 z-10 bg-[var(--background-gray-main)] flex-shrink-0">
-        <div class="flex items-center flex-1">
-          <div class="relative flex items-center">
-            <div @click="toggleLeftPanel" v-if="!isLeftPanelShow"
-              class="flex h-7 w-7 items-center justify-center cursor-pointer rounded-md hover:bg-[var(--fill-tsp-gray-main)]">
-              <PanelLeft class="size-5 text-[var(--icon-secondary)]" />
-            </div>
-          </div>
-        </div>
+        <div class="flex items-center flex-1"></div>
         <div class="max-w-full sm:max-w-[768px] sm:min-w-[390px] flex w-full flex-col gap-[4px] overflow-hidden">
           <div
             class="text-[var(--text-primary)] text-lg font-medium w-full flex flex-row items-center justify-between flex-1 min-w-0 gap-2">
@@ -97,7 +90,7 @@
                 class="h-8 px-2 sm:px-3 rounded-lg inline-flex items-center gap-1.5 hover:bg-[var(--fill-tsp-white-dark)] cursor-pointer border border-[var(--border-btn-main)] bg-[var(--background-white-main)]"
                 :title="t('Open Manus workspace')">
                 <Monitor class="text-[var(--icon-secondary)]" :size="18" />
-                <span class="text-[var(--text-secondary)] text-sm font-medium whitespace-nowrap">{{ t('Workspace') }}</span>
+                <span class="hidden sm:inline text-[var(--text-secondary)] text-sm font-medium whitespace-nowrap">{{ t('Workspace') }}</span>
               </button>
             </div>
           </div>
@@ -122,18 +115,9 @@
             <ArrowDown class="text-[var(--icon-primary)]" :size="20" />
           </button>
           <PlanPanel v-if="plan && plan.steps.length > 0" :plan="plan" />
-          <ChatBox
-            v-model="inputMessage"
-            :rows="1"
-            :selected-model-id="selectedModelId"
-            :model-options="modelOptions"
-            show-model-picker
-            model-picker-disabled
-            @submit="handleSubmit"
-            :isRunning="isLoading"
-            @stop="handleStop"
-            :attachments="attachments"
-          />
+          <ChatBox v-model="inputMessage" v-model:attachments="attachments" :rows="1"
+            :selected-model-id="selectedModelId" :model-options="modelOptions" show-model-picker
+            model-picker-disabled @submit="handleSubmit" :isRunning="isLoading" @stop="handleStop" />
         </div>
       </div>
     </div>
@@ -151,23 +135,15 @@ import { useI18n } from 'vue-i18n';
 import ChatBox from '../components/ChatBox.vue';
 import ChatMessage from '../components/ChatMessage.vue';
 import * as agentApi from '../api/agent';
-import { Message, MessageContent, ToolContent, StepContent, AttachmentsContent, isConsecutiveAssistant } from '../types/message';
-import {
-  StepEventData,
-  ToolEventData,
-  MessageEventData,
-  ErrorEventData,
-  TitleEventData,
-  PlanEventData,
-  AgentSSEEvent,
-} from '../types/event';
+import { Message, MessageContent, ToolContent, AttachmentsContent, isConsecutiveAssistant } from '../types/message';
+import { PlanEventData, AgentSSEEvent } from '../types/event';
+import { hasTerminalEventForLatestTurn, useAgentEvents } from '../composables/useAgentEvents';
 import ToolPanel from '../components/ToolPanel.vue'
 import PlanPanel from '../components/PlanPanel.vue';
-import { ArrowDown, FileSearch, PanelLeft, Lock, Globe, Link, Check, Monitor } from 'lucide-vue-next';
+import { ArrowDown, FileSearch, Lock, Globe, Link, Check, Monitor } from 'lucide-vue-next';
 import ShareIcon from '@/components/icons/ShareIcon.vue';
 import { showErrorToast, showInfoToast, showSuccessToast } from '../utils/toast';
 import type { FileInfo } from '../api/file';
-import { useLeftPanel } from '../composables/useLeftPanel'
 import { useSessionFileList } from '../composables/useSessionFileList'
 import { useFilePanel } from '../composables/useFilePanel'
 import { copyToClipboard } from '../utils/dom'
@@ -180,19 +156,13 @@ import {
   CURRENT_SESSION_MODEL_ID,
   resolveModelIdForConfig,
   SYSTEM_MODEL_ID,
+  upsertCurrentSessionModelOption,
 } from '@/api/agentConfig';
 import type { ChatModelOption } from '@/api/agentConfig';
-
-type SessionModelDisplayConfig = {
-  model_id?: string | null;
-  api_base?: string | null;
-  model_name?: string | null;
-  model_provider?: string | null;
-};
+import type { SessionModelConfig } from '@/types/response';
 
 const router = useRouter()
 const { t } = useI18n()
-const { toggleLeftPanel, isLeftPanelShow } = useLeftPanel()
 const { showSessionFileList } = useSessionFileList()
 const { hideFilePanel } = useFilePanel()
 
@@ -251,40 +221,47 @@ const modelOptions = ref<ChatModelOption[]>([]);
 const selectedModelId = ref(SYSTEM_MODEL_ID);
 
 const loadModelOptions = async () => {
-  const clientConfig = await getCachedClientConfig();
-  modelOptions.value = buildChatModelOptions(clientConfig);
+  modelOptions.value = buildChatModelOptions(await getCachedClientConfig());
 };
 
-const addCurrentSessionModelOption = (modelConfig: SessionModelDisplayConfig | null | undefined) => {
-  if (!modelConfig?.model_name) {
-    return;
-  }
-  if (modelOptions.value.some((option) => option.id === CURRENT_SESSION_MODEL_ID)) {
-    return;
-  }
-  modelOptions.value.push({
-    id: CURRENT_SESSION_MODEL_ID,
-    label: modelConfig.model_name,
-    model_name: modelConfig.model_name,
-    model_provider: modelConfig.model_provider || '',
-    api_base: modelConfig.api_base || null,
-  });
-};
-
-const syncSelectedSessionModel = (modelConfig: SessionModelDisplayConfig | null | undefined) => {
+const syncSelectedSessionModel = (modelConfig?: SessionModelConfig | null) => {
   const nextModelId = resolveModelIdForConfig(modelConfig, modelOptions.value);
-  if (nextModelId === CURRENT_SESSION_MODEL_ID) {
-    addCurrentSessionModelOption(modelConfig);
-  }
+  modelOptions.value = upsertCurrentSessionModelOption(
+    modelOptions.value,
+    nextModelId === CURRENT_SESSION_MODEL_ID ? modelConfig : null,
+  );
   selectedModelId.value = nextModelId;
 };
 
+// Shared SSE event -> message list conversion
+const { handleEvent, resetEventHistory } = useAgentEvents(
+  { messages, title, plan, isLoading, lastEventId, lastTool, lastNoMessageTool },
+  {
+    onToolActivity: (tool: ToolContent) => {
+      if (realTime.value) {
+        toolPanel.value?.showToolPanel(tool, true);
+      }
+    },
+  }
+);
+
+let sessionGeneration = 0;
+let activeChatToken: symbol | null = null;
+
+const isCurrentSession = (targetSessionId: string, generation: number) => (
+  sessionGeneration === generation && sessionId.value === targetSessionId
+);
+
 // Reset all refs to their initial values
 const resetState = () => {
+  sessionGeneration += 1;
+  activeChatToken = null;
   // Cancel any existing chat connection
   if (cancelCurrentChat.value) {
     cancelCurrentChat.value();
   }
+
+  resetEventHistory();
 
   // Reset reactive state to initial values
   Object.assign(state, createInitialState());
@@ -300,136 +277,27 @@ watch(messages, async () => {
 
 
 
-const getLastStep = (): StepContent | undefined => {
-  return messages.value.filter(message => message.type === 'step').pop()?.content as StepContent;
-}
-
-// Handle message event
-const handleMessageEvent = (messageData: MessageEventData) => {
-  messages.value.push({
-    type: messageData.role,
-    content: {
-      ...messageData
-    } as MessageContent,
-  });
-
-  if (messageData.attachments?.length > 0) {
-    messages.value.push({
-      type: 'attachments',
-      content: {
-        ...messageData
-      } as AttachmentsContent,
-    });
-  }
-}
-
-// Handle tool event
-const handleToolEvent = (toolData: ToolEventData) => {
-  const lastStep = getLastStep();
-  let toolContent: ToolContent = {
-    ...toolData
-  }
-  if (lastTool.value && lastTool.value.tool_call_id === toolContent.tool_call_id) {
-    Object.assign(lastTool.value, toolContent);
-  } else {
-    if (lastStep?.status === 'running') {
-      lastStep.tools.push(toolContent);
-    } else {
-      messages.value.push({
-        type: 'tool',
-        content: toolContent,
-      });
-    }
-    lastTool.value = toolContent;
-  }
-  if (toolContent.name !== 'message') {
-    lastNoMessageTool.value = toolContent;
-    if (realTime.value) {
-      toolPanel.value?.showToolPanel(toolContent, true);
-    }
-  }
-}
-
-// Handle step event
-const handleStepEvent = (stepData: StepEventData) => {
-  const lastStep = getLastStep();
-  if (stepData.status === 'running') {
-    messages.value.push({
-      type: 'step',
-      content: {
-        ...stepData,
-        tools: []
-      } as StepContent,
-    });
-  } else if (stepData.status === 'completed') {
-    if (lastStep) {
-      lastStep.status = stepData.status;
-    }
-  } else if (stepData.status === 'failed') {
-    isLoading.value = false;
-  }
-}
-
-// Handle error event
-const handleErrorEvent = (errorData: ErrorEventData) => {
-  isLoading.value = false;
-  messages.value.push({
-    type: 'assistant',
-    content: {
-      content: errorData.error,
-      timestamp: errorData.timestamp
-    } as MessageContent,
-  });
-}
-
-// Handle title event
-const handleTitleEvent = (titleData: TitleEventData) => {
-  title.value = titleData.title;
-}
-
-// Handle plan event
-const handlePlanEvent = (planData: PlanEventData) => {
-  plan.value = planData;
-}
-
-const hasTerminalEvent = (events: AgentSSEEvent[]) => {
-  return events.some((event) => event.event === 'done' || event.event === 'error' || event.event === 'wait');
-}
-
-// Main event handler function
-const handleEvent = (event: AgentSSEEvent) => {
-  if (event.event === 'message') {
-    handleMessageEvent(event.data as MessageEventData);
-  } else if (event.event === 'tool') {
-    handleToolEvent(event.data as ToolEventData);
-  } else if (event.event === 'step') {
-    handleStepEvent(event.data as StepEventData);
-  } else if (event.event === 'done') {
-    isLoading.value = false;
-  } else if (event.event === 'wait') {
-    isLoading.value = false;
-  } else if (event.event === 'error') {
-    handleErrorEvent(event.data as ErrorEventData);
-  } else if (event.event === 'title') {
-    handleTitleEvent(event.data as TitleEventData);
-  } else if (event.event === 'plan') {
-    handlePlanEvent(event.data as PlanEventData);
-  }
-  lastEventId.value = event.data.event_id;
-}
-
 const handleSubmit = () => {
   chat(inputMessage.value, attachments.value);
 }
 
 const chat = async (message: string = '', files: FileInfo[] = []) => {
-  if (!sessionId.value) return;
+  const targetSessionId = sessionId.value;
+  if (!targetSessionId) return;
+  const generation = sessionGeneration;
+  const chatToken = Symbol(targetSessionId);
 
   // Cancel any existing chat connection before starting a new one
   if (cancelCurrentChat.value) {
     cancelCurrentChat.value();
     cancelCurrentChat.value = null;
   }
+  activeChatToken = chatToken;
+
+  const isActiveChat = () => (
+    activeChatToken === chatToken
+    && isCurrentSession(targetSessionId, generation)
+  );
 
   if (message.trim()) {
     // Add user message to conversation list
@@ -459,57 +327,70 @@ const chat = async (message: string = '', files: FileInfo[] = []) => {
   inputMessage.value = '';
   attachments.value = [];
   isLoading.value = true;
-
   try {
     // Use the split event handler function and store the cancel function
-    cancelCurrentChat.value = await agentApi.chatWithSession(
-      sessionId.value,
+    const cancel = await agentApi.chatWithSession(
+      targetSessionId,
       message,
       lastEventId.value,
       files.map((file: FileInfo) => ({file_id : file.file_id, 
                                         filename : file.filename})),
       {
         onOpen: () => {
-          console.log('Chat opened');
+          if (!isActiveChat()) return;
           isLoading.value = true;
         },
         onMessage: ({ event, data }) => {
+          if (!isActiveChat()) return;
           handleEvent({
             event: event as AgentSSEEvent['event'],
             data: data as AgentSSEEvent['data']
           });
         },
         onClose: () => {
-          console.log('Chat closed');
+          if (!isActiveChat()) return;
           isLoading.value = false;
           // Clear the cancel function when connection is closed normally
           if (cancelCurrentChat.value) {
             cancelCurrentChat.value = null;
           }
+          activeChatToken = null;
         },
         onError: (error) => {
+          if (!isActiveChat()) return;
           console.error('Chat error:', error);
           isLoading.value = false;
           // Clear the cancel function when there's an error
           if (cancelCurrentChat.value) {
             cancelCurrentChat.value = null;
           }
+          activeChatToken = null;
         }
-      }
+      },
     );
+    if (!isActiveChat()) {
+      cancel();
+      return;
+    }
+    cancelCurrentChat.value = cancel;
   } catch (error) {
+    if (!isActiveChat()) return;
     console.error('Chat error:', error);
     isLoading.value = false;
     cancelCurrentChat.value = null;
+    activeChatToken = null;
   }
 }
 
 const restoreSession = async () => {
-  if (!sessionId.value) {
+  const targetSessionId = sessionId.value;
+  if (!targetSessionId) {
     showErrorToast(t('Session not found'));
     return;
   }
-  const session = await agentApi.getSession(sessionId.value);
+  const generation = sessionGeneration;
+  const session = await agentApi.getSession(targetSessionId);
+  if (!isCurrentSession(targetSessionId, generation)) return;
   syncSelectedSessionModel(session.model_config);
   // Initialize share mode based on session state
   shareMode.value = session.is_shared ? 'public' : 'private';
@@ -518,17 +399,16 @@ const restoreSession = async () => {
     handleEvent(event);
   }
   realTime.value = true;
-  const canResume = (
-    (session.status === SessionStatus.RUNNING || session.status === SessionStatus.PENDING) &&
-    session.events.length > 0 &&
-    !hasTerminalEvent(session.events)
-  );
-  if (canResume) {
+  const hasTerminalEvent = hasTerminalEventForLatestTurn(session.events);
+  if (
+    (session.status === SessionStatus.RUNNING || session.status === SessionStatus.PENDING)
+    && !hasTerminalEvent
+  ) {
     await chat();
   } else {
     isLoading.value = false;
   }
-  agentApi.clearUnreadMessageCount(sessionId.value);
+  agentApi.clearUnreadMessageCount(targetSessionId);
 }
 
 
@@ -572,6 +452,8 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  sessionGeneration += 1;
+  activeChatToken = null;
   if (cancelCurrentChat.value) {
     cancelCurrentChat.value();
     cancelCurrentChat.value = null;
@@ -589,7 +471,7 @@ const isLiveTool = (tool: ToolContent) => {
   if (!isLastNoMessageTool(tool)) {
     return false;
   }
-  if (tool.timestamp > Date.now() - 5 * 60 * 1000) {
+  if (tool.timestamp > Math.floor(Date.now() / 1000) - 5 * 60) {
     return true;
   }
   return false;
@@ -618,9 +500,20 @@ const handleScroll = (_: Event) => {
   follow.value = simpleBarRef.value?.isScrolledToBottom() ?? false;
 }
 
-const handleStop = () => {
-  if (sessionId.value) {
-    agentApi.stopSession(sessionId.value);
+const handleStop = async () => {
+  const targetSessionId = sessionId.value;
+  if (targetSessionId) {
+    const generation = sessionGeneration;
+    try {
+      await agentApi.stopSession(targetSessionId);
+      if (!isCurrentSession(targetSessionId, generation)) return;
+      activeChatToken = null;
+      cancelCurrentChat.value?.();
+      cancelCurrentChat.value = null;
+      isLoading.value = false;
+    } catch (error) {
+      console.error('Failed to stop session:', error);
+    }
   }
 }
 
@@ -706,6 +599,3 @@ const handleCopyLink = async () => {
   }
 }
 </script>
-
-<style scoped>
-</style>

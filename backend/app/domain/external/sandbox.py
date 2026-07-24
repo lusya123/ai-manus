@@ -2,8 +2,29 @@ from typing import Any, Optional, Protocol, BinaryIO
 from app.domain.models.tool_result import ToolResult
 from app.domain.external.browser import Browser
 
+
+class SandboxUnavailableError(RuntimeError):
+    """A sandbox may still exist, but its provider cannot confirm state now."""
+
+
+class SandboxProvisioningError(RuntimeError):
+    """Provisioning failed and cleanup could not confirm resource deletion."""
+
+    def __init__(self, sandbox_id: str, message: str):
+        super().__init__(message)
+        self.sandbox_id = sandbox_id
+
 class Sandbox(Protocol):
     """Sandbox service gateway interface"""
+
+    async def aclose(self) -> None:
+        """Close this client handle without deleting the provider resource.
+
+        ``get()`` may return a fresh HTTP/provider handle for an existing,
+        persisted sandbox.  Releasing that handle must never stop the
+        container or cloud session; destructive cleanup remains ``destroy``.
+        """
+        ...
 
     async def ensure_sandbox(self) -> None:
         """Ensure sandbox is ready"""

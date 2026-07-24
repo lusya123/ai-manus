@@ -1,8 +1,17 @@
 // Backend API client configuration
 import axios, { AxiosError } from 'axios';
-import { fetchEventSource, EventSourceMessage } from '@microsoft/fetch-event-source';
-import { router } from '@/main';
-import { clearStoredTokens, getStoredToken, getStoredRefreshToken, storeToken, storeRefreshToken, storeExternalAuthToken } from './auth';
+import type { AxiosRequestConfig } from 'axios';
+import { fetchEventSource } from '@microsoft/fetch-event-source';
+import type { EventSourceMessage } from '@microsoft/fetch-event-source';
+import {
+  clearStoredTokens,
+  getStoredExternalAuthToken,
+  getStoredRefreshToken,
+  getStoredToken,
+  storeExternalAuthToken,
+  storeRefreshToken,
+  storeToken,
+} from './auth';
 
 // API configuration
 export const API_CONFIG = {
@@ -33,6 +42,13 @@ export interface ApiError {
   details?: unknown;
 }
 
+export interface ApiClientRequestConfig extends AxiosRequestConfig {
+  __skipAuth?: boolean;
+  /** Do not turn a candidate-token verification failure into a refresh flow. */
+  __skipAuthRefresh?: boolean;
+  __suppressErrorLog?: boolean;
+}
+
 // Create axios instance
 export const apiClient = axios.create({
   baseURL: BASE_URL,
@@ -45,9 +61,12 @@ export const apiClient = axios.create({
 // Request interceptor, add authentication token
 apiClient.interceptors.request.use(
   (config) => {
+    const requestConfig = config as ApiClientRequestConfig;
     // Add authentication token if available
     const token = getStoredToken();
-    if (token && !config.headers.Authorization) {
+    if (requestConfig.__skipAuth) {
+      config.headers.delete('Authorization');
+    } else if (token && !config.headers.Authorization) {
       config.headers.Authorization = `Bearer ${token}`;
     }
     return config;
@@ -72,16 +91,15 @@ const processQueue = (error: any, token: string | null = null) => {
 };
 
 /**
- * Redirect to login page using Vue Router
+ * Redirect to the login page with a full page load.
+ * Intentionally avoids importing the router to keep the API layer
+ * free of dependencies on the app entry point.
  */
 const redirectToLogin = () => {
-  // Check if we're already on the login page
-  if (window.location.pathname === LOGIN_ROUTE || 
-      router.currentRoute.value.path === LOGIN_ROUTE) {
+  if (window.location.pathname === LOGIN_ROUTE) {
     return; // Already on login page, no need to redirect
   }
 
-  // Use Vue Router to navigate to login page
   setTimeout(() => {
     window.location.href = LOGIN_ROUTE;
   }, 100);
@@ -90,7 +108,7 @@ const redirectToLogin = () => {
 /**
  * Common token refresh logic used by both axios interceptor and SSE connections
  */
-const refreshAuthToken = async (): Promise<string | null> => {
+export const refreshAuthToken = async (): Promise<string | null> => {
   if (isRefreshing) {
     // If already refreshing, queue this request
     return new Promise((resolve, reject) => {
@@ -125,6 +143,8 @@ const refreshAuthToken = async (): Promise<string | null> => {
       storeToken(newAccessToken);
       if (response.data.data.refresh_token) {
         storeRefreshToken(response.data.data.refresh_token);
+      }
+      if (getStoredExternalAuthToken()) {
         storeExternalAuthToken(newAccessToken);
       }
       
@@ -189,7 +209,12 @@ apiClient.interceptors.response.use(
     }
     
     // Handle 401 Unauthorized errors with token refresh
-    if (error.response?.status === 401 && !originalRequest._retry) {
+    if (
+      error.response?.status === 401
+      && !originalRequest.__skipAuth
+      && !originalRequest.__skipAuthRefresh
+      && !originalRequest._retry
+    ) {
       originalRequest._retry = true;
 
       try {
@@ -232,7 +257,7 @@ apiClient.interceptors.response.use(
       apiError.message = 'Network error, please check your connection';
     }
 
-    if (!originalRequest.__suppressErrorLog) {
+    if (!originalRequest?.__suppressErrorLog) {
       console.error('API Error:', apiError);
     }
     return Promise.reject(apiError);
@@ -243,6 +268,7 @@ export interface SSECallbacks<T = any> {
   onOpen?: () => void;
   onMessage?: (event: { event: string; data: T }) => void;
   onClose?: () => void;
+  /** Called once when the SSE connection has stopped permanently. */
   onError?: (error: Error) => void;
 }
 
@@ -252,33 +278,30 @@ export interface SSEOptions {
   headers?: Record<string, string>;
 }
 
-/**
- * Handle SSE authentication errors and attempt token refresh
- */
-const handleSSEAuthError = async <T = any>(
-  _error: Error,
-  _endpoint: string,
-  _options: SSEOptions,
-  callbacks: SSECallbacks<T>
-): Promise<boolean> => {
-  try {
-    const newAccessToken = await refreshAuthToken();
-    if (newAccessToken) {
-      // Emit event for token refresh success
-      window.dispatchEvent(new CustomEvent('auth:token-refreshed'));
-      console.log('Token refreshed for SSE connection, will retry connection');
-      return true; // Indicate successful refresh
-    }
-    return false; // No new token obtained
-  } catch (refreshError) {
-    // Token refresh failed, error already handled in refreshAuthToken
-    console.error('SSE token refresh failed:', refreshError);
-    if (callbacks.onError) {
-      callbacks.onError(refreshError as Error);
-    }
-    return false; // Indicate failed refresh
+class FatalSSEError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'FatalSSEError';
   }
-};
+}
+
+class RetrySSEWithFreshAuthError extends Error {
+  constructor() {
+    super('Retry SSE connection with refreshed credentials');
+    this.name = 'RetrySSEWithFreshAuthError';
+  }
+}
+
+const toError = (error: unknown): Error => (
+  error instanceof Error ? error : new Error(String(error))
+);
+
+const isRetryableSSEStatus = (status: number): boolean => (
+  status === 408
+  || status === 425
+  || status === 429
+  || status >= 500
+);
 
 /**
  * Generic SSE connection function
@@ -301,96 +324,135 @@ export const createSSEConnection = async <T = any>(
   
   // Create AbortController for cancellation
   const abortController = new AbortController();
-  
   const apiUrl = `${BASE_URL}${endpoint}`;
-  
+  const hasExplicitAuthorization = Object.keys(headers).some(
+    (header) => header.toLowerCase() === 'authorization'
+  );
+
   // Add authentication headers
   const requestHeaders: Record<string, string> = {
     'Content-Type': 'application/json',
     ...headers,
   };
-  
+
   // Add authentication token if available
   const token = getStoredToken();
-  if (token && !requestHeaders.Authorization) {
+  if (token && !hasExplicitAuthorization) {
     requestHeaders.Authorization = `Bearer ${token}`;
   }
-  
-  // 创建SSE连接
-  const createConnection = async (): Promise<void> => {
-    return new Promise((_resolve, reject) => {
-      if (abortController.signal.aborted) {
-        reject(new Error('Connection aborted'));
-        return;
+
+  // fetch-event-source clones its headers once, so update Authorization at
+  // request time. This lets its own retry loop use a token refreshed after a
+  // 401 without starting a second, competing SSE lifecycle.
+  const fetchWithCurrentAuth: typeof fetch = (input, init = {}) => {
+    const latestHeaders = new Headers(init.headers);
+    if (!hasExplicitAuthorization) {
+      const latestToken = getStoredToken();
+      if (latestToken) {
+        latestHeaders.set('Authorization', `Bearer ${latestToken}`);
+      } else {
+        latestHeaders.delete('Authorization');
       }
-
-      const ssePromise = fetchEventSource(apiUrl, {
-        method,
-        headers: requestHeaders,
-        openWhenHidden: true,
-        body: body ? JSON.stringify(body) : undefined,
-        signal: abortController.signal,
-        async onopen(response) {
-          // Check for authentication errors in the initial response
-          if (response.status === 401) {
-            const authError = new Error('Unauthorized');
-            const refreshSuccess = await handleSSEAuthError(authError, endpoint, options, callbacks);
-            
-            if (refreshSuccess) {
-              // Update authorization header with new token
-              const newToken = getStoredToken();
-              if (newToken) {
-                requestHeaders.Authorization = `Bearer ${newToken}`;
-                // Retry connection with new token
-                setTimeout(() => createConnection().catch(console.error), 1000);
-              }
-            }
-            return;
-          }
-          
-          // Check for other error status codes
-          if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-          }
-          
-          if (onOpen) {
-            onOpen();
-          }
-        },
-        onmessage(event: EventSourceMessage) {
-          if (event.event && event.event.trim() !== '') {
-            if (onMessage) {
-              onMessage({
-                event: event.event,
-                data: JSON.parse(event.data) as T
-              });
-            }
-          }
-        },
-        onclose() {
-          if (onClose) {
-            onClose();
-          }
-        },
-        onerror(err: any) {
-          const error = err instanceof Error ? err : new Error(String(err));
-          console.error('EventSource error:', error);
-          
-          if (onError) {
-            onError(error);
-          }
-          reject(error);
-        },
-      });
-
-      ssePromise.catch(reject);
-    });
+    }
+    return window.fetch(input, { ...init, headers: latestHeaders });
   };
 
-  createConnection().catch((error) => {
-    if (!abortController.signal.aborted) {
-      console.error('SSE connection failed:', error);
-    }
+  let authRefreshAttempted = false;
+  let terminalCallbackSent = false;
+
+  const notifyTerminalError = (error: Error) => {
+    if (terminalCallbackSent || abortController.signal.aborted) return;
+    terminalCallbackSent = true;
+    onError?.(error);
+  };
+
+  const connectionPromise = fetchEventSource(apiUrl, {
+    method,
+    headers: requestHeaders,
+    openWhenHidden: true,
+    body: body ? JSON.stringify(body) : undefined,
+    signal: abortController.signal,
+    fetch: fetchWithCurrentAuth,
+    async onopen(response) {
+      if (response.status === 401) {
+        if (authRefreshAttempted) {
+          throw new FatalSSEError('SSE authentication failed after token refresh');
+        }
+        authRefreshAttempted = true;
+        try {
+          const newAccessToken = await refreshAuthToken();
+          if (!newAccessToken) {
+            throw new Error('Token refresh returned no access token');
+          }
+          window.dispatchEvent(new CustomEvent('auth:token-refreshed'));
+        } catch {
+          throw new FatalSSEError('SSE token refresh failed');
+        }
+        throw new RetrySSEWithFreshAuthError();
+      }
+
+      if (!response.ok) {
+        const message = `SSE request failed with HTTP ${response.status}`;
+        if (isRetryableSSEStatus(response.status)) {
+          throw new Error(message);
+        }
+        throw new FatalSSEError(message);
+      }
+
+      const contentType = response.headers.get('content-type');
+      if (!contentType?.startsWith('text/event-stream')) {
+        throw new FatalSSEError('SSE response has an invalid content type');
+      }
+
+      authRefreshAttempted = false;
+      try {
+        onOpen?.();
+      } catch {
+        throw new FatalSSEError('SSE open callback failed');
+      }
+    },
+    onmessage(event: EventSourceMessage) {
+      if (!event.event || event.event.trim() === '') return;
+
+      let data: T;
+      try {
+        data = JSON.parse(event.data) as T;
+      } catch {
+        throw new FatalSSEError('SSE event contains invalid JSON');
+      }
+
+      try {
+        onMessage?.({ event: event.event, data });
+      } catch {
+        throw new FatalSSEError('SSE message callback failed');
+      }
+    },
+    onclose() {
+      if (terminalCallbackSent || abortController.signal.aborted) return;
+      terminalCallbackSent = true;
+      onClose?.();
+    },
+    onerror(error: unknown) {
+      const normalizedError = toError(error);
+      if (normalizedError instanceof RetrySSEWithFreshAuthError) {
+        return 0;
+      }
+      if (normalizedError instanceof FatalSSEError || terminalCallbackSent) {
+        notifyTerminalError(normalizedError);
+        throw normalizedError;
+      }
+
+      // Returning normally delegates transient network/server recovery to the
+      // library's single retry loop. It must not look terminal to the page.
+      return undefined;
+    },
+  });
+
+  connectionPromise.catch((error: unknown) => {
+    if (abortController.signal.aborted) return;
+    const normalizedError = toError(error);
+    notifyTerminalError(normalizedError);
+    console.error('SSE connection failed:', normalizedError);
   });
 
   return () => {

@@ -5,6 +5,7 @@
  * 🛠️ 功能使用
    * [✨ 场景演示](demo.md)
    * [🔧 MCP 配置](mcp.md)
+   * [☁️ AgentBay 云沙箱](agentbay.md)
  * [📋 配置说明](configuration.md)
  * 👨‍💻 开发指南
    * [⚙️ 系统架构](architecture.md)

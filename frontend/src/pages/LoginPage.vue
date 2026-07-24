@@ -3,9 +3,9 @@
     <div class="sticky top-0 left-0 w-full z-[10] px-[48px] max-sm:px-[12px] max-sm:bg-[var(--background-gray-login)]">
       <div class="w-full h-[60px] mx-auto flex items-center justify-between text-[var(--text-primary)]">
         <a href="/">
-          <div class="flex">
-            <Bot :size="30" />
-            <ManusLogoTextIcon />
+          <div class="flex gap-0.5 w-fit items-center">
+            <Bot :size="30" class="text-[var(--icon-primary)]" />
+            <ManusLogoTextIcon :width="74.1" :height="32" />
           </div>
         </a>
       </div>
@@ -26,7 +26,19 @@
           </h1>
         </div>
       </div>
-      <LoginForm v-if="!isRegistering && !isResettingPassword" 
+      <div v-if="sub2apiLoginUrl" class="w-full max-w-[360px] flex flex-col items-center gap-4 px-5">
+        <p class="text-sm text-center text-[var(--text-secondary)]">
+          {{ t('You are signed out of Manus') }}
+        </p>
+        <button
+          type="button"
+          class="w-full h-10 rounded-[10px] bg-[var(--Button-primary-black)] text-[var(--text-onblack)] font-medium hover:opacity-90"
+          @click="continueWithSub2Api"
+        >
+          {{ t('Continue with Sub2API') }}
+        </button>
+      </div>
+      <LoginForm v-else-if="!isRegistering && !isResettingPassword"
         @success="handleLoginSuccess" 
         @switch-to-register="switchToRegister" 
         @switch-to-reset="switchToReset" />
@@ -49,6 +61,8 @@ import LoginForm from '@/components/login/LoginForm.vue'
 import RegisterForm from '@/components/login/RegisterForm.vue'
 import ResetPasswordForm from '@/components/login/ResetPasswordForm.vue'
 import { useAuth } from '@/api'
+import { buildSub2ApiLoginUrl } from '@/api/auth'
+import { getCachedClientConfig } from '@/api/config'
 
 const { t } = useI18n()
 
@@ -58,6 +72,21 @@ const { isAuthenticated } = useAuth()
 // Form state for header display
 const isRegistering = ref(false)
 const isResettingPassword = ref(false)
+const sub2apiLoginUrl = ref<string | null>(null)
+
+const continueWithSub2Api = () => {
+  if (!sub2apiLoginUrl.value) return
+  const redirect = router.currentRoute.value.query.redirect
+  const returnPath = typeof redirect === 'string' ? redirect : '/'
+  const requestedReturnUrl = new URL(returnPath, window.location.origin)
+  const safeReturnUrl = requestedReturnUrl.origin === window.location.origin
+    ? requestedReturnUrl
+    : new URL('/', window.location.origin)
+  window.location.assign(buildSub2ApiLoginUrl(
+    sub2apiLoginUrl.value,
+    safeReturnUrl.toString(),
+  ))
+}
 
 // Switch to register mode
 const switchToRegister = () => {
@@ -91,7 +120,11 @@ watch(isAuthenticated, (authenticated) => {
 })
 
 // Check if already logged in when page loads
-onMounted(() => {
+onMounted(async () => {
+  const clientConfig = await getCachedClientConfig()
+  if (clientConfig?.auth_provider === 'sub2api') {
+    sub2apiLoginUrl.value = clientConfig.sub2api_login_url || null
+  }
   if (isAuthenticated.value) {
     router.push('/')
   }

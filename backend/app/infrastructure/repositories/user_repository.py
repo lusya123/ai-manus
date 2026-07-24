@@ -13,7 +13,7 @@ class MongoUserRepository(UserRepository):
     
     async def create_user(self, user: User) -> User:
         """Create a new user"""
-        logger.info(f"Creating user: {user.fullname}")
+        logger.info("Creating user: user_id=%s", user.id)
         
         # Convert domain model to document
         user_doc = UserDocument.from_domain(user)
@@ -39,22 +39,22 @@ class MongoUserRepository(UserRepository):
     
     async def get_user_by_fullname(self, fullname: str) -> Optional[User]:
         """Get user by fullname"""
-        logger.debug(f"Getting user by fullname: {fullname}")
+        logger.debug("Getting user by fullname")
         
         user_doc = await UserDocument.find_one(UserDocument.fullname == fullname)
         if not user_doc:
-            logger.debug(f"User not found: {fullname}")
+            logger.debug("User not found by fullname")
             return None
         
         return user_doc.to_domain()
     
     async def get_user_by_email(self, email: str) -> Optional[User]:
         """Get user by email"""
-        logger.debug(f"Getting user by email: {email}")
+        logger.debug("Getting user by email")
         
         user_doc = await UserDocument.find_one(UserDocument.email == email.lower())
         if not user_doc:
-            logger.debug(f"User not found: {email}")
+            logger.debug("User not found by email")
             return None
         
         return user_doc.to_domain()
@@ -104,7 +104,7 @@ class MongoUserRepository(UserRepository):
     
     async def fullname_exists(self, fullname: str) -> bool:
         """Check if fullname exists"""
-        logger.debug(f"Checking if fullname exists: {fullname}")
+        logger.debug("Checking if fullname exists")
         
         user_doc = await UserDocument.find_one(UserDocument.fullname == fullname)
         exists = user_doc is not None
@@ -113,9 +113,9 @@ class MongoUserRepository(UserRepository):
     
     async def email_exists(self, email: str) -> bool:
         """Check if email exists"""
-        logger.debug(f"Checking if email exists: {email}")
+        logger.debug("Checking if email exists")
         
         user_doc = await UserDocument.find_one(UserDocument.email == email.lower())
         exists = user_doc is not None
         logger.debug(f"Email exists: {exists}")
-        return exists 
+        return exists

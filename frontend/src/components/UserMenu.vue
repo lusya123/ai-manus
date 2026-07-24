@@ -51,19 +51,16 @@
                                 class="overflow-hidden flex-1 text-sm font-medium leading-5 whitespace-nowrap text-ellipsis">{{
                                 t('Model') }}</span>
                         </div>
-                        <template v-for="link in sub2apiLinks" :key="link.label">
-                            <a
-                                v-if="link.url"
-                                :href="link.url"
-                                class="flex gap-3 items-center p-2 rounded-lg cursor-pointer text-[var(--text-primary)] hover:bg-[var(--fill-tsp-white-main)]">
-                                <div class="flex-shrink-0 w-5 h-5">
-                                    <ExternalLink :size="20" />
-                                </div>
-                                <span
-                                    class="overflow-hidden flex-1 text-sm font-medium leading-5 whitespace-nowrap text-ellipsis">{{
-                                    link.label }}</span>
-                            </a>
-                        </template>
+                        <a v-for="link in sub2apiLinks" :key="link.label" v-show="link.url" :href="link.url || undefined"
+                            target="_blank" rel="noopener noreferrer"
+                            class="flex gap-3 items-center p-2 rounded-lg cursor-pointer text-[var(--text-primary)] hover:bg-[var(--fill-tsp-white-main)]">
+                            <div class="flex-shrink-0 w-5 h-5">
+                                <ExternalLink :size="20" />
+                            </div>
+                            <span
+                                class="overflow-hidden flex-1 text-sm font-medium leading-5 whitespace-nowrap text-ellipsis">{{
+                                t(link.label) }}</span>
+                        </a>
                         <div class="w-full h-[1px] my-1 bg-[var(--border-main)]"></div>
                         <div v-if="authProvider !== 'none'"
                             class="flex gap-3 items-center p-2 rounded-lg cursor-pointer hover:bg-[var(--fill-tsp-white-main)] text-[var(--function-error)]"
@@ -89,7 +86,7 @@ import { useI18n } from 'vue-i18n';
 import { useAuth } from '../composables/useAuth';
 import { useSettingsDialog } from '../composables/useSettingsDialog';
 import { getCachedAuthProvider, getCachedClientConfig } from '../api/config';
-import { BrainCircuit, ExternalLink, LogOut, Settings2, User } from 'lucide-vue-next';
+import { BrainCircuit, ExternalLink, LogOut, User, Settings2 } from 'lucide-vue-next';
 
 const router = useRouter();
 const { t } = useI18n();
@@ -131,9 +128,9 @@ onMounted(async () => {
     authProvider.value = await getCachedAuthProvider();
     const config = await getCachedClientConfig();
     sub2apiLinks.value = [
-        { label: '控制台', url: config?.sub2api_console_url ?? null },
-        { label: '模型广场', url: config?.sub2api_marketplace_url ?? null },
-        { label: '用 Token', url: config?.sub2api_use_token_url ?? null },
+        { label: 'Sub2API Console', url: config?.sub2api_console_url ?? null },
+        { label: 'Model Marketplace', url: config?.sub2api_marketplace_url ?? null },
+        { label: 'Use Token', url: config?.sub2api_use_token_url ?? null },
     ];
 });
 </script>

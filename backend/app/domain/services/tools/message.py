@@ -1,14 +1,17 @@
-from ast import And
 from typing import List, Optional, Union
-from app.domain.services.tools.base import BaseToolkit
+from app.domain.services.tools.base import BaseToolkit, tool
 from app.domain.models.tool_result import ToolResult
-from langchain.tools import tool
 
 
 class MessageToolkit(BaseToolkit):
     """Message tool class, providing message sending functions for user interaction"""
 
     name: str = "message"
+    instructions: str = """
+- Use message_notify_user for brief progress updates that need no response
+- Use message_ask_user only when blocked on essential input, authorization, credentials, or browser takeover
+- Deliver actual results and verified files, not internal plans or todo lists
+"""
     
     def __init__(self):
         """Initialize message tool class"""

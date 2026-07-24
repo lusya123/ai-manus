@@ -1,6 +1,18 @@
 export default {
   'Hello': '你好',
   'What can I do for you?': '我能为你做什么？',
+  // Home suggestion chips
+  'Create slides': '创建幻灯片',
+  'Build website': '构建网站',
+  'Design': '设计',
+  'Create games': '创建游戏',
+  'Deep research': '深入研究',
+  'Analyze data': '分析数据',
+  'Generate image': '生成图片',
+  'Write report': '撰写报告',
+  'More': '更多',
+  'Collapse sidebar': '收起侧边栏',
+  'Expand sidebar': '展开侧边栏',
   'Failed to create agent, please try again later': '创建Agent失败，请稍后重试',
   'New Chat': '新对话',
   'New Task': '新建任务',
@@ -31,7 +43,7 @@ export default {
   'Open workspace': '打开工作台',
   'Open Manus workspace': '打开 Manus 工作台',
   'Hide workspace': '收起工作台',
-  'No Manus workspace yet': '还没有可打开的 Manus 工作台，等 Manus 使用工具后就能点这里打开',
+  'No Manus workspace yet': '还没有可打开的 Manus 工作台，等 Manus 使用工具后就能打开',
   'Open file': '打开文件',
   'Failed to load file content': '加载文件内容失败',
   'Give Manus a task to work on...': '给 Manus 一个任务...',
@@ -51,7 +63,6 @@ export default {
   'Viewing webpage': '正在查看网页',
   'Navigating to webpage': '正在导航到网页',
   'Restarting browser': '正在重启浏览器',
-  'Showing preview': '正在显示预览',
   'Clicking element': '正在点击元素',
   'Entering text': '正在输入文本',
   'Moving mouse': '正在移动鼠标',
@@ -61,6 +72,7 @@ export default {
   'Scrolling down': '正在向下滚动',
   'Executing JS code': '正在执行JS代码',
   'Viewing console output': '正在查看控制台输出',
+  'Showing preview': '正在显示预览',
   // Search tools
   'Searching web': '正在搜索网络',
   // Message tools
@@ -70,6 +82,7 @@ export default {
   'Terminal': '终端',
   'File': '文件',
   'Browser': '浏览器',
+  'Preview': '预览',
   'Information': '信息',
   'Message': '消息',
   // Dialog
@@ -86,6 +99,10 @@ export default {
   'Take Over': '接管',
   'Open preview': '打开预览',
   'Preparing preview': '正在准备预览',
+  'Preview unavailable': '预览暂不可用',
+  'Retry': '重试',
+  'You are signed out of Manus': '你已退出 Manus',
+  'Continue with Sub2API': '继续使用 Sub2API',
   // Session File List
   'All Files in This Task': '此任务中的所有文件',
   'No Content': '暂无内容',
@@ -138,6 +155,9 @@ export default {
   'Logout': '退出登录',
   'Unknown User': '未知用户',
   'No email': '无邮箱',
+  'Sub2API Console': 'Sub2API 控制台',
+  'Model Marketplace': '模型广场',
+  'Use Token': '使用 Token',
   // Settings Dialog
   'Settings': '设置',
   'Account': '账户',
@@ -175,6 +195,11 @@ export default {
   'Model settings saved': '模型设置已保存',
   'Model name is required': '请填写模型名称',
   'Provider is required': '请填写供应商',
+  'Unsupported provider': '服务器不支持这个模型供应商',
+  'API Base URL is required': '请填写 API Base URL',
+  'API Base URL is invalid': '请输入不含账号、查询参数或锚点的有效 HTTP(S) API 地址',
+  'API key is required': '请填写 API Key',
+  'Model configuration is incomplete': '模型配置不完整',
   // Profile Settings
   'Name': '名称',
   'Full name updated successfully': '姓名修改成功',
@@ -244,6 +269,10 @@ export default {
   'Link copied to clipboard': '链接已复制到剪贴板',
   'Failed to copy link': '复制链接失败',
   'You are viewing a completed Manus task. Replay will start automatically in {countdown} seconds.': '您正在查看一个已完成的 Manus 任务。回放将在 {countdown} 秒后自动开始。',
+  'Manus task replay completed.': 'Manus 任务回放完成。',
+  'Manus is replaying the task...': 'Manus 正在回放任务...',
+  'Replay': '重放',
+  'Jump to result': '跳转到结果',
   // Claw Page
   'Deploy OpenClaw Instantly': '极速部署 OpenClaw',
   'OpenClaw is an AI assistant with unique personality and long-term memory, one-click deploy to sandbox cloud, no complex setup, 24/7 online': 'OpenClaw 是一个具备独特个性与长期记忆能力的 AI 助手，一键部署到沙盒云端，无需复杂设置，7×24 在线',
@@ -267,4 +296,4 @@ export default {
   'Please check {count} attachment(s) I sent': '（请查看我发送的 {count} 个附件）',
   'WebSocket not connected, please try again later': 'WebSocket 未连接，请稍后重试',
   'Claw has expired, please recreate.': 'Claw 已过期，请重新创建。',
-} 
+}

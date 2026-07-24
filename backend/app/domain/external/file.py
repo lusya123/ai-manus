@@ -9,6 +9,10 @@ class FileTooLargeError(RuntimeError):
 class FileStorageQuotaExceededError(RuntimeError):
     """A user has exhausted the configured byte or file-count quota."""
 
+
+class FileStorageBusyError(RuntimeError):
+    """The process has reached its bounded concurrent storage-work limit."""
+
 class FileStorage(Protocol):
     """File storage service interface for file upload and download operations"""
     

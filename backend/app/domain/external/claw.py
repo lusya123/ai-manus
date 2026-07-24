@@ -4,6 +4,10 @@ from dataclasses import dataclass
 from app.domain.models.claw import ClawMessage
 
 
+class ClawResponseTooLargeError(RuntimeError):
+    """Raised when a streamed Claw answer exceeds its configured byte cap."""
+
+
 @dataclass
 class ClawInstanceInfo:
     """Connection info returned after creating a claw instance."""

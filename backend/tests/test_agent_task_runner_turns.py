@@ -20,12 +20,23 @@ async def test_browser_screenshot_bytes_are_wrapped_for_file_storage():
             return b"\x89PNG\r\n\x1a\nimage"
 
     class FileStorage:
-        async def upload_file(self, stream, filename, user_id, content_type=None):
+        async def upload_file(
+            self,
+            stream,
+            filename,
+            user_id,
+            content_type=None,
+            metadata=None,
+        ):
             assert isinstance(stream, io.BytesIO)
             assert stream.read() == b"\x89PNG\r\n\x1a\nimage"
             assert filename == "screenshot.png"
             assert user_id == "owner"
             assert content_type == "image/png"
+            assert metadata == {
+                "manus_auto_artifact_session_id": "session-1",
+                "manus_auto_artifact_kind": "browser_screenshot",
+            }
             return FileInfo(
                 file_id="screenshot-file",
                 filename="screenshot.png",
@@ -52,7 +63,6 @@ async def test_browser_screenshot_bytes_are_wrapped_for_file_storage():
 
     assert await runner._get_browser_screenshot() == "screenshot-file"
     assert runner._session_repository.operations == [
-        ("remove", "session-1", "screenshot-file"),
         (
             "add",
             "session-1",

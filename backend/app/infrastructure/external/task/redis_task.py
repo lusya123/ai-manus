@@ -3,7 +3,12 @@ import uuid
 import logging
 from typing import Any, Dict, Optional
 
-from app.domain.external.task import Task, TaskRunner, TaskRunnerFactory
+from app.domain.external.task import (
+    RunnerCleanupCapacityError,
+    Task,
+    TaskRunner,
+    TaskRunnerFactory,
+)
 from app.domain.utils.error_reporting import safe_exception_summary
 from app.infrastructure.external.message_queue.redis_stream_queue import RedisStreamQueue, MessageQueue
 
@@ -20,6 +25,12 @@ class RedisStreamTask(Task):
     _task_registry: Dict[str, 'RedisStreamTask'] = {}
     _runner_factory: Optional[TaskRunnerFactory] = None
     _DESTROY_CANCEL_TIMEOUT_SECONDS = 15.0
+    _RUNNER_CAPACITY_RETRY_INITIAL_SECONDS = 0.05
+    _RUNNER_CAPACITY_RETRY_MAX_SECONDS = 1.0
+    _GENERIC_FACTORY_RETRIES_BEFORE_RECOVERY = 3
+    _RETRYABLE_CONTROL_CANCELLATIONS = frozenset(
+        {"claim_lost", "mongo_claim_lost"}
+    )
     
     def __init__(self, params: Dict[str, Any], *, task_id: Optional[str] = None):
         """Initialize Redis Stream task with serializable runner parameters.
@@ -32,6 +43,10 @@ class RedisStreamTask(Task):
         self._runner: Optional[TaskRunner] = None
         self._runner_closed = False
         self._id = task_id or str(uuid.uuid4())
+        # Runner construction is part of the task lifecycle too.  Keep it in
+        # a separate, shared task so concurrent cold-start run() calls await
+        # one factory operation and cancel()/wait_for_done() can observe it.
+        self._startup_task: Optional[asyncio.Task] = None
         self._execution_task: Optional[asyncio.Task] = None
         # A second message can be submitted while the current runner is just
         # about to observe an empty input stream and return.  Remember that
@@ -53,12 +68,37 @@ class RedisStreamTask(Task):
     def id(self) -> str:
         """Task ID."""
         return self._id
+
+    def refresh_runner_params(self, params: Dict[str, Any]) -> None:
+        """Fill legacy metadata without moving this task to another runtime."""
+        for field in ("session_id", "agent_id", "user_id", "sandbox_id"):
+            previous = self._params.get(field)
+            incoming = params.get(field)
+            if previous is not None and previous != incoming:
+                raise RuntimeError(
+                    f"Task {self._id} cannot change bound {field}"
+                )
+        previous_generation = self._params.get("task_sandbox_id")
+        incoming_generation = params.get("task_sandbox_id")
+        if (
+            previous_generation is not None
+            and previous_generation != incoming_generation
+        ):
+            raise RuntimeError(
+                f"Task {self._id} cannot change sandbox generation"
+            )
+        self._params = dict(params)
+
+    def _bound_runner_params(self) -> Dict[str, Any]:
+        return {**self._params, "task_id": self._id}
     
     @property
     def _done(self) -> bool:
-        if self._execution_task is None:
-            return True
-        return self._execution_task.done()
+        startup_task = getattr(self, "_startup_task", None)
+        if startup_task is not None and not startup_task.done():
+            return False
+        execution_task = getattr(self, "_execution_task", None)
+        return execution_task is None or execution_task.done()
     
     async def is_done(self) -> bool:
         """Check if the task is done.
@@ -70,16 +110,30 @@ class RedisStreamTask(Task):
     
     async def run(self) -> None:
         """Run the task using the runner built by the registered factory."""
+        # A caller may retain an object just before its completed execution
+        # removes it from the registry.  If recover() has since installed a
+        # replacement for the same durable stream ID, that incumbent is the
+        # sole lifecycle owner.  Delegate before inspecting or publishing any
+        # local startup state so the stale object cannot overwrite the new
+        # registry entry and create a second runner (registry ABA).
+        incumbent = RedisStreamTask._task_registry.get(self._id)
+        if incumbent is not None and incumbent is not self:
+            await incumbent.run()
+            return
+
+        # There is no await before a new startup task is assigned.  Event-loop
+        # scheduling therefore makes the check-and-publish single-flight:
+        # every concurrent caller that arrives during construction observes
+        # and awaits this exact task instead of invoking the factory again.
+        startup_task = getattr(self, "_startup_task", None)
+        if startup_task is not None and not startup_task.done():
+            await asyncio.shield(startup_task)
+            return
+
         if not self._done:
             if not self._cancel_requested:
                 self._rerun_requested = True
             return
-
-        if self._runner is None or getattr(self, "_runner_closed", False):
-            if RedisStreamTask._runner_factory is None:
-                raise RuntimeError("No TaskRunnerFactory registered for RedisStreamTask")
-            self._runner = await RedisStreamTask._runner_factory.create_runner(self._params)
-            self._runner_closed = False
 
         self._rerun_requested = False
         self._cancel_requested = False
@@ -87,8 +141,62 @@ class RedisStreamTask(Task):
         # turn can legitimately reuse the same task object obtained just
         # before that cleanup, so register it again before restarting.
         RedisStreamTask._task_registry[self._id] = self
-        self._execution_task = asyncio.create_task(self._execute_task())
-        logger.info(f"Task {self._id} execution started")
+        startup_task = asyncio.create_task(self._start_execution())
+        self._startup_task = startup_task
+        # Shield the shared startup from cancellation of one HTTP caller.  An
+        # explicit task.cancel() still cancels it directly below.
+        await asyncio.shield(startup_task)
+
+    async def _close_unstarted_runner(self) -> None:
+        """Close a runner built after cancellation but never executed."""
+        runner = self._runner
+        close = getattr(runner, "aclose", None) if runner else None
+        try:
+            if callable(close):
+                await close()
+        except Exception as exc:
+            logger.error(
+                "Task %s unstarted runner cleanup failed: %s",
+                self._id,
+                safe_exception_summary(exc),
+            )
+        finally:
+            self._runner_closed = True
+
+    async def _start_execution(self) -> None:
+        """Build one runner and publish its execution task atomically."""
+        try:
+            if self._runner is None or getattr(self, "_runner_closed", False):
+                factory = RedisStreamTask._runner_factory
+                if factory is None:
+                    raise RuntimeError(
+                        "No TaskRunnerFactory registered for RedisStreamTask"
+                    )
+                self._runner = await factory.create_runner(
+                    self._bound_runner_params()
+                )
+                self._runner_closed = False
+
+            # A defensive factory may finish constructing and return a runner
+            # while suppressing CancelledError in order to clean up.  Honour
+            # the explicit request before exposing an execution coroutine and
+            # release every handle/cleanup lease owned by that runner.
+            if getattr(self, "_cancel_requested", False):
+                await self._close_unstarted_runner()
+                self._finish_explicit_cancellation()
+                return
+
+            self._execution_task = asyncio.create_task(self._execute_task())
+            logger.info(f"Task {self._id} execution started")
+        except asyncio.CancelledError:
+            # AgentTaskRunnerFactory owns cleanup for cancellation raised
+            # during construction.  If a custom factory returned a runner,
+            # the branch above closes it before reaching this handler.
+            if getattr(self, "_cancel_requested", False):
+                self._finish_explicit_cancellation()
+            else:
+                self._cleanup_registry()
+            raise
     
     async def cancel(self) -> bool:
         """Cancel the task.
@@ -96,7 +204,21 @@ class RedisStreamTask(Task):
         Returns:
             bool: True if the task is cancelled, False otherwise
         """
+        startup_task = getattr(self, "_startup_task", None)
+        if startup_task is not None and not startup_task.done():
+            if getattr(self, "_cancel_requested", False):
+                # Do not inject a second CancelledError while the factory is
+                # releasing partially constructed handles/leases.
+                return True
+            self._cancel_requested = True
+            self._rerun_requested = False
+            startup_task.cancel()
+            logger.info(f"Task {self._id} startup cancelled")
+            return True
+
         if not self._done:
+            if getattr(self, "_cancel_requested", False):
+                return True
             self._cancel_requested = True
             self._rerun_requested = False
             self._execution_task.cancel()
@@ -113,26 +235,37 @@ class RedisStreamTask(Task):
         task registered until this coroutine exits also prevents another API
         request from mistaking a cancelling task for a missing one.
         """
-        execution_task = self._execution_task
-        if execution_task is None or execution_task.done():
-            return True
-        try:
-            await asyncio.wait_for(
-                asyncio.shield(execution_task), timeout=max(0.0, timeout_seconds)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, timeout_seconds)
+        while True:
+            startup_task = getattr(self, "_startup_task", None)
+            execution_task = getattr(self, "_execution_task", None)
+            pending_task = (
+                startup_task
+                if startup_task is not None and not startup_task.done()
+                else execution_task
+                if execution_task is not None and not execution_task.done()
+                else None
             )
-        except asyncio.CancelledError:
-            # A normally acknowledged cancellation leaves the execution task
-            # in the cancelled state, which is still terminal/done.  Preserve
-            # cancellation of the caller itself when the execution is live.
-            current_task = asyncio.current_task()
-            if current_task is not None and current_task.cancelling():
-                raise
-            if execution_task.done():
+            if pending_task is None:
                 return True
-            raise
-        except TimeoutError:
-            return False
-        return execution_task.done()
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(pending_task),
+                    timeout=max(0.0, deadline - loop.time()),
+                )
+            except asyncio.CancelledError:
+                # A normally acknowledged cancellation leaves startup or
+                # execution in a cancelled state.  Preserve cancellation of
+                # this waiter itself, then loop because successful startup may
+                # have published a still-live execution task.
+                current_task = asyncio.current_task()
+                if current_task is not None and current_task.cancelling():
+                    raise
+                if not pending_task.done():
+                    raise
+            except TimeoutError:
+                return False
     
     @property
     def input_stream(self) -> MessageQueue:
@@ -172,9 +305,248 @@ class RedisStreamTask(Task):
     
     def _cleanup_registry(self) -> None:
         """Remove this task from the registry."""
-        if self._id in RedisStreamTask._task_registry:
-            del RedisStreamTask._task_registry[self._id]
+        if RedisStreamTask._task_registry.get(self._id) is self:
+            RedisStreamTask._task_registry.pop(self._id, None)
             logger.info(f"Task {self._id} removed from registry")
+
+    @staticmethod
+    def _consume_internal_cancellation() -> None:
+        """Clear cancellation used as an infrastructure retry signal."""
+        current = asyncio.current_task()
+        uncancel = getattr(current, "uncancel", None)
+        if current is None or not callable(uncancel):
+            return
+        while current.cancelling():
+            uncancel()
+
+    @classmethod
+    def _is_retryable_control_cancellation(
+        cls,
+        error: asyncio.CancelledError,
+    ) -> bool:
+        reason = str(error.args[0]) if error.args else ""
+        return reason in cls._RETRYABLE_CONTROL_CANCELLATIONS
+
+    def _finish_explicit_cancellation(self) -> None:
+        self._cancel_requested = False
+        self._rerun_requested = False
+        self._cleanup_registry()
+
+    async def _wait_before_runner_retry(
+        self,
+        delay: float,
+        *,
+        reason: str,
+    ) -> bool:
+        """Wait without letting a user cancellation strand the task."""
+        try:
+            await asyncio.sleep(max(0.0, delay))
+        except asyncio.CancelledError as exc:
+            if self._cancel_requested:
+                logger.info(
+                    "Task %s %s wait cancelled by user request",
+                    self._id,
+                    reason,
+                )
+                self._finish_explicit_cancellation()
+                return False
+            cancellation_reason = str(exc.args[0]) if exc.args else "unknown"
+            if not self._is_retryable_control_cancellation(exc):
+                logger.info(
+                    "Task %s %s wait cancelled by runtime shutdown "
+                    "(reason=%s)",
+                    self._id,
+                    reason,
+                    cancellation_reason,
+                )
+                self._finish_explicit_cancellation()
+                return False
+            self._consume_internal_cancellation()
+            logger.warning(
+                "Task %s %s wait received an infrastructure cancellation; "
+                "continuing durable recovery (reason=%s)",
+                self._id,
+                reason,
+                cancellation_reason,
+            )
+        return True
+
+    async def _rebuild_runner_until_resolved(self) -> bool:
+        """Rebuild a local runner or durably resolve work before returning.
+
+        A rerun request has already been committed to Redis and Mongo before
+        this method is reached.  Returning ``False`` is therefore permitted
+        only after explicit cancellation or after the factory's durable
+        recovery hook confirms that no live turn remains.
+        """
+        retry_delay = self._RUNNER_CAPACITY_RETRY_INITIAL_SECONDS
+        capacity_retries = 0
+        generic_failures = 0
+        stable_recovery_error: Optional[str] = None
+        while True:
+            factory = RedisStreamTask._runner_factory
+            if factory is None:
+                generic_failures += 1
+                if generic_failures & (generic_failures - 1) == 0:
+                    logger.error(
+                        "Task %s has no runner factory while durable work "
+                        "remains queued (attempt=%s)",
+                        self._id,
+                        generic_failures,
+                    )
+                if not await self._wait_before_runner_retry(
+                    retry_delay,
+                    reason="missing runner factory",
+                ):
+                    return False
+                retry_delay = min(
+                    retry_delay * 2,
+                    self._RUNNER_CAPACITY_RETRY_MAX_SECONDS,
+                )
+                continue
+
+            try:
+                runner = await factory.create_runner(
+                    self._bound_runner_params()
+                )
+            except RunnerCleanupCapacityError:
+                # Cleanup admission fails before any new handles are created.
+                # The queued turn must retain this execution task as its
+                # worker until an existing cleanup lease is released.
+                capacity_retries += 1
+                if capacity_retries & (capacity_retries - 1) == 0:
+                    logger.warning(
+                        "Task %s runner cleanup capacity is exhausted; "
+                        "waiting to rebuild durable work (attempt=%s)",
+                        self._id,
+                        capacity_retries,
+                    )
+                if not await self._wait_before_runner_retry(
+                    retry_delay,
+                    reason="cleanup-capacity recovery",
+                ):
+                    return False
+                retry_delay = min(
+                    retry_delay * 2,
+                    self._RUNNER_CAPACITY_RETRY_MAX_SECONDS,
+                )
+                continue
+            except asyncio.CancelledError as exc:
+                if self._cancel_requested:
+                    logger.info(
+                        "Task %s runner rebuild cancelled by user request",
+                        self._id,
+                    )
+                    self._finish_explicit_cancellation()
+                    return False
+                cancellation_reason = str(exc.args[0]) if exc.args else "unknown"
+                if not self._is_retryable_control_cancellation(exc):
+                    logger.info(
+                        "Task %s runner rebuild cancelled by runtime "
+                        "shutdown (reason=%s)",
+                        self._id,
+                        cancellation_reason,
+                    )
+                    self._finish_explicit_cancellation()
+                    return False
+                self._consume_internal_cancellation()
+                logger.warning(
+                    "Task %s runner rebuild received an infrastructure "
+                    "cancellation; retrying (reason=%s)",
+                    self._id,
+                    cancellation_reason,
+                )
+                if not await self._wait_before_runner_retry(
+                    retry_delay,
+                    reason="runner rebuild",
+                ):
+                    return False
+                retry_delay = min(
+                    retry_delay * 2,
+                    self._RUNNER_CAPACITY_RETRY_MAX_SECONDS,
+                )
+                continue
+            except Exception as exc:
+                generic_failures += 1
+                summary = safe_exception_summary(exc)
+                if stable_recovery_error is None:
+                    # Mongo recovery may commit FAILED and then lose its reply
+                    # while repairing quota/outbox postconditions. Reuse the
+                    # first exact error marker so the retry selects and
+                    # repairs that same terminal row even if later factory
+                    # exceptions have a different HTTP status/errno.
+                    stable_recovery_error = (
+                        f"Runner factory failed: {summary}"
+                    )
+                if generic_failures & (generic_failures - 1) == 0:
+                    logger.error(
+                        "Task %s runner rebuild failed; retrying without "
+                        "orphaning durable work (attempt=%s error=%s)",
+                        self._id,
+                        generic_failures,
+                        summary,
+                    )
+
+                recover = getattr(factory, "recover_factory_failure", None)
+                if (
+                    generic_failures
+                    >= self._GENERIC_FACTORY_RETRIES_BEFORE_RECOVERY
+                    and callable(recover)
+                ):
+                    try:
+                        resolved = await recover(
+                            self._params,
+                            task_id=self._id,
+                            error=stable_recovery_error,
+                        )
+                    except asyncio.CancelledError as recovery_cancel:
+                        if self._cancel_requested:
+                            self._finish_explicit_cancellation()
+                            return False
+                        if not self._is_retryable_control_cancellation(
+                            recovery_cancel
+                        ):
+                            self._finish_explicit_cancellation()
+                            return False
+                        self._consume_internal_cancellation()
+                        resolved = False
+                    except Exception as recovery_exc:
+                        logger.error(
+                            "Task %s durable factory-failure recovery failed; "
+                            "will retry (error=%s)",
+                            self._id,
+                            safe_exception_summary(recovery_exc),
+                        )
+                        resolved = False
+                    if resolved:
+                        # A concurrent run() may have queued work after the
+                        # recovery query. In that case rebuild once more so it
+                        # cannot fall into the completion boundary.
+                        if self._rerun_requested:
+                            self._rerun_requested = False
+                            generic_failures = 0
+                            stable_recovery_error = None
+                            retry_delay = (
+                                self._RUNNER_CAPACITY_RETRY_INITIAL_SECONDS
+                            )
+                            continue
+                        self._cleanup_registry()
+                        return False
+
+                if not await self._wait_before_runner_retry(
+                    retry_delay,
+                    reason="runner-factory recovery",
+                ):
+                    return False
+                retry_delay = min(
+                    retry_delay * 2,
+                    self._RUNNER_CAPACITY_RETRY_MAX_SECONDS,
+                )
+                continue
+
+            self._runner = runner
+            self._runner_closed = False
+            return True
     
     async def _execute_task(self):
         """Execute every requested runner generation without a tail gap.
@@ -183,10 +555,15 @@ class RedisStreamTask(Task):
         final rerun check therefore happens after those awaits, and registry
         removal immediately follows a negative check with no intervening await.
         """
+        execution_retry_delay = self._RUNNER_CAPACITY_RETRY_INITIAL_SECONDS
         while True:
+            execution_error: Optional[BaseException] = None
             try:
                 while True:
                     await self._runner.run(self)
+                    execution_retry_delay = (
+                        self._RUNNER_CAPACITY_RETRY_INITIAL_SECONDS
+                    )
                     if self._cancel_requested or not self._rerun_requested:
                         break
                     self._rerun_requested = False
@@ -195,50 +572,95 @@ class RedisStreamTask(Task):
                         "rechecking its input stream",
                         self._id,
                     )
-            except asyncio.CancelledError:
-                logger.info(f"Task {self._id} execution cancelled")
-                self._cancel_requested = True
-            except Exception as e:
+            except asyncio.CancelledError as exc:
+                if self._cancel_requested:
+                    logger.info(
+                        "Task %s execution cancelled by user request",
+                        self._id,
+                    )
+                elif self._is_retryable_control_cancellation(exc):
+                    # AgentTaskRunner uses cancellation as a fencing signal
+                    # when its Mongo claim renewal is lost. Celery retries that
+                    # exact state; local execution must do the same instead of
+                    # confusing it with an explicit stop request.
+                    self._consume_internal_cancellation()
+                    execution_error = exc
+                    cancellation_reason = (
+                        str(exc.args[0]) if exc.args else "unknown"
+                    )
+                    logger.error(
+                        "Task %s execution lost infrastructure ownership; "
+                        "rebuilding durable worker (reason=%s)",
+                        self._id,
+                        cancellation_reason,
+                    )
+                else:
+                    cancellation_reason = (
+                        str(exc.args[0]) if exc.args else "runtime shutdown"
+                    )
+                    logger.info(
+                        "Task %s execution cancelled outside durable control; "
+                        "stopping local worker (reason=%s)",
+                        self._id,
+                        cancellation_reason,
+                    )
+                    self._cancel_requested = True
+            except Exception as exc:
+                execution_error = exc
                 logger.error(
-                    "Task %s execution failed: %s",
+                    "Task %s execution failed before durable completion; "
+                    "rebuilding worker: %s",
                     self._id,
-                    safe_exception_summary(e),
+                    safe_exception_summary(exc),
                 )
 
-            await self._finalize_runner()
+            try:
+                await self._finalize_runner()
+            except asyncio.CancelledError as exc:
+                if self._cancel_requested:
+                    logger.info(
+                        "Task %s runner finalization cancelled by user request",
+                        self._id,
+                    )
+                elif self._is_retryable_control_cancellation(exc):
+                    self._consume_internal_cancellation()
+                    execution_error = execution_error or exc
+                    logger.error(
+                        "Task %s runner finalization was interrupted; "
+                        "rebuilding durable worker",
+                        self._id,
+                    )
+                else:
+                    logger.info(
+                        "Task %s runner finalization cancelled by runtime "
+                        "shutdown",
+                        self._id,
+                    )
+                    self._cancel_requested = True
 
             if self._cancel_requested:
-                self._cancel_requested = False
-                self._rerun_requested = False
-                self._cleanup_registry()
+                self._finish_explicit_cancellation()
                 return
 
-            if not self._rerun_requested:
+            if execution_error is None and not self._rerun_requested:
                 # No await is allowed between this final check and removal:
                 # otherwise run() could set a marker that nobody consumes.
                 self._cleanup_registry()
                 return
 
+            if execution_error is not None:
+                if not await self._wait_before_runner_retry(
+                    execution_retry_delay,
+                    reason="execution recovery",
+                ):
+                    return
+                execution_retry_delay = min(
+                    execution_retry_delay * 2,
+                    self._RUNNER_CAPACITY_RETRY_MAX_SECONDS,
+                )
+
             self._rerun_requested = False
-            if RedisStreamTask._runner_factory is None:
-                logger.error(
-                    "Task %s cannot rebuild its runner for a requested rerun",
-                    self._id,
-                )
-                self._cleanup_registry()
-                return
-            try:
-                self._runner = await RedisStreamTask._runner_factory.create_runner(
-                    self._params
-                )
-                self._runner_closed = False
-            except Exception as exc:
-                logger.error(
-                    "Task %s runner rebuild failed: %s",
-                    self._id,
-                    safe_exception_summary(exc),
-                )
-                self._cleanup_registry()
+            if not await self._rebuild_runner_until_resolved():
                 return
     
     @classmethod
@@ -279,24 +701,74 @@ class RedisStreamTask(Task):
     async def destroy(cls) -> None:
         """Destroy all task instances."""
         # Never release a runner handle while its coroutine may still be using
-        # it. cancel() only schedules cancellation; wait for acknowledgement,
-        # then close clients non-destructively. Sandbox deletion belongs to the
-        # session cleanup path, not global task-backend shutdown.
-        for task in list(cls._task_registry.values()):
-            await task.cancel()
-            stopped = await task.wait_for_done(
-                cls._DESTROY_CANCEL_TIMEOUT_SECONDS
-            )
-            if not stopped:
+        # it. Broadcast cancellation to the whole snapshot before waiting;
+        # sequential 15-second waits let later tasks miss the application's
+        # 30-second shutdown window entirely. All acknowledgements share one
+        # deadline, and only confirmed-stopped runners are closed.
+        tasks = list({id(task): task for task in cls._task_registry.values()}.values())
+        if not tasks:
+            return
+
+        cancel_results = await asyncio.gather(
+            *(task.cancel() for task in tasks),
+            return_exceptions=True,
+        )
+        for task, result in zip(tasks, cancel_results):
+            if isinstance(result, BaseException):
                 logger.error(
-                    "Task %s did not stop during shutdown; retaining its resources",
+                    "Task %s cancellation request failed during shutdown: %s",
                     task.id,
+                    safe_exception_summary(result),
                 )
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + cls._DESTROY_CANCEL_TIMEOUT_SECONDS
+
+        async def wait_for_stop(task: "RedisStreamTask") -> bool:
+            return await task.wait_for_done(max(0.0, deadline - loop.time()))
+
+        wait_results = await asyncio.gather(
+            *(wait_for_stop(task) for task in tasks),
+            return_exceptions=True,
+        )
+        stopped_tasks: list[RedisStreamTask] = []
+        for task, result in zip(tasks, wait_results):
+            if result is True:
+                stopped_tasks.append(task)
                 continue
-            if task._runner:
-                close = getattr(task._runner, "aclose", None)
+            detail = (
+                safe_exception_summary(result)
+                if isinstance(result, BaseException)
+                else "timeout"
+            )
+            logger.error(
+                "Task %s did not stop during shutdown (%s); retaining its resources",
+                task.id,
+                detail,
+            )
+
+        async def close_stopped_runner(task: "RedisStreamTask") -> None:
+            if getattr(task, "_runner_closed", False):
+                return
+            runner = task._runner
+            close = getattr(runner, "aclose", None) if runner else None
+            try:
                 if callable(close):
                     await close()
+            finally:
+                task._runner_closed = True
+
+        close_results = await asyncio.gather(
+            *(close_stopped_runner(task) for task in stopped_tasks),
+            return_exceptions=True,
+        )
+        for task, result in zip(stopped_tasks, close_results):
+            if isinstance(result, BaseException):
+                logger.error(
+                    "Task %s runner close failed during shutdown: %s",
+                    task.id,
+                    safe_exception_summary(result),
+                )
     
     def __repr__(self) -> str:
         """String representation of the task."""

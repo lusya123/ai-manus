@@ -415,29 +415,50 @@ class AgentService:
                 )
                 if not session:
                     return
+                claim_delete = getattr(
+                    self._session_repository, "claim_session_delete", None
+                )
+                if callable(claim_delete) and not session.deleting:
+                    if not await claim_delete(session_id, user_id):
+                        current = (
+                            await self._session_repository.find_by_id_and_user_id(
+                                session_id, user_id
+                            )
+                        )
+                        if current is None:
+                            return
+                        if not current.deleting:
+                            raise RuntimeError(
+                                "Session deletion claim changed concurrently"
+                            )
+                        session = current
+                    session.deleting = True
                 await self._agent_domain_service.cleanup_session_resources(session)
-                # Remove the credential first while the session is locked. If
-                # the session delete fails, restore the Agent so the visible
-                # session never points at missing model configuration.
-                agent = await self._agent_repository.find_by_id(session.agent_id)
-                try:
-                    # Renewal loss can cancel this coroutine at any await. Keep
-                    # both destructive writes in the rollback boundary.
-                    await self._agent_repository.delete(session.agent_id)
+                # Once the irreversible Session delete claim is durable, the
+                # record is no longer visible/usable as a chat. Never restore
+                # credentials after deleting them: an ambiguous conditional
+                # Session delete may already have committed, and restoration
+                # would create an orphan Agent/BYOK record that no retry can
+                # discover. A failed write leaves the tombstoned Session for a
+                # safe, idempotent cleanup retry.
+                await self._agent_repository.delete(session.agent_id)
+                delete_claimed = getattr(
+                    self._session_repository, "delete_claimed", None
+                )
+                if callable(delete_claimed):
+                    deleted = await delete_claimed(session_id, user_id)
+                    if not deleted:
+                        current = (
+                            await self._session_repository.find_by_id_and_user_id(
+                                session_id, user_id
+                            )
+                        )
+                        if current is not None:
+                            raise RuntimeError(
+                                "Claimed session delete did not commit"
+                            )
+                else:
                     await self._session_repository.delete(session_id)
-                except BaseException:
-                    if agent is not None:
-                        try:
-                            await asyncio.shield(
-                                self._agent_repository.save(agent)
-                            )
-                        except Exception as exc:
-                            logger.error(
-                                "Failed to restore Agent %s after session deletion failed: %s",
-                                session.agent_id,
-                                safe_exception_summary(exc),
-                            )
-                    raise
 
             await self._agent_domain_service.run_session_lifecycle_exclusive(
                 session_id, delete_locked

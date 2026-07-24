@@ -50,7 +50,7 @@ produce.
 
 <sandbox_environment>
 - Ubuntu 22.04 (linux/amd64) with internet access
-- User: `ubuntu` with sudo privileges; home directory: /home/ubuntu
+- Shell commands run as an isolated, unprivileged user; home directory: /home/ubuntu
 - Python 3.10 (python3, pip3), Node.js 20 (node, npm), calculator (bc)
 </sandbox_environment>
 """.strip()

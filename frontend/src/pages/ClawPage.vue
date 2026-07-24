@@ -376,7 +376,13 @@ const handleWSEvent = (chunk: ClawEvent) => {
   if (chunk.type === 'status') {
     const newStatus = chunk.status!;
     clawStatus.value = newStatus;
-    if (newStatus === 'stopped' || newStatus === 'error') {
+    if (newStatus === 'destroying') {
+      clawWS?.disconnect();
+      clawWS = null;
+      isLoadingClaw.value = true;
+      startStatusPolling();
+    }
+    if (newStatus === 'destroying' || newStatus === 'stopped' || newStatus === 'error') {
       streamingAssistantIdx.value = -1;
       removeThinkingMessage();
       isWaitingResponse.value = false;
@@ -476,7 +482,7 @@ const loadClaw = async () => {
       return;
     }
 
-    if (claw.status === 'creating') {
+    if (claw.status === 'creating' || claw.status === 'destroying') {
       startStatusPolling();
       return;
     }
@@ -524,9 +530,22 @@ const startStatusPolling = () => {
         await deleteClaw().catch(() => {});
         clawData.value = null;
         isLoadingClaw.value = false;
+      } else if (claw.status === 'stopped') {
+        stopStatusPolling();
+        clawData.value = null;
+        isLoadingClaw.value = false;
+      } else {
+        isLoadingClaw.value = true;
       }
-    } catch {
-      stopStatusPolling();
+    } catch (err: any) {
+      if (err?.code === 404 || err?.code === 40400) {
+        stopStatusPolling();
+        clawData.value = null;
+        clawStatus.value = 'stopped';
+        isLoadingClaw.value = false;
+      } else {
+        console.error('Failed to poll claw status:', err);
+      }
     }
   }, 3000);
 };

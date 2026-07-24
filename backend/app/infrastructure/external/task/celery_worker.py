@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 
 from beanie import init_beanie
 from celery.exceptions import Reject
+from celery.signals import worker_process_shutdown
 
 from app.core.config import get_settings
 from app.domain.utils.error_reporting import safe_exception_summary
@@ -38,6 +39,34 @@ _initialized = False
 _turn_submission_repository: Optional[TurnSubmissionRepository] = None
 
 _FACTORY_FAILURE_MESSAGE = "Agent worker could not initialize before execution"
+
+
+@worker_process_shutdown.connect
+def _drain_artifact_tasks_before_worker_exit(**_: Any) -> None:
+    """Give committed uploads a bounded publish/compensation grace period."""
+    loop = _loop
+    if loop is None or loop.is_closed():
+        return
+    from app.domain.services.agent_task_runner import (
+        begin_artifact_enrichment_shutdown,
+        drain_artifact_enrichment_tasks,
+    )
+    # Worker-process shutdown is terminal. Do not reopen this loop's gate;
+    # tests that deliberately reuse the loop can call the explicit end hook.
+    begin_artifact_enrichment_shutdown(loop)
+    if loop.is_running():
+        logger.warning(
+            "Celery event loop is still running during worker shutdown; "
+            "artifact admission is closed but synchronous drain is skipped"
+        )
+        return
+    try:
+        loop.run_until_complete(drain_artifact_enrichment_tasks(10.0))
+    except Exception as exc:
+        logger.error(
+            "Celery artifact enrichment shutdown drain failed: %s",
+            safe_exception_summary(exc),
+        )
 
 
 class WorkerStateRetry(RuntimeError):
@@ -401,11 +430,25 @@ async def _run_agent(
             cycle_id = str(uuid.uuid4())
             runner = None
             try:
-                runner = await CeleryTask.get_runner_factory().create_runner(params)
+                runner = await CeleryTask.get_runner_factory().create_runner(
+                    {**params, "task_id": task_id}
+                )
             except Exception as exc:
                 if claim_lost.is_set():
                     raise WorkerStateRetry(
                         "claim", claim_id=effective_claim_id
+                    ) from None
+                from app.domain.services.agent_task_runner import (
+                    RunnerCleanupCapacityError,
+                )
+                if isinstance(exc, RunnerCleanupCapacityError):
+                    logger.warning(
+                        "Task %s runner cleanup capacity is exhausted; "
+                        "retrying without terminalizing its durable turn",
+                        task_id,
+                    )
+                    raise WorkerStateRetry(
+                        "run", claim_id=effective_claim_id
                     ) from None
                 logger.error(
                     "Task %s runner construction failed: %s",

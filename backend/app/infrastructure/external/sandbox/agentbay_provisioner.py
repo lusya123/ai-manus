@@ -24,6 +24,9 @@ from app.domain.repositories.session_repository import SessionRepository
 from app.infrastructure.external.sandbox.agentbay_sandbox import AgentBaySandbox
 
 
+_EXPECTED_TASK_SANDBOX_ID_UNSET = object()
+
+
 class AgentBayProvisioner(SandboxProvisioner):
     """The only application path allowed to allocate billable sessions.
 
@@ -84,7 +87,51 @@ class AgentBayProvisioner(SandboxProvisioner):
             "manus_operation": operation_id,
         }
 
-    async def _persist_runtime(self, session: Session) -> None:
+    async def _persist_runtime(
+        self,
+        session: Session,
+        *,
+        expected_sandbox_id: str | None,
+        expected_task_id: str | None,
+        expected_sandbox_provider: str | None,
+        expected_task_sandbox_id: object = _EXPECTED_TASK_SANDBOX_ID_UNSET,
+    ) -> None:
+        compare_and_set = getattr(
+            self._sessions, "compare_and_set_runtime_ownership", None
+        )
+        if callable(compare_and_set):
+            updated = await compare_and_set(
+                session.id,
+                expected_sandbox_id,
+                expected_task_id,
+                (
+                    session.task_sandbox_id
+                    if expected_task_sandbox_id
+                    is _EXPECTED_TASK_SANDBOX_ID_UNSET
+                    else expected_task_sandbox_id
+                ),
+                expected_sandbox_provider,
+                session.sandbox_id,
+                session.task_id,
+                session.sandbox_provider,
+                session.task_sandbox_id,
+            )
+            if updated:
+                return
+            current = await self._sessions.find_by_id(session.id)
+            if (
+                current is not None
+                and current.sandbox_id == session.sandbox_id
+                and current.task_id == session.task_id
+                and current.sandbox_provider == session.sandbox_provider
+                and current.task_sandbox_id == session.task_sandbox_id
+                and not current.sandbox_destroying
+                and not current.deleting
+            ):
+                return
+            raise AgentBayQuotaInconsistentError(
+                "Session runtime changed during AgentBay lifecycle operation"
+            )
         update = getattr(self._sessions, "update_runtime_ownership", None)
         if callable(update):
             await update(
@@ -92,12 +139,27 @@ class AgentBayProvisioner(SandboxProvisioner):
                 session.sandbox_id,
                 session.task_id,
                 session.sandbox_provider,
+                session.task_sandbox_id,
             )
             return
         await self._sessions.save(session)
 
-    async def _persist_runtime_before_cancellation(self, session: Session) -> None:
-        task = asyncio.create_task(self._persist_runtime(session))
+    async def _persist_runtime_before_cancellation(
+        self,
+        session: Session,
+        *,
+        expected_sandbox_id: str | None,
+        expected_task_id: str | None,
+        expected_sandbox_provider: str | None,
+        expected_task_sandbox_id: object = _EXPECTED_TASK_SANDBOX_ID_UNSET,
+    ) -> None:
+        task = asyncio.create_task(self._persist_runtime(
+            session,
+            expected_sandbox_id=expected_sandbox_id,
+            expected_task_id=expected_task_id,
+            expected_sandbox_provider=expected_sandbox_provider,
+            expected_task_sandbox_id=expected_task_sandbox_id,
+        ))
         cancelled = False
         while True:
             try:
@@ -124,6 +186,81 @@ class AgentBayProvisioner(SandboxProvisioner):
         if cancelled:
             raise asyncio.CancelledError
 
+    async def _claim_destroy(self, session: Session) -> None:
+        if session.sandbox_destroying:
+            return
+        claim = getattr(self._sessions, "claim_runtime_destroy", None)
+        if not callable(claim):
+            return
+        claimed = await claim(
+            session.id,
+            session.sandbox_id,
+            session.task_id,
+            session.task_sandbox_id,
+            session.sandbox_provider,
+        )
+        if not claimed:
+            current = await self._sessions.find_by_id(session.id)
+            if not (
+                current is not None
+                and current.sandbox_id == session.sandbox_id
+                and current.task_id == session.task_id
+                and current.task_sandbox_id == session.task_sandbox_id
+                and current.sandbox_provider == session.sandbox_provider
+                and current.sandbox_destroying
+            ):
+                raise AgentBayQuotaInconsistentError(
+                    "Session runtime changed before AgentBay deletion"
+                )
+        session.sandbox_destroying = True
+
+    async def _finish_destroy(
+        self,
+        session: Session,
+        *,
+        expected_sandbox_id: str | None,
+        expected_task_id: str | None,
+        expected_task_sandbox_id: str | None,
+        expected_sandbox_provider: str | None,
+    ) -> None:
+        finish = getattr(self._sessions, "finish_runtime_destroy", None)
+        if callable(finish):
+            finished = await finish(
+                session.id,
+                expected_sandbox_id,
+                expected_task_id,
+                expected_task_sandbox_id,
+                expected_sandbox_provider,
+                session.sandbox_id,
+                session.task_id,
+                session.sandbox_provider,
+                session.task_sandbox_id,
+            )
+            if not finished:
+                current = await self._sessions.find_by_id(session.id)
+                if not (
+                    current is not None
+                    and current.sandbox_id == session.sandbox_id
+                    and current.task_id == session.task_id
+                    and current.sandbox_provider == session.sandbox_provider
+                    and current.task_sandbox_id == session.task_sandbox_id
+                    and not current.sandbox_destroying
+                    and current.deleting == session.deleting
+                ):
+                    raise AgentBayQuotaInconsistentError(
+                        "Session runtime changed while finishing AgentBay deletion"
+                    )
+            session.sandbox_destroying = False
+            return
+        session.sandbox_destroying = False
+        await self._persist_runtime_before_cancellation(
+            session,
+            expected_sandbox_id=expected_sandbox_id,
+            expected_task_id=expected_task_id,
+            expected_sandbox_provider=expected_sandbox_provider,
+            expected_task_sandbox_id=expected_task_sandbox_id,
+        )
+
     async def _adopt_legacy_ownership(
         self,
         session: Session,
@@ -140,8 +277,15 @@ class AgentBayProvisioner(SandboxProvisioner):
                 "Legacy sandbox provider ownership is unknown; the AgentBay "
                 "cost ledger does not exactly match the Session pointer"
             )
+        previous_id = session.sandbox_id
+        previous_task_id = session.task_id
         session.sandbox_provider = self._PROVIDER_NAME
-        await self._persist_runtime_before_cancellation(session)
+        await self._persist_runtime_before_cancellation(
+            session,
+            expected_sandbox_id=previous_id,
+            expected_task_id=previous_task_id,
+            expected_sandbox_provider=None,
+        )
 
     async def _live_labeled_sessions(
         self,
@@ -274,9 +418,16 @@ class AgentBayProvisioner(SandboxProvisioner):
             raise AgentBayQuotaInconsistentError(
                 "Session points to a live provider outside its ledger operation"
             )
+        previous_task_id = session.task_id
+        previous_provider = session.sandbox_provider
         session.sandbox_id = None
         session.sandbox_provider = self._PROVIDER_NAME
-        await self._persist_runtime_before_cancellation(session)
+        await self._persist_runtime_before_cancellation(
+            session,
+            expected_sandbox_id=stale_id,
+            expected_task_id=previous_task_id,
+            expected_sandbox_provider=previous_provider,
+        )
 
     async def _ensure_reserved(
         self,
@@ -346,9 +497,17 @@ class AgentBayProvisioner(SandboxProvisioner):
             operation_id=reservation.operation_id,
             provider_id=provider_id,
         )
+        previous_id = session.sandbox_id
+        previous_task_id = session.task_id
+        previous_provider = session.sandbox_provider
         session.sandbox_id = provider_id
         session.sandbox_provider = self._PROVIDER_NAME
-        await self._persist_runtime_before_cancellation(session)
+        await self._persist_runtime_before_cancellation(
+            session,
+            expected_sandbox_id=previous_id,
+            expected_task_id=previous_task_id,
+            expected_sandbox_provider=previous_provider,
+        )
         # Link resolution happens only after both durable recovery pointers.
         return await self._sandbox_cls.connect(provider)
 
@@ -377,9 +536,17 @@ class AgentBayProvisioner(SandboxProvisioner):
                 session.sandbox_id != provider_id
                 or session.sandbox_provider != self._PROVIDER_NAME
             ):
+                previous_id = session.sandbox_id
+                previous_task_id = session.task_id
+                previous_provider = session.sandbox_provider
                 session.sandbox_id = provider_id
                 session.sandbox_provider = self._PROVIDER_NAME
-                await self._persist_runtime_before_cancellation(session)
+                await self._persist_runtime_before_cancellation(
+                    session,
+                    expected_sandbox_id=previous_id,
+                    expected_task_id=previous_task_id,
+                    expected_sandbox_provider=previous_provider,
+                )
             return await self._sandbox_cls.connect(provider)
 
         replacement_id = str(uuid.uuid4())
@@ -397,9 +564,17 @@ class AgentBayProvisioner(SandboxProvisioner):
             raise AgentBayQuotaInconsistentError(
                 "AgentBay replacement lost its lifecycle compare-and-set"
             )
+        previous_id = session.sandbox_id
+        previous_task_id = session.task_id
+        previous_provider = session.sandbox_provider
         session.sandbox_id = None
         session.sandbox_provider = self._PROVIDER_NAME
-        await self._persist_runtime_before_cancellation(session)
+        await self._persist_runtime_before_cancellation(
+            session,
+            expected_sandbox_id=previous_id,
+            expected_task_id=previous_task_id,
+            expected_sandbox_provider=previous_provider,
+        )
         return await self._ensure_reserved(
             session,
             self._reservation_or_raise(replacement),
@@ -407,6 +582,15 @@ class AgentBayProvisioner(SandboxProvisioner):
         )
 
     async def ensure_locked(self, session: Session) -> Sandbox:
+        if session.deleting:
+            raise AgentBayQuotaInconsistentError(
+                "Session deletion is in progress"
+            )
+        if session.sandbox_destroying:
+            # Resume an exact durable tombstone after a crashed/timed-out
+            # owner. The session lifecycle lease serializes this recovery and
+            # the AgentBay ledger/provider IDs fence it from replacements.
+            await self.destroy_locked(session, preserve_task=True)
         if session.sandbox_provider not in (None, self._PROVIDER_NAME):
             raise AgentBayQuotaInconsistentError(
                 "Session sandbox belongs to a different provider"
@@ -460,7 +644,9 @@ class AgentBayProvisioner(SandboxProvisioner):
                 "AgentBay quota release did not confirm the exact operation"
             )
 
-    async def destroy_locked(self, session: Session) -> None:
+    async def destroy_locked(
+        self, session: Session, *, preserve_task: bool = False
+    ) -> None:
         if session.sandbox_provider not in (None, self._PROVIDER_NAME):
             raise AgentBayQuotaInconsistentError(
                 "Session sandbox belongs to a different provider"
@@ -474,9 +660,21 @@ class AgentBayProvisioner(SandboxProvisioner):
                 raise AgentBayQuotaInconsistentError(
                     "Session has AgentBay ownership missing from the cost ledger"
                 )
-            session.task_id = None
+            previous_id = session.sandbox_id
+            previous_task_id = session.task_id
+            previous_task_sandbox_id = session.task_sandbox_id
+            previous_provider = session.sandbox_provider
+            if not preserve_task:
+                session.task_id = None
+                session.task_sandbox_id = None
             session.sandbox_provider = None
-            await self._persist_runtime_before_cancellation(session)
+            await self._persist_runtime_before_cancellation(
+                session,
+                expected_sandbox_id=previous_id,
+                expected_task_id=previous_task_id,
+                expected_sandbox_provider=previous_provider,
+                expected_task_sandbox_id=previous_task_sandbox_id,
+            )
             return
 
         provider: Any | None = None
@@ -531,11 +729,23 @@ class AgentBayProvisioner(SandboxProvisioner):
             )
         if session.sandbox_id and session.sandbox_id != provider_id:
             await self._clear_stale_session_pointer(session)
+        previous_id = session.sandbox_id
+        previous_task_id = session.task_id
+        previous_task_sandbox_id = session.task_sandbox_id
+        previous_provider = session.sandbox_provider
+        await self._claim_destroy(session)
         if provider is None:
             provider = await self._sandbox_cls.lookup_provider_session(provider_id)
         if provider is not None:
             self._exact_provider_id(provider, provider_id)
-            result = await provider.delete()
+            async with asyncio.timeout(
+                getattr(
+                    self._sandbox_cls,
+                    "_PROVIDER_DELETE_TIMEOUT_SECONDS",
+                    AgentBaySandbox._PROVIDER_DELETE_TIMEOUT_SECONDS,
+                )
+            ):
+                result = await provider.delete()
             if not getattr(result, "success", False):
                 raise SandboxUnavailableError(
                     "AgentBay did not confirm session deletion"
@@ -548,12 +758,26 @@ class AgentBayProvisioner(SandboxProvisioner):
             )
 
         session.sandbox_id = None
-        session.task_id = None
+        if not preserve_task:
+            session.task_id = None
+            session.task_sandbox_id = None
         # Keep the allocator marker until the cost-ledger CAS succeeds. If the
         # release is unavailable, a deployment-wide provider switch must not
         # overwrite the only signal that AgentBay cleanup is still required.
         session.sandbox_provider = self._PROVIDER_NAME
-        await self._persist_runtime_before_cancellation(session)
+        await self._finish_destroy(
+            session,
+            expected_sandbox_id=previous_id,
+            expected_task_id=previous_task_id,
+            expected_task_sandbox_id=previous_task_sandbox_id,
+            expected_sandbox_provider=previous_provider,
+        )
         await self._release(session, reservation)
+        previous_task_id = session.task_id
         session.sandbox_provider = None
-        await self._persist_runtime_before_cancellation(session)
+        await self._persist_runtime_before_cancellation(
+            session,
+            expected_sandbox_id=None,
+            expected_task_id=previous_task_id,
+            expected_sandbox_provider=self._PROVIDER_NAME,
+        )

@@ -10,6 +10,7 @@ import pytest
 
 from app.domain.models.tool_result import ToolResult
 from app.domain.services.tools.base import BaseToolkit, tool
+from app.domain.services.tools.file import FileToolkit
 
 
 class SampleToolkit(BaseToolkit):
@@ -92,3 +93,16 @@ class TestToolLookupAndInvoke:
 
     def test_tool_carries_toolkit_reference(self):
         assert self.tk.get_tool("do_thing").toolkit is self.tk
+
+
+def test_model_file_tools_do_not_expose_privileged_writes():
+    toolkit = FileToolkit(object())
+    schemas = {
+        schema["function"]["name"]: schema["function"]["parameters"]
+        for schema in toolkit.get_tool_schemas()
+    }
+
+    assert "sudo" not in schemas["file_write"]["properties"]
+    assert "sudo" not in schemas["file_str_replace"]["properties"]
+    # Privileged reads remain a separate, read-only compatibility capability.
+    assert "sudo" in schemas["file_read"]["properties"]

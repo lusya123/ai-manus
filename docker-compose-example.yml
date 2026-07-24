@@ -17,6 +17,12 @@ services:
       - sandbox
       - claw
     restart: unless-stopped
+    sysctls:
+      net.ipv4.ip_forward: "0"
+      net.ipv4.conf.all.forwarding: "0"
+      net.ipv4.conf.default.forwarding: "0"
+      net.ipv6.conf.all.forwarding: "0"
+      net.ipv6.conf.default.forwarding: "0"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       #- ./mcp.json:/etc/mcp.json # Mount MCP servers directory
@@ -41,6 +47,9 @@ services:
       - SANDBOX_PIDS_LIMIT=512
       - CLAW_IMAGE=simpleyyt/manus-claw
       - CLAW_NETWORK=manus-network
+      - RUNTIME_NETWORK_ISOLATION=true
+      - RUNTIME_DEPLOYMENT_ID=${RUNTIME_DEPLOYMENT_ID:-ai-manus}
+      - CLAW_PUBLISH_HOST_PORTS=false
 
   sandbox:
     image: simpleyyt/manus-sandbox

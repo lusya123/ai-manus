@@ -10,6 +10,7 @@ from app.interfaces.schemas.base import APIResponse
 from app.interfaces.schemas.file import FileInfoResponse
 from app.interfaces.schemas.resource import AccessTokenRequest, SignedUrlResponse
 from app.domain.external.file import (
+    FileStorageBusyError,
     FileStorageQuotaExceededError,
     FileTooLargeError,
 )
@@ -37,6 +38,11 @@ async def upload_file(
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail=str(exc),
+        ) from exc
+    except FileStorageBusyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="File storage is busy; please retry",
         ) from exc
     
     return APIResponse.success(await FileInfoResponse.from_domain(result))

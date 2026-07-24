@@ -9,8 +9,16 @@ from typing import Optional, List
 import httpx
 
 from app.domain.models.claw import Claw, ClawStatus, ClawMessage, ClawAttachment
-from app.domain.external.claw import ClawRuntime, ClawClient
-from app.domain.repositories.claw_repository import ClawRepository
+from app.domain.external.claw import (
+    ClawClient,
+    ClawResponseTooLargeError,
+    ClawRuntime,
+)
+from app.domain.external.coordination import current_lifecycle_task_lost_lease
+from app.domain.repositories.claw_repository import (
+    ClawRepository,
+    ClawWriteConflictError,
+)
 from app.domain.utils.model_output import sanitize_model_text
 from app.domain.utils.error_reporting import safe_exception_summary
 from app.core.config import get_settings
@@ -34,6 +42,9 @@ class ClawDomainService:
     application-level concerns (SSE event bus, background task scheduling, etc.).
     """
 
+    _OWNERSHIP_RECONCILE_INTERVAL_SECONDS = 1.0
+    _OWNERSHIP_RECONCILE_MAX_ATTEMPTS = 3
+
     def __init__(
         self,
         claw_repository: ClawRepository,
@@ -55,6 +66,123 @@ class ClawDomainService:
         runtime_timeout = getattr(self.claw_runtime, "ready_timeout", None)
         return max(30, runtime_timeout or self.settings.claw_ready_timeout)
 
+    @staticmethod
+    async def _await_task_to_known_outcome(task: asyncio.Task) -> object:
+        """Let lifecycle I/O finish despite repeated caller cancellation."""
+
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if task.done():
+                    break
+                continue
+        return task.result()
+
+    async def _reconcile_failed_provisioning(
+        self,
+        claw: Claw,
+        *,
+        base_error_message: str,
+        rollback_action: str,
+    ) -> None:
+        """Persist deterministic ownership before exact-name rollback."""
+
+        async def state_machine() -> None:
+            claw.status = ClawStatus.ERROR
+            claw.error_message = base_error_message
+            ownership_persisted = False
+            try:
+                # Persist the only cleanup pointer before attempting rollback.
+                # If destroy is indeterminate, this record makes retry durable.
+                await self.claw_repository.update(claw)
+                ownership_persisted = True
+            except Exception as persist_error:
+                logger.error(
+                    "Failed to persist Claw cleanup ownership before rollback: "
+                    "id=%s error=%s",
+                    claw.id,
+                    safe_exception_summary(persist_error),
+                )
+
+            destroyed, detail = await self._destroy_runtime_instance(
+                claw, rollback_action
+            )
+            if destroyed:
+                self._clear_runtime_ownership(claw)
+            else:
+                claw.error_message = (
+                    f"{claw.error_message}; rollback failed: {detail}. "
+                    "Runtime ownership was retained so cleanup can be retried."
+                )
+
+            if destroyed or ownership_persisted:
+                try:
+                    # If deletion is exact, a failed final write leaves only a
+                    # harmless stale pointer. If the first write succeeded, the
+                    # cleanup pointer is already durable even if this richer
+                    # error update fails.
+                    await self.claw_repository.update(claw)
+                except Exception as persist_error:
+                    logger.error(
+                        "Failed to persist final Claw provisioning state: "
+                        "id=%s error=%s",
+                        claw.id,
+                        safe_exception_summary(persist_error),
+                    )
+                return
+
+            # First-party dynamic runtimes pre-publish their deterministic
+            # name in ``prepare_claw_for_creation``. Keep foreground recovery
+            # bounded: if Mongo remains unavailable, that existing CREATING
+            # record is the durable pointer consumed by cleanup_instances on a
+            # later pass.
+            for attempt in range(self._OWNERSHIP_RECONCILE_MAX_ATTEMPTS):
+                try:
+                    await self.claw_repository.update(claw)
+                    return
+                except Exception as persist_error:
+                    logger.error(
+                        "Retrying unpersisted Claw cleanup ownership: "
+                        "id=%s error=%s",
+                        claw.id,
+                        safe_exception_summary(persist_error),
+                    )
+
+                destroyed, _ = await self._destroy_runtime_instance(
+                    claw, rollback_action
+                )
+                if destroyed:
+                    self._clear_runtime_ownership(claw)
+                    try:
+                        await self.claw_repository.update(claw)
+                    except Exception as persist_error:
+                        logger.error(
+                            "Provider cleanup succeeded but final Claw state "
+                            "could not be persisted: id=%s error=%s",
+                            claw.id,
+                            safe_exception_summary(persist_error),
+                        )
+                    return
+                if attempt + 1 < self._OWNERSHIP_RECONCILE_MAX_ATTEMPTS:
+                    await asyncio.sleep(
+                        self._OWNERSHIP_RECONCILE_INTERVAL_SECONDS
+                    )
+
+            claw.error_message = (
+                f"{claw.error_message}; cleanup reconciliation was deferred "
+                "after the bounded foreground retry budget."
+            )
+            logger.error(
+                "Deferred Claw ownership reconciliation to a later durable "
+                "cleanup pass: id=%s instance=%s",
+                claw.id,
+                claw.container_name,
+            )
+
+        state_task = asyncio.create_task(state_machine())
+        await self._await_task_to_known_outcome(state_task)
+
     async def _destroy_runtime_instance(
         self, claw: Claw, action: str
     ) -> tuple[bool, Optional[str]]:
@@ -66,8 +194,26 @@ class ClawDomainService:
         """
         if not claw.container_name:
             return True, None
+        claim_destroy = getattr(
+            self.claw_repository, "claim_runtime_destroy", None
+        )
+        if callable(claim_destroy):
+            claimed = await claim_destroy(claw)
+            if claimed is None:
+                raise ClawWriteConflictError(
+                    f"Claw runtime destroy claim lost: {claw.id}"
+                )
+            # Keep the caller's aggregate and ephemeral credential, but advance
+            # its fencing token/status to the atomic pre-delete claim.
+            claw.revision = claimed.revision
+            claw.status = claimed.status
+            claw.updated_at = claimed.updated_at
         try:
-            destroyed = await self.claw_runtime.destroy(claw.container_name)
+            destroy_owned = getattr(self.claw_runtime, "destroy_owned", None)
+            if callable(destroy_owned):
+                destroyed = await destroy_owned(claw.container_name, claw.id)
+            else:
+                destroyed = await self.claw_runtime.destroy(claw.container_name)
         except Exception as e:
             logger.error(
                 "[claw] %s failed for instance=%s: %s",
@@ -89,6 +235,45 @@ class ClawDomainService:
     def _clear_runtime_ownership(claw: Claw) -> None:
         claw.container_name = None
         claw.container_ip = None
+
+    async def _delete_if_current(self, claw: Claw) -> bool:
+        """Delete only the lifecycle revision inspected by this caller."""
+
+        conditional_delete = getattr(
+            self.claw_repository, "delete_if_matches", None
+        )
+        if callable(conditional_delete):
+            return await conditional_delete(claw)
+        # Compatibility for lightweight/custom repositories. Production Mongo
+        # always exposes the conditional form above.
+        return await self.claw_repository.delete_by_user_id(claw.user_id)
+
+    async def _refresh_runtime_address(self, claw: Claw) -> Claw:
+        """Reconnect this API replica to an owned Docker runtime on demand."""
+
+        resolver = getattr(self.claw_runtime, "resolve_owned", None)
+        if not callable(resolver) or not claw.container_name:
+            return claw
+        address = await resolver(claw.container_name, claw.id)
+        # Non-isolated/external implementations retain their persisted address.
+        if address is None:
+            return claw
+        if not address:
+            raise RuntimeError("Owned Claw runtime has no reachable address")
+        if address == claw.container_ip:
+            return claw
+        claw.container_ip = address
+        try:
+            return await self.claw_repository.update(claw)
+        except Exception as exc:
+            # The newly inspected address is valid for this request. Keep the
+            # durable refresh best-effort; the next request repeats exact owner
+            # and network verification if Mongo was temporarily unavailable.
+            logger.warning(
+                "Could not persist refreshed Claw address: %s",
+                safe_exception_summary(exc),
+            )
+            return claw
 
     async def _persist_lifecycle_error(
         self, claw: Claw, message: str
@@ -122,9 +307,12 @@ class ClawDomainService:
             if updated_at:
                 age_seconds = (datetime.now(UTC) - updated_at).total_seconds()
                 if age_seconds > self._creating_timeout_seconds() + 30:
-                    destroyed, detail = await self._destroy_runtime_instance(
-                        claw, "Timed-out Claw cleanup"
-                    )
+                    try:
+                        destroyed, detail = await self._destroy_runtime_instance(
+                            claw, "Timed-out Claw cleanup"
+                        )
+                    except ClawWriteConflictError:
+                        return await self.claw_repository.get_by_user_id(user_id)
                     if destroyed:
                         self._clear_runtime_ownership(claw)
                         claw = await self._persist_lifecycle_error(
@@ -139,30 +327,53 @@ class ClawDomainService:
         if claw and claw.status == ClawStatus.RUNNING:
             if self.settings.claw_ttl_seconds <= 0 and claw.expires_at:
                 claw.expires_at = None
-                claw = await self.claw_repository.update(claw)
+                try:
+                    claw = await self.claw_repository.update(claw)
+                except ClawWriteConflictError:
+                    return await self.claw_repository.get_by_user_id(user_id)
             expires = self._as_utc(claw.expires_at)
             if expires and datetime.now(UTC) >= expires:
                 logger.info(f"[claw] expired for user={user_id}, auto-deleting")
-                destroyed, detail = await self._destroy_runtime_instance(
-                    claw, "Expired Claw cleanup"
-                )
+                try:
+                    destroyed, detail = await self._destroy_runtime_instance(
+                        claw, "Expired Claw cleanup"
+                    )
+                except ClawWriteConflictError:
+                    return await self.claw_repository.get_by_user_id(user_id)
                 if not destroyed:
                     return await self._mark_destroy_failure(
                         claw, "Expired Claw cleanup", detail
                     )
-                deleted = await self.claw_repository.delete_by_user_id(user_id)
+                deleted = await self._delete_if_current(claw)
                 if deleted:
                     return None
-                self._clear_runtime_ownership(claw)
-                return await self._persist_lifecycle_error(
-                    claw,
-                    "The expired runtime was destroyed, but its database "
-                    "record could not be deleted. Please retry cleanup.",
-                )
-            if claw.http_base_url and not await self._health_check(claw.http_base_url):
-                logger.warning(f"[claw] health check failed for user={user_id}, marking stopped")
-                claw.status = ClawStatus.STOPPED
-                await self.claw_repository.update(claw)
+                # A false CAS means a newer lifecycle revision now owns the
+                # record. Never overwrite it with this stale cleanup snapshot.
+                return await self.claw_repository.get_by_user_id(user_id)
+            # Legacy/fake records without any runtime pointer retain their old
+            # behavior. Owned or addressable runtimes must resolve and pass an
+            # actual health check; a missing/stale address cannot be trusted.
+            if claw.container_name or claw.http_base_url:
+                healthy = False
+                try:
+                    claw = await self._refresh_runtime_address(claw)
+                    healthy = bool(
+                        claw.http_base_url
+                        and await self._health_check(claw.http_base_url)
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[claw] runtime address refresh failed for user=%s: %s",
+                        user_id,
+                        safe_exception_summary(exc),
+                    )
+                if not healthy:
+                    logger.warning(f"[claw] health check failed for user={user_id}, marking stopped")
+                    claw.status = ClawStatus.STOPPED
+                    try:
+                        claw = await self.claw_repository.update(claw)
+                    except ClawWriteConflictError:
+                        return await self.claw_repository.get_by_user_id(user_id)
         return claw
 
     @staticmethod
@@ -213,9 +424,14 @@ class ClawDomainService:
         # Destroy it before replacing the record; otherwise resetting the
         # fields below would orphan the only container ownership pointer.
         if existing and existing.container_name:
-            destroyed, detail = await self._destroy_runtime_instance(
-                existing, "Previous Claw cleanup"
-            )
+            try:
+                destroyed, detail = await self._destroy_runtime_instance(
+                    existing, "Previous Claw cleanup"
+                )
+            except ClawWriteConflictError as exc:
+                raise RuntimeError(
+                    "Claw lifecycle changed concurrently; please retry"
+                ) from exc
             if not destroyed:
                 existing = await self._mark_destroy_failure(
                     existing, "Previous Claw cleanup", detail
@@ -224,14 +440,22 @@ class ClawDomainService:
             self._clear_runtime_ownership(existing)
 
         active_count = await self.claw_repository.count_by_statuses(
-            [ClawStatus.CREATING, ClawStatus.RUNNING]
+            [
+                ClawStatus.CREATING,
+                ClawStatus.RUNNING,
+                ClawStatus.DESTROYING,
+            ]
         )
         if (
             self.settings.claw_max_instances_total > 0
             and active_count >= self.settings.claw_max_instances_total
             and not (
                 existing
-                and existing.status in {ClawStatus.CREATING, ClawStatus.RUNNING}
+                and existing.status in {
+                    ClawStatus.CREATING,
+                    ClawStatus.RUNNING,
+                    ClawStatus.DESTROYING,
+                }
             )
         ):
             raise RuntimeError("Claw capacity reached, please try again later")
@@ -258,8 +482,17 @@ class ClawDomainService:
             user_id=user_id,
             api_key=api_key,
             status=ClawStatus.CREATING,
+            revision=existing.revision if existing else 0,
             last_activity_at=datetime.now(UTC),
         )
+        planned_id = getattr(self.claw_runtime, "plan_owned_id", None)
+        if not callable(planned_id):
+            planned_id = getattr(self.claw_runtime, "planned_id", None)
+        if callable(planned_id):
+            # Persist the exact Docker cleanup authority before the background
+            # task can enter docker-py. A timed-out thread can then finish late
+            # without creating an unowned container.
+            claw.container_name = planned_id(claw.id)
         if existing:
             claw = await self.claw_repository.update(claw)
         else:
@@ -278,7 +511,32 @@ class ClawDomainService:
             started_at = datetime.now(UTC)
             if not claw.api_key:
                 raise RuntimeError("Claw runtime credential is unavailable")
-            info = await self.claw_runtime.create(claw.id, claw.api_key)
+            if not claw.container_name:
+                planned_id = getattr(
+                    self.claw_runtime,
+                    "plan_owned_id",
+                    None,
+                )
+                if not callable(planned_id):
+                    planned_id = getattr(
+                        self.claw_runtime,
+                        "planned_id",
+                        None,
+                    )
+                if callable(planned_id):
+                    # Robustness for direct/internal callers that did not use
+                    # prepare_claw_for_creation: persist before Docker mutation.
+                    claw.container_name = planned_id(claw.id)
+                    await self.claw_repository.update(claw)
+            create_owned = getattr(self.claw_runtime, "create_owned", None)
+            if callable(create_owned) and claw.container_name:
+                info = await create_owned(
+                    claw.id,
+                    claw.api_key,
+                    claw.container_name,
+                )
+            else:
+                info = await self.claw_runtime.create(claw.id, claw.api_key)
             claw.container_name = info.instance_name
             claw.container_ip = info.address
             if claw.http_base_url:
@@ -298,24 +556,21 @@ class ClawDomainService:
             )
         except asyncio.CancelledError as e:
             logger.warning("Claw provisioning cancelled: id=%s", claw.id)
+            if current_lifecycle_task_lost_lease():
+                # The exact generation is already durable. Another replica
+                # may have acquired the lifecycle lease and adopted it, so a
+                # fenced owner must never perform provider-side rollback.
+                raise
             instance_name = getattr(e, "claw_instance_name", None)
             if instance_name and not claw.container_name:
                 claw.container_name = instance_name
-            claw.status = ClawStatus.ERROR
-            claw.error_message = "Claw provisioning was cancelled"
-            destroyed, detail = await self._destroy_runtime_instance(
-                claw, "Cancelled provisioning rollback"
-            )
-            if destroyed:
-                self._clear_runtime_ownership(claw)
-            else:
-                claw.error_message = (
-                    f"{claw.error_message}; rollback failed: {detail}. "
-                    "Runtime ownership was retained so cleanup can be retried."
-                )
             try:
-                await self.claw_repository.update(claw)
-            except Exception as persist_error:
+                await self._reconcile_failed_provisioning(
+                    claw,
+                    base_error_message="Claw provisioning was cancelled",
+                    rollback_action="Cancelled provisioning rollback",
+                )
+            except BaseException as persist_error:
                 logger.error(
                     "Failed to persist cancelled claw provisioning: "
                     "id=%s error=%s",
@@ -332,21 +587,15 @@ class ClawDomainService:
             instance_name = getattr(e, "claw_instance_name", None)
             if instance_name and not claw.container_name:
                 claw.container_name = instance_name
-            claw.status = ClawStatus.ERROR
-            claw.error_message = "Claw provisioning failed. Please retry."
-            destroyed, detail = await self._destroy_runtime_instance(
-                claw, "Failed provisioning rollback"
-            )
-            if destroyed:
-                self._clear_runtime_ownership(claw)
-            else:
-                claw.error_message = (
-                    f"{claw.error_message}; rollback failed: {detail}. "
-                    "Runtime ownership was retained so cleanup can be retried."
-                )
             try:
-                await self.claw_repository.update(claw)
-            except Exception as persist_error:
+                await self._reconcile_failed_provisioning(
+                    claw,
+                    base_error_message=(
+                        "Claw provisioning failed. Please retry."
+                    ),
+                    rollback_action="Failed provisioning rollback",
+                )
+            except BaseException as persist_error:
                 logger.error(
                     "Failed to persist claw provisioning error: "
                     "id=%s error=%s",
@@ -372,21 +621,16 @@ class ClawDomainService:
             self.settings.claw_destroy_on_delete
         )
         if destroy_runtime:
-            destroyed, detail = await self._destroy_runtime_instance(
-                claw, "Claw deletion"
-            )
+            try:
+                destroyed, detail = await self._destroy_runtime_instance(
+                    claw, "Claw deletion"
+                )
+            except ClawWriteConflictError:
+                return False
             if not destroyed:
                 await self._mark_destroy_failure(claw, "Claw deletion", detail)
                 return False
-        deleted = await self.claw_repository.delete_by_user_id(user_id)
-        if not deleted and destroy_runtime:
-            self._clear_runtime_ownership(claw)
-            await self._persist_lifecycle_error(
-                claw,
-                "The runtime was destroyed, but its database record could "
-                "not be deleted. Please retry deletion.",
-            )
-        return deleted
+        return await self._delete_if_current(claw)
 
     async def cleanup_instances(self) -> dict[str, int]:
         """Clean interrupted instances and records matching retention policy."""
@@ -397,99 +641,101 @@ class ClawDomainService:
             [
                 ClawStatus.CREATING,
                 ClawStatus.RUNNING,
+                ClawStatus.DESTROYING,
                 ClawStatus.ERROR,
                 ClawStatus.STOPPED,
             ]
         )
 
         for claw in claws:
-            if claw.status in {ClawStatus.ERROR, ClawStatus.STOPPED}:
-                if not claw.container_name:
-                    continue
-                destroyed, detail = await self._destroy_runtime_instance(
-                    claw, f"{claw.status.value.title()} Claw ownership cleanup"
-                )
-                if not destroyed:
-                    await self._mark_destroy_failure(
-                        claw,
-                        f"{claw.status.value.title()} Claw ownership cleanup",
-                        detail,
-                    )
-                    errored += 1
-                    continue
-                self._clear_runtime_ownership(claw)
-                await self.claw_repository.update(claw)
-                continue
-
-            if claw.status == ClawStatus.CREATING:
-                updated_at = self._as_utc(claw.updated_at)
-                if (
-                    updated_at
-                    and (now - updated_at).total_seconds()
-                    > self._creating_timeout_seconds() + 30
-                ):
+            try:
+                if claw.status in {
+                    ClawStatus.DESTROYING,
+                    ClawStatus.ERROR,
+                    ClawStatus.STOPPED,
+                }:
+                    if not claw.container_name:
+                        continue
                     destroyed, detail = await self._destroy_runtime_instance(
-                        claw, "Timed-out Claw cleanup"
+                        claw, f"{claw.status.value.title()} Claw ownership cleanup"
                     )
-                    if destroyed:
-                        self._clear_runtime_ownership(claw)
-                        await self._persist_lifecycle_error(
-                            claw,
-                            "Claw provisioning timed out or was interrupted.",
-                        )
-                    else:
+                    if not destroyed:
                         await self._mark_destroy_failure(
-                            claw, "Timed-out Claw cleanup", detail
+                            claw,
+                            f"{claw.status.value.title()} Claw ownership cleanup",
+                            detail,
                         )
-                    errored += 1
-                continue
-
-            if self.settings.claw_ttl_seconds <= 0 and claw.expires_at:
-                claw.expires_at = None
-                await self.claw_repository.update(claw)
-            expires_at = self._as_utc(claw.expires_at)
-            expired = bool(expires_at and now >= expires_at)
-            idle = False
-            if self.settings.claw_idle_timeout_seconds > 0:
-                last_activity_at = self._as_utc(
-                    claw.last_activity_at or claw.updated_at
-                )
-                idle = bool(
-                    last_activity_at
-                    and (now - last_activity_at).total_seconds()
-                    > self.settings.claw_idle_timeout_seconds
-                )
-
-            if expired or idle:
-                reason = "expired" if expired else "idle"
-                logger.info(
-                    "[claw-cleanup] removing %s claw id=%s user=%s",
-                    reason,
-                    claw.id,
-                    claw.user_id,
-                )
-                destroyed, detail = await self._destroy_runtime_instance(
-                    claw, f"{reason.title()} Claw cleanup"
-                )
-                if not destroyed:
-                    await self._mark_destroy_failure(
-                        claw, f"{reason.title()} Claw cleanup", detail
-                    )
-                    errored += 1
-                    continue
-                deleted = await self.claw_repository.delete_by_user_id(
-                    claw.user_id
-                )
-                if deleted:
-                    removed += 1
-                else:
+                        errored += 1
+                        continue
                     self._clear_runtime_ownership(claw)
-                    await self._persist_lifecycle_error(
-                        claw,
-                        "The runtime was destroyed, but its database record "
-                        "could not be deleted. Please retry cleanup.",
+                    await self.claw_repository.update(claw)
+                    continue
+
+                if claw.status == ClawStatus.CREATING:
+                    updated_at = self._as_utc(claw.updated_at)
+                    if (
+                        updated_at
+                        and (now - updated_at).total_seconds()
+                        > self._creating_timeout_seconds() + 30
+                    ):
+                        destroyed, detail = await self._destroy_runtime_instance(
+                            claw, "Timed-out Claw cleanup"
+                        )
+                        if destroyed:
+                            self._clear_runtime_ownership(claw)
+                            await self._persist_lifecycle_error(
+                                claw,
+                                "Claw provisioning timed out or was interrupted.",
+                            )
+                        else:
+                            await self._mark_destroy_failure(
+                                claw, "Timed-out Claw cleanup", detail
+                            )
+                        errored += 1
+                    continue
+
+                if self.settings.claw_ttl_seconds <= 0 and claw.expires_at:
+                    claw.expires_at = None
+                    claw = await self.claw_repository.update(claw)
+                expires_at = self._as_utc(claw.expires_at)
+                expired = bool(expires_at and now >= expires_at)
+                idle = False
+                if self.settings.claw_idle_timeout_seconds > 0:
+                    last_activity_at = self._as_utc(
+                        claw.last_activity_at or claw.updated_at
                     )
-                    errored += 1
+                    idle = bool(
+                        last_activity_at
+                        and (now - last_activity_at).total_seconds()
+                        > self.settings.claw_idle_timeout_seconds
+                    )
+
+                if expired or idle:
+                    reason = "expired" if expired else "idle"
+                    logger.info(
+                        "[claw-cleanup] removing %s claw id=%s user=%s",
+                        reason,
+                        claw.id,
+                        claw.user_id,
+                    )
+                    destroyed, detail = await self._destroy_runtime_instance(
+                        claw, f"{reason.title()} Claw cleanup"
+                    )
+                    if not destroyed:
+                        await self._mark_destroy_failure(
+                            claw, f"{reason.title()} Claw cleanup", detail
+                        )
+                        errored += 1
+                        continue
+                    if await self._delete_if_current(claw):
+                        removed += 1
+            except ClawWriteConflictError:
+                # A newer lifecycle revision won the race. Its generation is
+                # authoritative; this stale maintenance snapshot is discarded.
+                logger.info(
+                    "[claw-cleanup] skipped stale lifecycle snapshot id=%s",
+                    claw.id,
+                )
 
         return {"removed": removed, "errored": errored}
 
@@ -509,6 +755,7 @@ class ClawDomainService:
         try:
             claw = await self.claw_repository.get_by_user_id(user_id)
             if claw and claw.http_base_url and claw.status == ClawStatus.RUNNING:
+                claw = await self._refresh_runtime_address(claw)
                 claw_msgs = await self.claw_client.get_history(
                     claw.http_base_url, "default", 200,
                 )
@@ -639,12 +886,26 @@ class ClawDomainService:
         for broadcasting chunks to SSE / WebSocket consumers.
         """
         assistant_content: list[str] = []
+        assistant_content_bytes = 0
+        response_too_large = False
+        response_completed = False
         file_attachments: list[ClawAttachment] = []
 
         try:
             async for chunk in self.claw_client.chat_stream(base_url, message, session_id):
                 if chunk.get("type") == "text" and chunk.get("content"):
-                    assistant_content.append(chunk["content"])
+                    content = chunk["content"]
+                    if not isinstance(content, str):
+                        raise TypeError("Claw text chunks must contain strings")
+                    assistant_content_bytes += len(content.encode("utf-8"))
+                    if assistant_content_bytes > max(
+                        1, int(self.settings.claw_chat_max_response_bytes)
+                    ):
+                        response_too_large = True
+                        raise ClawResponseTooLargeError(
+                            "Claw response exceeded the configured size limit"
+                        )
+                    assistant_content.append(content)
 
                 if chunk.get("type") == "file" and chunk.get("file_id"):
                     file_attachments.append(ClawAttachment(
@@ -657,12 +918,25 @@ class ClawDomainService:
 
                 yield chunk
 
+            response_completed = True
+
+        except ClawResponseTooLargeError:
+            response_too_large = True
+            raise
+
         finally:
             if file_attachments:
                 await self.claw_repository.append_message(
                     user_id, "attachments", "assistant", attachments=file_attachments,
                 )
-            if assistant_content:
+            # An over-limit answer is deliberately not stored as a truncated
+            # assistant message.  The application layer emits an explicit
+            # error followed by the one terminal done event for this turn.
+            if (
+                assistant_content
+                and response_completed
+                and not response_too_large
+            ):
                 content = sanitize_model_text("".join(assistant_content))
                 if content:
                     await self.claw_repository.append_message(
@@ -679,7 +953,7 @@ class ClawDomainService:
             raise ValueError("No running claw instance found")
         if claw.status != ClawStatus.RUNNING:
             raise ValueError(f"Claw is not running (status: {claw.status})")
-        return claw
+        return await self._refresh_runtime_address(claw)
 
     # ------------------------------------------------------------------
     # File proxy
@@ -691,6 +965,7 @@ class ClawDomainService:
             raise ValueError("No running claw instance found")
         if claw.status != ClawStatus.RUNNING:
             raise ValueError(f"Claw is not running (status: {claw.status})")
+        claw = await self._refresh_runtime_address(claw)
         return await self.claw_client.get_file(claw.http_base_url, filename)
 
     # ------------------------------------------------------------------

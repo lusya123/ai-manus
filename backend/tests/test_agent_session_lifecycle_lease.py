@@ -90,7 +90,12 @@ class SharedSessionRepository:
         self.stored = session.model_copy(deep=True)
 
     async def update_runtime_ownership(
-        self, session_id, sandbox_id, task_id, sandbox_provider=None
+        self,
+        session_id,
+        sandbox_id,
+        task_id,
+        sandbox_provider=None,
+        task_sandbox_id=None,
     ):
         await asyncio.sleep(0)
         if self.stored is None or self.stored.id != session_id:
@@ -99,6 +104,7 @@ class SharedSessionRepository:
         self.stored.sandbox_id = sandbox_id
         self.stored.sandbox_provider = sandbox_provider
         self.stored.task_id = task_id
+        self.stored.task_sandbox_id = task_sandbox_id
 
     async def update_latest_message(self, session_id, message, timestamp):
         if self.stored is None:

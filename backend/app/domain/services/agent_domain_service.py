@@ -27,7 +27,10 @@ from app.domain.models.event import (
 from pydantic import TypeAdapter
 from app.domain.repositories.agent_repository import AgentRepository
 from app.domain.repositories.session_repository import SessionRepository
-from app.domain.services.agent_task_runner import AgentTaskRunnerFactory
+from app.domain.services.agent_task_runner import (
+    AgentTaskRunnerFactory,
+    RunnerCleanupCapacityError,
+)
 from app.domain.external.task import Task
 from typing import Type
 from app.domain.external.file import FileStorage
@@ -202,13 +205,41 @@ class AgentDomainService:
         await self._task_cls.destroy()
         logger.info("All agents closed successfully")
 
-    async def _persist_runtime_ownership(self, session: Session) -> None:
+    async def _persist_runtime_ownership(
+        self,
+        session: Session,
+        *,
+        expected_task_id: Optional[str],
+        expected_task_sandbox_id: Optional[str],
+    ) -> None:
         """Persist runtime IDs without recreating a deleted session.
 
         The fallback keeps lightweight repository fakes backwards-compatible;
         the production Mongo repository always implements the non-upserting
         method from ``SessionRepository``.
         """
+        compare_and_set = getattr(
+            self._session_repository,
+            "compare_and_set_runtime_ownership",
+            None,
+        )
+        if callable(compare_and_set):
+            updated = await compare_and_set(
+                session.id,
+                session.sandbox_id,
+                expected_task_id,
+                expected_task_sandbox_id,
+                session.sandbox_provider,
+                session.sandbox_id,
+                session.task_id,
+                session.sandbox_provider,
+                session.task_sandbox_id,
+            )
+            if not updated:
+                raise RuntimeError(
+                    "Session runtime ownership changed during task binding"
+                )
+            return
         update_runtime = getattr(
             self._session_repository, "update_runtime_ownership", None
         )
@@ -218,6 +249,7 @@ class AgentDomainService:
                 session.sandbox_id,
                 session.task_id,
                 session.sandbox_provider,
+                session.task_sandbox_id,
             )
             return
         await self._session_repository.save(session)
@@ -242,6 +274,8 @@ class AgentDomainService:
         handle is needed only as proof that provisioning/link resolution
         succeeded; task workers reconstruct their own non-owning handle.
         """
+        if session.deleting:
+            raise RuntimeError("Session deletion is in progress")
         if self._sandbox_provisioner is None:
             raise SandboxProvisioningRequiredError(
                 "No sandbox lifecycle provisioner is configured"
@@ -253,7 +287,13 @@ class AgentDomainService:
                 raise RuntimeError(
                     "Sandbox provisioner returned inconsistent persisted ownership"
                 )
-            return previous_id is not None and previous_id != session.sandbox_id
+            task_generation_mismatch = (
+                session.task_id is not None
+                and session.task_sandbox_id != session.sandbox_id
+            )
+            return task_generation_mismatch or (
+                previous_id is not None and previous_id != session.sandbox_id
+            )
         finally:
             await self._aclose_sandbox_handle(sandbox)
 
@@ -289,8 +329,15 @@ class AgentDomainService:
                     "cannot replace a sandbox while a turn is still running"
                 )
 
+        previous_task_id = session.task_id
+        previous_task_sandbox_id = session.task_sandbox_id
         session.task_id = None
-        await self._persist_runtime_ownership(session)
+        session.task_sandbox_id = None
+        await self._persist_runtime_ownership(
+            session,
+            expected_task_id=previous_task_id,
+            expected_task_sandbox_id=previous_task_sandbox_id,
+        )
 
     async def _create_task(
         self, session: Session, *, sandbox_ready: bool = False
@@ -305,11 +352,19 @@ class AgentDomainService:
                 agent_id=session.agent_id,
                 user_id=session.user_id,
                 sandbox_id=session.sandbox_id,
+                task_sandbox_id=session.sandbox_id,
                 sandbox_provider=session.sandbox_provider,
             )
+            previous_task_id = session.task_id
+            previous_task_sandbox_id = session.task_sandbox_id
             task = self._task_cls.create(params)
             session.task_id = task.id
-            await self._persist_runtime_ownership(session)
+            session.task_sandbox_id = session.sandbox_id
+            await self._persist_runtime_ownership(
+                session,
+                expected_task_id=previous_task_id,
+                expected_task_sandbox_id=previous_task_sandbox_id,
+            )
         except BaseException:
             # A task handle can enter an in-process registry before the
             # session update succeeds.  Cancel that unpublished handle so it
@@ -399,7 +454,11 @@ class AgentDomainService:
             return idle_status
 
     async def _finalize_turns_after_task_stop(
-        self, session_id: str, *, user_id: Optional[str] = None
+        self,
+        session_id: str,
+        *,
+        user_id: Optional[str] = None,
+        task_id: Optional[str] = None,
     ) -> None:
         if self._turn_submission_repository is None:
             return
@@ -409,9 +468,35 @@ class AgentDomainService:
         await self._turn_submission_repository.cancel_queued(
             session_id, user_id=user_id
         )
-        if await self._turn_submission_repository.count_running(
+        running = await self._turn_submission_repository.count_running(
             session_id, user_id=user_id
-        ):
+        )
+        if running and task_id and user_id:
+            # A local API crash can lose its process-only task registry after
+            # Mongo committed RUNNING. Deleting sessions cannot use the SSE
+            # recovery path because their lifecycle is intentionally fenced,
+            # so retry the exact stopped task's expiry reconciliation here.
+            # Live claims remain untouched and keep cleanup fail-closed; once
+            # expired, repository recovery records FAILED_UNKNOWN and releases
+            # quota before sandbox destruction is allowed.
+            recover = getattr(
+                self._turn_submission_repository,
+                "recover_factory_failure_for_task",
+                None,
+            )
+            if callable(recover):
+                await recover(
+                    session_id,
+                    user_id=user_id,
+                    task_id=task_id,
+                    error=(
+                        "Stopped task did not persist terminal turn state"
+                    ),
+                )
+                running = await self._turn_submission_repository.count_running(
+                    session_id, user_id=user_id
+                )
+        if running:
             raise RuntimeError(
                 "Task stopped without persisting a terminal running turn"
             )
@@ -427,6 +512,7 @@ class AgentDomainService:
             agent_id=session.agent_id,
             user_id=session.user_id,
             sandbox_id=session.sandbox_id,
+            task_sandbox_id=session.task_sandbox_id,
             sandbox_provider=session.sandbox_provider,
         )
 
@@ -444,15 +530,91 @@ class AgentDomainService:
             raise TurnSubmissionUnavailableError(
                 "Persisted task no longer owns this session"
             )
+        if current.deleting or current.sandbox_destroying:
+            raise TurnSubmissionUnavailableError(
+                "Session runtime cleanup is in progress"
+            )
+        if (
+            current.sandbox_id is None
+            or current.task_sandbox_id is None
+            or current.task_sandbox_id != current.sandbox_id
+        ):
+            raise TurnSubmissionUnavailableError(
+                "Persisted task belongs to a different sandbox generation"
+            )
+        params = self._runner_params(current)
         task = await self._task_cls.get(task_id)
         if task is not None:
+            refresh_params = getattr(task, "refresh_runner_params", None)
+            if callable(refresh_params):
+                refresh_params(params)
             return task
         recover = getattr(self._task_cls, "recover", None)
         if not callable(recover):
             raise TurnSubmissionUnavailableError(
                 "Task backend cannot recover a persisted input stream"
             )
-        return recover(task_id, self._runner_params(current))
+        return recover(task_id, params)
+
+    async def _recover_and_run_durable_task(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        submission_id: str,
+        task_id: str,
+        expected_state: TurnSubmissionState,
+        require_expired_claim: bool = False,
+    ) -> None:
+        """Fence one reconnect dispatch against delete and runtime replacement.
+
+        The lifecycle lease is held only for the short task reconstruction and
+        dispatch call, never for SSE polling or the model execution itself.
+        Re-reading both durable owners inside the lease closes the gap between
+        an outer stream snapshot and a concurrent delete/replacement claim.
+        """
+
+        async def recover_and_run() -> None:
+            current_session = (
+                await self._session_repository.find_by_id_and_user_id(
+                    session_id, user_id
+                )
+            )
+            if current_session is None:
+                raise TurnSubmissionUnavailableError("Session no longer exists")
+            if current_session.deleting or current_session.sandbox_destroying:
+                raise TurnSubmissionUnavailableError(
+                    "Session runtime cleanup is in progress"
+                )
+
+            current_turn = await self._turn_submission_repository.find(
+                session_id, submission_id
+            )
+            if (
+                current_turn is None
+                or current_turn.user_id != user_id
+                or current_turn.task_id != task_id
+                or current_turn.state != expected_state
+            ):
+                raise TurnSubmissionUnavailableError(
+                    "Durable turn no longer owns this task dispatch"
+                )
+
+            if require_expired_claim:
+                claim_until = current_turn.claim_until
+                if claim_until is not None and claim_until.tzinfo is None:
+                    claim_until = claim_until.replace(tzinfo=UTC)
+                if claim_until is not None and claim_until > datetime.now(UTC):
+                    raise TurnSubmissionUnavailableError(
+                        "Durable turn execution claim is still active"
+                    )
+
+            task = await self._recover_task(current_session, task_id)
+            await task.run()
+
+        await self.run_session_lifecycle_exclusive(
+            session_id, recover_and_run
+        )
 
     async def _continue_durable_turn_locked(
         self,
@@ -468,6 +630,10 @@ class AgentDomainService:
         ):
             raise TurnSubmissionUnavailableError(
                 "Accepted turn ownership no longer matches its session"
+            )
+        if session.deleting:
+            raise TurnSubmissionUnavailableError(
+                "Session deletion is in progress"
             )
 
         if turn.state not in TERMINAL_TURN_STATES:
@@ -577,6 +743,17 @@ class AgentDomainService:
                 await self._sync_durable_session_status(session_id)
                 await task.run()
             except Exception as exc:
+                if isinstance(exc, RunnerCleanupCapacityError):
+                    # Local RedisStreamTask builds the runner synchronously in
+                    # task.run().  Cleanup-capacity exhaustion happens before
+                    # any runner handle or execution coroutine is created, so
+                    # dispatch is known not to have started.  Keep the durable
+                    # row ENQUEUED (and its existing Redis input) so an
+                    # idempotent reconnect can retry once capacity is free.
+                    await self._sync_durable_session_status(session_id)
+                    raise TurnSubmissionUnavailableError(
+                        "Task dispatch is temporarily backpressured; retry the same submission_id"
+                    ) from exc
                 await self._turn_submission_repository.mark_unclaimed_terminal(
                     session_id,
                     submission_id,
@@ -658,6 +835,10 @@ class AgentDomainService:
                 )
                 if not session:
                     raise RuntimeError("Session not found")
+                if session.deleting:
+                    raise TurnSubmissionUnavailableError(
+                        "Session deletion is in progress"
+                    )
 
                 requested_file_infos = self._to_file_infos(attachments)
                 canonical = json.dumps(
@@ -759,12 +940,15 @@ class AgentDomainService:
         seen: set[str] = set()
         terminal_seen = False
         dispatch_recovery_confirmed = False
+        expired_running_recovery_confirmed = False
         try:
             while True:
                 session = await self._session_repository.find_by_id_and_user_id(
                     session_id, user_id
                 )
                 if not session:
+                    return
+                if session.deleting:
                     return
                 output_events = await self._turn_submission_repository.list_outputs(
                     session_id, submission_id
@@ -848,13 +1032,55 @@ class AgentDomainService:
                     # generation lease either observes the active delivery or
                     # takes over after its bounded deadline.
                     try:
-                        task = await self._recover_task(session, current.task_id)
-                        await task.run()
+                        await self._recover_and_run_durable_task(
+                            session_id=session_id,
+                            user_id=user_id,
+                            submission_id=submission_id,
+                            task_id=current.task_id,
+                            expected_state=TurnSubmissionState.ENQUEUED,
+                        )
                         dispatch_recovery_confirmed = True
                     except Exception as exc:
                         logger.warning(
                             "Durable dispatch recovery deferred: session_id=%s "
                             "submission_id=%s error=%s",
+                            session_id,
+                            submission_id,
+                            safe_exception_summary(exc),
+                        )
+                claim_until = current.claim_until
+                if claim_until is not None and claim_until.tzinfo is None:
+                    claim_until = claim_until.replace(tzinfo=UTC)
+                if (
+                    current.state == TurnSubmissionState.RUNNING
+                    and current.task_id
+                    and (
+                        claim_until is None
+                        or claim_until <= datetime.now(UTC)
+                    )
+                    and not expired_running_recovery_confirmed
+                ):
+                    # A local API restart loses its process-only task registry.
+                    # If shutdown was interrupted after Mongo RUNNING but
+                    # before XACK, merely polling this SSE can otherwise spin
+                    # forever. Rebuild the exact persisted stream worker only
+                    # after its claim expires. The Mongo claim state machine
+                    # then records FAILED_UNKNOWN and ACKs; it never replays
+                    # external side effects from the expired owner.
+                    try:
+                        await self._recover_and_run_durable_task(
+                            session_id=session_id,
+                            user_id=user_id,
+                            submission_id=submission_id,
+                            task_id=current.task_id,
+                            expected_state=TurnSubmissionState.RUNNING,
+                            require_expired_claim=True,
+                        )
+                        expired_running_recovery_confirmed = True
+                    except Exception as exc:
+                        logger.warning(
+                            "Expired durable execution recovery deferred: "
+                            "session_id=%s submission_id=%s error=%s",
                             session_id,
                             submission_id,
                             safe_exception_summary(exc),
@@ -890,7 +1116,9 @@ class AgentDomainService:
                     f"{self._TASK_CANCEL_TIMEOUT_SECONDS:g}s"
                 )
         await self._finalize_turns_after_task_stop(
-            session_id, user_id=session.user_id
+            session_id,
+            user_id=session.user_id,
+            task_id=session.task_id,
         )
         await self._session_repository.update_status(session_id, SessionStatus.COMPLETED)
 
@@ -932,7 +1160,9 @@ class AgentDomainService:
         if task_stopped:
             try:
                 await self._finalize_turns_after_task_stop(
-                    session.id, user_id=session.user_id
+                    session.id,
+                    user_id=session.user_id,
+                    task_id=session.task_id,
                 )
             except Exception as exc:
                 task_stopped = False

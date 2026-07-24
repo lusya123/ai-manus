@@ -4,6 +4,8 @@ from typing import List, AsyncIterator
 
 import httpx
 
+from app.core.config import get_settings
+from app.domain.external.claw import ClawResponseTooLargeError
 from app.domain.models.claw import ClawMessage, ClawAttachment
 
 logger = logging.getLogger(__name__)
@@ -16,6 +18,17 @@ class HttpClawClient:
         self, base_url: str, message: str, session_id: str,
     ) -> AsyncIterator[dict]:
         url = f"{base_url}/chat"
+        settings = get_settings()
+        event_limit = max(
+            1, int(settings.claw_chat_max_upstream_event_bytes)
+        )
+        stream_limit = max(
+            1, int(settings.claw_chat_max_upstream_stream_bytes)
+        )
+        # The whole-stream budget is authoritative.  Silently increasing it
+        # to the per-event setting would violate an operator's configured hard
+        # cap when the two values are accidentally inverted.
+        event_limit = min(event_limit, stream_limit)
         async with httpx.AsyncClient(timeout=120.0) as client:
             async with client.stream(
                 "POST",
@@ -24,16 +37,76 @@ class HttpClawClient:
                 headers={"Content-Type": "application/json"},
             ) as response:
                 response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if not data:
-                        continue
-                    try:
-                        yield json.loads(data)
-                    except Exception:
-                        continue
+                async for event in self._iter_bounded_sse_events(
+                    response,
+                    event_limit=event_limit,
+                    stream_limit=stream_limit,
+                ):
+                    yield event
+
+    @staticmethod
+    async def _iter_bounded_sse_events(
+        response,
+        *,
+        event_limit: int,
+        stream_limit: int,
+    ) -> AsyncIterator[dict]:
+        """Parse SSE only after enforcing raw line and whole-stream bounds."""
+        buffer = bytearray()
+        stream_bytes = 0
+        read_size = max(1, min(64 * 1024, event_limit))
+
+        async for raw_chunk in response.aiter_bytes(chunk_size=read_size):
+            stream_bytes += len(raw_chunk)
+            if stream_bytes > stream_limit:
+                raise ClawResponseTooLargeError(
+                    "Claw upstream stream exceeded the configured size limit"
+                )
+            buffer.extend(raw_chunk)
+
+            consumed = 0
+            while True:
+                newline = buffer.find(b"\n", consumed)
+                if newline < 0:
+                    break
+                if newline - consumed > event_limit:
+                    raise ClawResponseTooLargeError(
+                        "Claw upstream event exceeded the configured size limit"
+                    )
+                line = bytes(buffer[consumed:newline]).rstrip(b"\r")
+                consumed = newline + 1
+                event = HttpClawClient._decode_sse_line(line)
+                if event is not None:
+                    yield event
+
+            if consumed:
+                del buffer[:consumed]
+            if len(buffer) > event_limit:
+                raise ClawResponseTooLargeError(
+                    "Claw upstream event exceeded the configured size limit"
+                )
+
+        if buffer:
+            if len(buffer) > event_limit:
+                raise ClawResponseTooLargeError(
+                    "Claw upstream event exceeded the configured size limit"
+                )
+            event = HttpClawClient._decode_sse_line(bytes(buffer).rstrip(b"\r"))
+            if event is not None:
+                yield event
+
+    @staticmethod
+    def _decode_sse_line(line: bytes) -> dict | None:
+        if not line.startswith(b"data:"):
+            return None
+        data = line[5:].strip()
+        if not data:
+            return None
+        try:
+            event = json.loads(data)
+        except Exception:
+            return None
+        return event if isinstance(event, dict) else None
 
     async def get_history(
         self, base_url: str, session_id: str, limit: int = 200,

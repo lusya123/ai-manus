@@ -12,6 +12,7 @@ from app.domain.models.turn_submission import (
 )
 from app.domain.models.event import MessageEvent
 from app.domain.services.agent_domain_service import AgentDomainService
+from app.domain.services.agent_task_runner import RunnerCleanupCapacityError
 from app.infrastructure.external.sandbox.passthrough_provisioner import (
     PassthroughSandboxProvisioner,
 )
@@ -96,6 +97,7 @@ class SessionRepository:
             sandbox_id="sandbox-1",
             sandbox_provider="docker",
             task_id=task_id,
+            task_sandbox_id="sandbox-1" if task_id is not None else None,
             status=status,
         )
         self.events = []
@@ -116,11 +118,17 @@ class SessionRepository:
         self.statuses.append(status)
 
     async def update_runtime_ownership(
-        self, session_id, sandbox_id, task_id, sandbox_provider=None
+        self,
+        session_id,
+        sandbox_id,
+        task_id,
+        sandbox_provider=None,
+        task_sandbox_id=None,
     ):
         self.session.sandbox_id = sandbox_id
         self.session.sandbox_provider = sandbox_provider
         self.session.task_id = task_id
+        self.session.task_sandbox_id = task_sandbox_id
 
 
 class InputStream:
@@ -136,17 +144,26 @@ class InputStream:
 
 
 class FakeTask:
-    def __init__(self, *, fail_run_once=False, fail_after_put_once=False):
+    def __init__(
+        self,
+        *,
+        fail_run_once=False,
+        fail_after_put_once=False,
+        run_error_once=None,
+    ):
         self.id = "task-1"
         self.input_stream = InputStream(
             fail_after_put_once=fail_after_put_once
         )
         self.output_stream = SimpleNamespace()
         self.fail_run_once = fail_run_once
+        self.run_error_once = run_error_once
         self.run_calls = 0
 
     async def run(self):
         self.run_calls += 1
+        if self.run_error_once is not None and self.run_calls == 1:
+            raise self.run_error_once
         if self.fail_run_once and self.run_calls == 1:
             raise ConnectionError("dispatch response lost")
 
@@ -328,6 +345,34 @@ async def test_ambiguous_task_dispatch_terminalizes_failed_unknown():
     terminal = await accept(domain_service)
     assert terminal.state == TurnSubmissionState.FAILED_UNKNOWN
     assert task.run_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_local_cleanup_backpressure_keeps_enqueued_turn_retryable():
+    repository = TurnRepository()
+    task = FakeTask(
+        run_error_once=RunnerCleanupCapacityError(
+            "cleanup bundles are full"
+        )
+    )
+    domain_service = service(
+        SessionRepository(), repository, task_class(task)
+    )
+
+    with pytest.raises(TurnSubmissionUnavailableError):
+        await accept(domain_service)
+
+    assert repository.turn.state == TurnSubmissionState.ENQUEUED
+    assert repository.terminal_states == []
+    assert len(task.input_stream.values) == 1
+    assert task.run_calls == 1
+
+    retried = await accept(domain_service)
+
+    assert retried.state == TurnSubmissionState.ENQUEUED
+    assert repository.terminal_states == []
+    assert len(task.input_stream.values) == 1
+    assert task.run_calls == 2
 
 
 @pytest.mark.asyncio

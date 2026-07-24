@@ -6,13 +6,39 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Set hostname to sandbox
 ENV HOSTNAME=sandbox
 
-# Configure apt source to use Aliyun mirror
-RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|http://mirrors.aliyun.com/ubuntu/|g' /etc/apt/sources.list && \
-    sed -i 's|http://security.ubuntu.com/ubuntu/|http://mirrors.aliyun.com/ubuntu/|g' /etc/apt/sources.list && \
-    sed -i 's|http://ports.ubuntu.com/ubuntu-ports/|http://mirrors.aliyun.com/ubuntu-ports/|g' /etc/apt/sources.list
+# The minimal Ubuntu image intentionally omits CA roots. Bootstrap them from
+# the signed official APT archive before switching transport to HTTPS. APT's
+# repository signatures protect this one HTTP bootstrap from tampered packages.
+RUN apt-get \
+      -o APT::Update::Error-Mode=any \
+      -o Acquire::Retries=5 \
+      -o Acquire::http::Timeout=30 \
+      update && \
+    apt-get \
+      -o Acquire::Retries=5 \
+      -o Acquire::http::Timeout=30 \
+      install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Configure apt source to use the TLS-protected Aliyun mirror. Plain HTTP was
+# intermittently black-holed by Docker Desktop/proxy networks during large
+# Chromium dependency downloads.
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|https://mirrors.aliyun.com/ubuntu/|g' /etc/apt/sources.list && \
+    sed -i 's|http://security.ubuntu.com/ubuntu/|https://mirrors.aliyun.com/ubuntu/|g' /etc/apt/sources.list && \
+    sed -i 's|http://ports.ubuntu.com/ubuntu-ports/|https://mirrors.aliyun.com/ubuntu-ports/|g' /etc/apt/sources.list
 
 # Update and install basic tools
-RUN apt-get update && apt-get install -y \
+RUN apt-get \
+      -o APT::Update::Error-Mode=any \
+      -o Acquire::Retries=5 \
+      -o Acquire::http::Timeout=30 \
+      -o Acquire::https::Timeout=30 \
+      update && \
+    apt-get \
+      -o Acquire::Retries=5 \
+      -o Acquire::http::Timeout=30 \
+      -o Acquire::https::Timeout=30 \
+      install -y \
     sudo \
     bc \
     curl \
@@ -28,39 +54,86 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Create user ubuntu and grant sudo privileges
+# The FastAPI service remains `ubuntu`, while model-generated shell commands
+# run as an unprivileged sibling account with no sudo rule.  Only the trusted
+# API process can invoke the read-only file helper and the helpers needed for
+# exact process-tree cleanup. Model-controlled writes never receive a sudo
+# capability.
 RUN useradd -m -d /home/ubuntu -s /bin/bash ubuntu && \
-    echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ubuntu
+    for slot in $(seq 0 63); do \
+      useradd -M -u $((20000 + slot)) -g ubuntu \
+        -d /home/ubuntu -s /bin/bash "manus-shell-${slot}"; \
+    done && \
+    chmod 2775 /home/ubuntu && \
+    { \
+      echo 'ubuntu ALL=(root) NOPASSWD: /usr/bin/head *, /bin/kill *, /usr/local/sbin/manus-shell-launcher *, /usr/local/sbin/manus-shell-reaper *'; \
+    } > /etc/sudoers.d/manus-api && \
+    chmod 0440 /etc/sudoers.d/manus-api && \
+    visudo -cf /etc/sudoers.d/manus-api
 
 # Install Python 3.10.12
 RUN add-apt-repository ppa:deadsnakes/ppa && \
-    apt-get update && \
-    apt-get install -y python3.10 python3.10-venv python3.10-dev python3-pip && \
+    apt-get \
+      -o APT::Update::Error-Mode=any \
+      -o Acquire::Retries=5 \
+      -o Acquire::http::Timeout=30 \
+      -o Acquire::https::Timeout=30 \
+      update && \
+    apt-get \
+      -o Acquire::Retries=5 \
+      -o Acquire::http::Timeout=30 \
+      -o Acquire::https::Timeout=30 \
+      install -y python3.10 python3.10-venv python3.10-dev python3-pip && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Install uv
-RUN pip3 install uv
+# Pin the build tool so the same reviewed lockfile is resolved identically
+# across local, CI and rollback rebuilds.
+RUN pip3 install uv==0.7.12
 
 # Install the current Node.js 20.x package from NodeSource
 RUN mkdir -p /etc/apt/keyrings && \
     curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
     echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list && \
-    apt-get update && \
+    apt-get \
+      -o APT::Update::Error-Mode=any \
+      -o Acquire::Retries=5 \
+      -o Acquire::http::Timeout=30 \
+      -o Acquire::https::Timeout=30 \
+      update && \
     apt-get install -y nodejs && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Google Chrome
 RUN add-apt-repository ppa:xtradeb/apps -y && \
-    apt-get update && \
-    apt-get install -y chromium  --no-install-recommends && \
+    apt-get \
+      -o APT::Update::Error-Mode=any \
+      -o Acquire::Retries=5 \
+      -o Acquire::http::Timeout=30 \
+      -o Acquire::https::Timeout=30 \
+      update && \
+    apt-get \
+      -o Acquire::Retries=5 \
+      -o Acquire::http::Timeout=30 \
+      -o Acquire::https::Timeout=30 \
+      install -y chromium --no-install-recommends && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Chinese fonts and language support
-RUN apt-get update && apt-get install -y \
+RUN apt-get \
+      -o APT::Update::Error-Mode=any \
+      -o Acquire::Retries=5 \
+      -o Acquire::http::Timeout=30 \
+      -o Acquire::https::Timeout=30 \
+      update && \
+    apt-get \
+      -o Acquire::Retries=5 \
+      -o Acquire::http::Timeout=30 \
+      -o Acquire::https::Timeout=30 \
+      install -y \
     fonts-noto-cjk \
     fonts-noto-color-emoji \
     language-pack-zh-hans \
@@ -87,7 +160,11 @@ RUN uv sync --frozen --no-dev
 COPY . .
 
 # Ensure application files are writable by app user
-RUN chown -R ubuntu:ubuntu /app
+RUN chown -R ubuntu:ubuntu /app && \
+    install -o root -g root -m 0755 \
+      /app/manus-shell-launcher.py /usr/local/sbin/manus-shell-launcher && \
+    install -o root -g root -m 0755 \
+      /app/manus-shell-reaper.py /usr/local/sbin/manus-shell-reaper
 
 # Configure supervisor
 COPY supervisord.conf /etc/supervisor/conf.d/app.conf
@@ -97,6 +174,7 @@ EXPOSE 8080 9222 5900 5901 30150 30151 30152
 
 ENV UVI_ARGS=""
 ENV CHROME_ARGS=""
+ENV MANUS_SHELL_ISOLATION_REQUIRED="1"
 
 # Use supervisor to start all services
 CMD ["supervisord", "-n", "-c", "/app/supervisord.conf"] 

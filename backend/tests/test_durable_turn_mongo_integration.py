@@ -12,12 +12,14 @@ import socket
 import subprocess
 import tempfile
 import time
-from types import MethodType
+from types import MethodType, SimpleNamespace
 
 import pytest
+from bson import BSON
 from pymongo import ASCENDING, MongoClient
 from pymongo.asynchronous.mongo_client import AsyncMongoClient
 
+from app.domain.models.file import FileInfo
 from app.domain.models.event import DoneEvent, MessageEvent
 from app.domain.models.turn_submission import (
     TurnClaimDecision,
@@ -29,6 +31,11 @@ from app.domain.models.turn_submission import (
 )
 from app.infrastructure.repositories.mongo_turn_submission_repository import (
     MongoTurnSubmissionRepository,
+)
+from app.infrastructure.models.documents import SessionDocument
+import app.infrastructure.repositories.mongo_session_repository as session_repository_module
+from app.infrastructure.repositories.mongo_session_repository import (
+    MongoSessionRepository,
 )
 
 
@@ -323,6 +330,50 @@ async def test_claim_is_single_execution_terminal_precedes_ack_and_expiry_is_unk
     assert expired.turn.state == TurnSubmissionState.FAILED_UNKNOWN
     assert expired.turn.expires_at is not None
 
+    # Legacy/crash-corrupted RUNNING rows may contain a null or missing lease.
+    # Mongo's `{field: null}` predicate covers both and must fence them rather
+    # than returning RETRY forever after an API restart.
+    for digit, lease_shape in zip(("6", "7"), ("null", "missing")):
+        lease_id = (
+            f"{digit * 8}-{digit * 4}-4{digit * 3}-"
+            f"8{digit * 3}-{digit * 12}"
+        )
+        lease_turn, _ = await repo.accept(_turn(lease_id))
+        await repo.mark_enqueued(
+            lease_turn.session_id,
+            lease_id,
+            task_id="task-1",
+            stream_id=f"{digit}-0",
+        )
+        await repo.claim_for_execution(
+            lease_turn.session_id,
+            lease_id,
+            task_id="task-1",
+            owner="crashed-worker",
+            claim_until=datetime.now(UTC) + timedelta(minutes=5),
+        )
+        lease_update = (
+            {"$set": {"claim_until": None}}
+            if lease_shape == "null"
+            else {"$unset": {"claim_until": ""}}
+        )
+        await turns.update_one(
+            {"session_id": lease_turn.session_id, "submission_id": lease_id},
+            lease_update,
+        )
+
+        recovered = await repo.claim_for_execution(
+            lease_turn.session_id,
+            lease_id,
+            task_id="task-1",
+            owner="restart-worker",
+            claim_until=datetime.now(UTC) + timedelta(minutes=5),
+        )
+
+        assert recovered.decision == TurnClaimDecision.ACK
+        assert recovered.turn.state == TurnSubmissionState.FAILED_UNKNOWN
+        assert recovered.turn.expires_at is not None
+
 
 async def test_turn_outbox_replays_beyond_bounded_session_history(
     mongo_repositories,
@@ -351,6 +402,93 @@ async def test_turn_outbox_replays_beyond_bounded_session_history(
     assert await outputs.count_documents(
         {"session_id": turn.session_id, "submission_id": submission_id}
     ) == 520
+
+
+async def test_session_projection_uses_real_mongo_count_and_bson_byte_tail(
+    mongo_repositories,
+    monkeypatch,
+):
+    _factory, turns, _quotas, _outputs, _client = mongo_repositories
+    sessions = turns.database.get_collection("sessions")
+    max_bytes = 150 * 1024
+    old_events = [
+        MessageEvent(
+            id=f"old-{index}",
+            turn_id="old-turn",
+            message=f"old-{index}|" + ("x" * (48 * 1024)),
+            attachments=[
+                FileInfo(
+                    file_id=f"old-file-{index}",
+                    filename="$old-file|" + ("y" * (16 * 1024)),
+                )
+            ],
+        ).model_dump()
+        for index in range(6)
+    ]
+    await sessions.insert_one(
+        {
+            "session_id": "session-history-bytes",
+            "events": old_events,
+            # Session files share the same aggregate; the event budget leaves
+            # independent headroom rather than assuming this array is empty.
+            "files": [
+                FileInfo(
+                    file_id="canonical-file",
+                    filename="canonical.txt",
+                    metadata={"source": "integration-regression"},
+                ).model_dump()
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        SessionDocument,
+        "get_pymongo_collection",
+        classmethod(lambda cls: sessions),
+    )
+    monkeypatch.setattr(
+        session_repository_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            session_history_max_events=512,
+            session_event_max_bytes=128 * 1024,
+            session_history_max_bytes=max_bytes,
+        ),
+    )
+    incoming = MessageEvent(
+        id="latest-event",
+        turn_id="latest-turn",
+        message="$literal-message",
+        attachments=[
+            FileInfo(
+                file_id="latest-file",
+                filename="$literal-filename",
+            )
+        ],
+    )
+    repository = MongoSessionRepository()
+
+    await repository.add_event_once("session-history-bytes", incoming)
+    first = await sessions.find_one({"session_id": "session-history-bytes"})
+    await repository.add_event_once("session-history-bytes", incoming)
+    second = await sessions.find_one({"session_id": "session-history-bytes"})
+
+    retained_bytes = sum(
+        len(BSON.encode(event))
+        + session_repository_module._HISTORY_ARRAY_ENTRY_OVERHEAD_BYTES
+        for event in second["events"]
+    )
+    assert retained_bytes <= max_bytes
+    assert len(second["events"]) < len(old_events) + 1
+    assert second["events"][-1]["id"] == "latest-event"
+    assert second["events"][-1]["message"] == "$literal-message"
+    assert (
+        second["events"][-1]["attachments"][0]["filename"]
+        == "$literal-filename"
+    )
+    assert [event["id"] for event in second["events"]] == [
+        event["id"] for event in first["events"]
+    ]
+    assert second["files"] == first["files"]
 
 
 async def test_terminal_ack_path_repairs_a_previous_quota_release_failure(
@@ -385,18 +523,18 @@ async def test_terminal_ack_path_repairs_a_previous_quota_release_failure(
         await original_release(current)
 
     repo._release_turn = fail_release_once
-    with pytest.raises(TurnSubmissionUnavailableError):
-        await repo.mark_terminal(
-            turn.session_id,
-            submission_id,
-            owner="worker-1",
-            state=TurnSubmissionState.COMPLETED,
-            terminal_event_id="done",
-        )
+    assert await repo.mark_terminal(
+        turn.session_id,
+        submission_id,
+        owner="worker-1",
+        state=TurnSubmissionState.COMPLETED,
+        terminal_event_id="done",
+    )
 
-    # The terminal write committed, but the reservation is still present.
+    # A postcondition failure after the terminal write is reconciled and
+    # retried before mark_terminal returns success.
     quota = await quotas.find_one({"scope_key": "user:user-1"})
-    assert len(quota["active_turns"]) == 1
+    assert quota["active_turns"] == []
     repaired = await repo.claim_for_execution(
         turn.session_id,
         submission_id,

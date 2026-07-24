@@ -6,6 +6,7 @@ distributed lease must permit at most one provisioning replica.
 import asyncio
 from datetime import datetime, timedelta, UTC
 from typing import Optional, List
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -113,6 +114,20 @@ class FakeClawRuntime:
         return self.ready
 
 
+class ResolvingClawRuntime(FakeClawRuntime):
+    def __init__(self, address: str | None = "10.9.0.7", *, fail=False):
+        super().__init__()
+        self.address = address
+        self.fail = fail
+        self.resolve_calls: list[tuple[str, str]] = []
+
+    async def resolve_owned(self, instance_name: str, claw_id: str):
+        self.resolve_calls.append((instance_name, claw_id))
+        if self.fail:
+            raise RuntimeError("owned runtime is missing")
+        return self.address
+
+
 class FakeClawClient:
     async def get_history(self, base_url, session_id, limit=200):
         return []
@@ -165,6 +180,54 @@ async def test_delete_claw_destroys_container():
     assert deleted is True
     assert runtime.destroyed == ["manus-claw-claw1234"]
     assert repo.deleted_user_ids == ["user-1"]
+
+
+async def test_stale_destroy_claim_never_touches_newer_runtime_generation():
+    stale = _make_claw(revision=4)
+
+    class ClaimLostRepository(FakeClawRepository):
+        async def claim_runtime_destroy(self, claw):
+            return None
+
+    repo = ClaimLostRepository(stale)
+    runtime = FakeClawRuntime()
+    service = ClawDomainService(repo, runtime, FakeClawClient())
+
+    assert await service.delete_claw("user-1") is False
+    assert runtime.destroyed == []
+    assert repo.claw is stale
+
+
+async def test_get_claw_refreshes_owned_address_before_health_check():
+    claw = _make_claw(container_ip="10.0.0.5")
+    repo = FakeClawRepository(claw)
+    runtime = ResolvingClawRuntime("10.9.0.7")
+    service = ClawDomainService(repo, runtime, FakeClawClient())
+    service._health_check = AsyncMock(return_value=True)
+
+    result = await service.get_claw("user-1")
+
+    assert result is claw
+    assert result.container_ip == "10.9.0.7"
+    assert runtime.resolve_calls == [
+        ("manus-claw-claw1234", "claw-1234-abcd")
+    ]
+    service._health_check.assert_awaited_once_with("http://10.9.0.7:18788")
+
+
+async def test_get_claw_never_health_checks_stale_ip_when_owned_runtime_missing():
+    claw = _make_claw(container_ip="10.0.0.5")
+    repo = FakeClawRepository(claw)
+    runtime = ResolvingClawRuntime(fail=True)
+    service = ClawDomainService(repo, runtime, FakeClawClient())
+    service._health_check = AsyncMock(return_value=True)
+
+    result = await service.get_claw("user-1")
+
+    assert result is claw
+    assert result.status == ClawStatus.STOPPED
+    assert result.container_ip == "10.0.0.5"
+    service._health_check.assert_not_awaited()
 
 
 async def test_delete_claw_without_record_is_noop():
@@ -488,8 +551,10 @@ async def test_lost_lease_cancels_provisioning_and_preserves_new_owner_lock(
     )
 
     assert domain.provision_calls == 1
-    assert repo.claw.status == ClawStatus.ERROR
-    assert "ownership was lost" in repo.claw.error_message
+    # The fenced old owner leaves the durable generation untouched. Marking it
+    # ERROR here could overwrite a new replica that adopted the same runtime.
+    assert repo.claw.status == ClawStatus.CREATING
+    assert repo.claw.error_message is None
     assert redis.values[lock_key] == "replacement-owner"
 
 

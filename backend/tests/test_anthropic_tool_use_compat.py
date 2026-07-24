@@ -868,7 +868,12 @@ async def test_missing_markdown_attachment_is_materialized_from_final_message():
             return io.BytesIO(self.files[path].encode())
 
         async def file_find(self, path, glob_pattern):
-            return type("Result", (), {"data": {"files": []}})()
+            files = [
+                file_path
+                for file_path in self.files
+                if file_path.rsplit("/", 1)[0] == path
+            ]
+            return type("Result", (), {"data": {"files": files}})()
 
         async def file_write(self, file, content, **kwargs):
             self.files[file] = content
@@ -886,7 +891,9 @@ async def test_missing_markdown_attachment_is_materialized_from_final_message():
             self.files.append(file_info)
 
     class FakeFileStorage:
-        async def upload_file(self, file_data, file_name, user_id):
+        async def upload_file(
+            self, file_data, file_name, user_id, metadata=None
+        ):
             return FileInfo(
                 file_id="stored_file",
                 filename=file_name,
@@ -969,7 +976,12 @@ async def test_relative_attachment_path_resolves_to_upload_directory():
             return io.BytesIO(self.files[path])
 
         async def file_find(self, path, glob_pattern):
-            return type("Result", (), {"data": {"files": []}})()
+            files = [
+                file_path
+                for file_path in self.files
+                if file_path.rsplit("/", 1)[0] == path
+            ]
+            return type("Result", (), {"data": {"files": files}})()
 
     class FakeSessionRepository:
         def __init__(self):
@@ -985,7 +997,9 @@ async def test_relative_attachment_path_resolves_to_upload_directory():
             self.files.append(file_info)
 
     class FakeFileStorage:
-        async def upload_file(self, file_data, file_name, user_id):
+        async def upload_file(
+            self, file_data, file_name, user_id, metadata=None
+        ):
             return FileInfo(
                 file_id="stored_relative",
                 filename=file_name,
@@ -1016,13 +1030,22 @@ async def test_relative_attachment_path_resolves_to_upload_directory():
 
 async def test_synced_artifact_path_is_reused_without_duplicate_uploads():
     class FakeSandbox:
+        def __init__(self):
+            self.downloads = 0
+
         async def file_download(self, path):
             if path != "/home/ubuntu/upload/report.md":
                 raise FileNotFoundError(path)
+            self.downloads += 1
             return io.BytesIO(b"content")
 
         async def file_find(self, path, glob_pattern):
-            return type("Result", (), {"data": {"files": []}})()
+            files = (
+                ["/home/ubuntu/upload/report.md"]
+                if path == "/home/ubuntu/upload"
+                else []
+            )
+            return type("Result", (), {"data": {"files": files}})()
 
     class FakeSessionRepository:
         def __init__(self):
@@ -1042,7 +1065,9 @@ async def test_synced_artifact_path_is_reused_without_duplicate_uploads():
         def __init__(self):
             self.uploads = 0
 
-        async def upload_file(self, file_data, file_name, user_id):
+        async def upload_file(
+            self, file_data, file_name, user_id, metadata=None
+        ):
             self.uploads += 1
             return FileInfo(
                 file_id=f"stored_{self.uploads}",
@@ -1069,6 +1094,7 @@ async def test_synced_artifact_path_is_reused_without_duplicate_uploads():
     assert first.file_id == "stored_1"
     assert second.file_id == "stored_1"
     assert runner._file_storage.uploads == 1
+    assert runner._sandbox.downloads == 1
 
 
 async def test_shell_created_artifact_is_tracked_for_delivery():
@@ -1092,7 +1118,12 @@ async def test_shell_created_artifact_is_tracked_for_delivery():
             return io.BytesIO(b"hi")
 
         async def file_find(self, path, glob_pattern):
-            return type("Result", (), {"data": {"files": []}})()
+            files = (
+                ["/home/ubuntu/upload/shell-artifact.md"]
+                if path == "/home/ubuntu/upload"
+                else []
+            )
+            return type("Result", (), {"data": {"files": files}})()
 
     class FakeSessionRepository:
         async def get_file_by_path(self, session_id, file_path):
@@ -1105,7 +1136,9 @@ async def test_shell_created_artifact_is_tracked_for_delivery():
             pass
 
     class FakeFileStorage:
-        async def upload_file(self, file_data, file_name, user_id):
+        async def upload_file(
+            self, file_data, file_name, user_id, metadata=None
+        ):
             return FileInfo(
                 file_id="stored_shell",
                 filename=file_name,
@@ -1150,6 +1183,9 @@ def test_shell_artifact_extraction_does_not_promote_relative_paths_to_root():
                 "../draft.md",
                 "assets/index.html",
                 "https://example.com/download/report.pdf",
+                "https://example.com/?file=/PLAN.md",
+                "Saved:/home/ubuntu/upload/saved.pdf",
+                "C:/Windows/not-an-artifact.txt",
                 "/home/ubuntu/upload/result.md",
                 "~/notes.md",
             ]
@@ -1157,6 +1193,7 @@ def test_shell_artifact_extraction_does_not_promote_relative_paths_to_root():
     )
 
     assert paths == [
+        "/home/ubuntu/upload/saved.pdf",
         "/home/ubuntu/upload/result.md",
         "/home/ubuntu/notes.md",
     ]
@@ -1165,13 +1202,13 @@ def test_shell_artifact_extraction_does_not_promote_relative_paths_to_root():
 async def test_missing_root_artifact_never_triggers_recursive_root_search():
     class FakeSandbox:
         def __init__(self):
-            self.search_dirs = []
+            self.searches = []
 
         async def file_download(self, path):
             raise FileNotFoundError(path)
 
         async def file_find(self, path, glob_pattern):
-            self.search_dirs.append(path)
+            self.searches.append((path, glob_pattern))
             return type("Result", (), {"data": {"files": []}})()
 
     runner = object.__new__(AgentTaskRunner)
@@ -1181,25 +1218,74 @@ async def test_missing_root_artifact_never_triggers_recursive_root_search():
     resolved = await runner._resolve_existing_sandbox_file("/PLAN.md")
 
     assert resolved is None
-    assert runner._sandbox.search_dirs == [
-        "/home/ubuntu",
-        "/home/ubuntu/upload",
-        "/tmp",
+    assert runner._sandbox.searches == [
+        ("/", "PLAN.md"),
+        ("/home/ubuntu", "**/PLAN.md"),
+        ("/home/ubuntu/upload", "**/PLAN.md"),
+        ("/tmp", "**/PLAN.md"),
     ]
-    assert "/" not in runner._sandbox.search_dirs
+    assert ("/", "**/PLAN.md") not in runner._sandbox.searches
+
+
+async def test_missing_artifact_escapes_glob_metacharacters_in_basename():
+    class FakeSandbox:
+        def __init__(self):
+            self.patterns = []
+
+        async def file_download(self, path):
+            raise FileNotFoundError(path)
+
+        async def file_find(self, path, glob_pattern):
+            self.patterns.append(glob_pattern)
+            return type("Result", (), {"data": {"files": []}})()
+
+    runner = object.__new__(AgentTaskRunner)
+    runner._agent_id = "agent"
+    runner._sandbox = FakeSandbox()
+
+    resolved = await runner._resolve_existing_sandbox_file(
+        "/home/ubuntu/upload/report[1]*?.md"
+    )
+
+    assert resolved is None
+    assert runner._sandbox.patterns == [
+        "report[[]1][*][?].md",
+        "**/report[[]1][*][?].md",
+        "**/report[[]1][*][?].md",
+        "**/report[[]1][*][?].md",
+    ]
+
+
+def test_artifact_extraction_bounds_input_text_and_result_count():
+    runner = object.__new__(AgentTaskRunner)
+    runner._MAX_ARTIFACT_DISCOVERY_TEXT_CHARS = 80
+
+    paths = runner._extract_artifact_paths(
+        " ".join(
+            f"/home/ubuntu/upload/report-{index}.md"
+            for index in range(100)
+        ),
+        max_paths=2,
+    )
+
+    assert paths == [
+        "/home/ubuntu/upload/report-0.md",
+        "/home/ubuntu/upload/report-1.md",
+    ]
 
 
 async def test_shell_artifact_sync_timeout_is_fail_open():
     runner = object.__new__(AgentTaskRunner)
     runner._agent_id = "agent"
     runner._ARTIFACT_SYNC_TIMEOUT_SECONDS = 0.01
-    cancelled = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
 
     async def never_finishes(self, path, fallback_content=None, generated=False):
         try:
-            await asyncio.Event().wait()
+            await release.wait()
         finally:
-            cancelled.set()
+            finished.set()
 
     runner._sync_file_to_storage = MethodType(never_finishes, runner)
     event = ToolEvent(
@@ -1215,14 +1301,14 @@ async def test_shell_artifact_sync_timeout_is_fail_open():
 
     await asyncio.wait_for(runner._sync_shell_artifacts(event, None), timeout=0.2)
 
-    assert cancelled.is_set()
+    await asyncio.wait_for(finished.wait(), timeout=0.1)
 
 
 async def test_shell_artifact_sync_uses_one_total_timeout_budget():
     runner = object.__new__(AgentTaskRunner)
     runner._agent_id = "agent"
     runner._ARTIFACT_SYNC_TIMEOUT_SECONDS = 0.025
-    runner._MAX_SHELL_ARTIFACT_CANDIDATES = 32
+    runner._MAX_AUTO_ARTIFACT_CANDIDATES = 32
     attempted = []
 
     async def slow_sync(self, path, fallback_content=None, generated=False):
@@ -1256,7 +1342,7 @@ async def test_shell_artifact_sync_caps_candidate_count():
     runner = object.__new__(AgentTaskRunner)
     runner._agent_id = "agent"
     runner._ARTIFACT_SYNC_TIMEOUT_SECONDS = 1
-    runner._MAX_SHELL_ARTIFACT_CANDIDATES = 2
+    runner._MAX_AUTO_ARTIFACT_CANDIDATES = 2
     attempted = []
 
     async def record_sync(self, path, fallback_content=None, generated=False):
@@ -1283,3 +1369,294 @@ async def test_shell_artifact_sync_caps_candidate_count():
         "/home/ubuntu/upload/report-0.md",
         "/home/ubuntu/upload/report-1.md",
     ]
+
+
+async def test_message_artifact_sync_timeout_is_fail_open_and_keeps_generated_files():
+    runner = object.__new__(AgentTaskRunner)
+    runner._agent_id = "agent"
+    runner._ARTIFACT_SYNC_TIMEOUT_SECONDS = 0.01
+    runner._MAX_AUTO_ARTIFACT_CANDIDATES = 32
+    runner._synced_artifacts = {}
+    runner._generated_artifacts = {
+        "/home/ubuntu/upload/already-synced.md": FileInfo(
+            file_id="stored-generated",
+            filename="already-synced.md",
+            file_path="/home/ubuntu/upload/already-synced.md",
+        )
+    }
+    release = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def never_finishes(self, path, fallback_content=None, generated=False):
+        try:
+            await release.wait()
+        finally:
+            finished.set()
+
+    runner._sync_file_to_storage = MethodType(never_finishes, runner)
+    event = MessageEvent(
+        message="See /home/ubuntu/upload/missing.md",
+        attachments=[],
+    )
+
+    await asyncio.wait_for(
+        runner._sync_message_attachments_to_storage(event),
+        timeout=0.2,
+    )
+
+    await asyncio.wait_for(finished.wait(), timeout=0.1)
+    assert [attachment.file_id for attachment in event.attachments] == [
+        "stored-generated"
+    ]
+
+
+async def test_message_artifact_sync_caps_candidate_count():
+    runner = object.__new__(AgentTaskRunner)
+    runner._agent_id = "agent"
+    runner._ARTIFACT_SYNC_TIMEOUT_SECONDS = 1
+    runner._MAX_AUTO_ARTIFACT_CANDIDATES = 2
+    runner._synced_artifacts = {}
+    runner._generated_artifacts = {}
+    attempted = []
+
+    async def record_sync(self, path, fallback_content=None, generated=False):
+        attempted.append(path)
+        return None
+
+    runner._sync_file_to_storage = MethodType(record_sync, runner)
+    event = MessageEvent(
+        message=" ".join(
+            f"/home/ubuntu/upload/message-{index}.md"
+            for index in range(5)
+        ),
+        attachments=[],
+    )
+
+    await runner._sync_message_attachments_to_storage(event)
+
+    assert attempted == [
+        "/home/ubuntu/upload/message-0.md",
+        "/home/ubuntu/upload/message-1.md",
+    ]
+
+
+async def test_shell_tool_preview_timeout_is_fail_open():
+    runner = object.__new__(AgentTaskRunner)
+    runner._agent_id = "agent"
+    runner._ARTIFACT_SYNC_TIMEOUT_SECONDS = 0.01
+    cancelled = asyncio.Event()
+
+    class Sandbox:
+        async def view_shell(self, session_id, console=False):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+    runner._sandbox = Sandbox()
+    event = ToolEvent(
+        tool_call_id="shell-preview-timeout",
+        tool_name="shell",
+        function_name="shell_exec",
+        function_args={"id": "shell-1", "command": "echo done"},
+        status=ToolStatus.CALLED,
+    )
+
+    await asyncio.wait_for(runner._handle_tool_event(event), timeout=0.1)
+
+    await asyncio.wait_for(cancelled.wait(), timeout=0.1)
+    assert event.tool_content.console == "(Console preview timed out)"
+
+
+async def test_browser_screenshot_timeout_is_fail_open():
+    runner = object.__new__(AgentTaskRunner)
+    runner._agent_id = "agent"
+    runner._ARTIFACT_SYNC_TIMEOUT_SECONDS = 0.01
+    cancelled = asyncio.Event()
+
+    async def slow_screenshot(self):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    runner._get_browser_screenshot = MethodType(slow_screenshot, runner)
+    event = ToolEvent(
+        tool_call_id="browser-preview-timeout",
+        tool_name="browser",
+        function_name="browser_view",
+        function_args={},
+        status=ToolStatus.CALLED,
+    )
+
+    await asyncio.wait_for(runner._handle_tool_event(event), timeout=0.1)
+
+    await asyncio.wait_for(cancelled.wait(), timeout=0.1)
+    assert event.tool_content.screenshot == ""
+
+
+async def test_read_only_file_tool_does_not_upload_artifact_again():
+    runner = object.__new__(AgentTaskRunner)
+    runner._agent_id = "agent"
+    runner._ARTIFACT_SYNC_TIMEOUT_SECONDS = 0.05
+
+    class Sandbox:
+        async def file_read(self, path):
+            raise AssertionError("function result content should be reused")
+
+    async def must_not_sync(*args, **kwargs):
+        raise AssertionError("read-only file tools must not upload artifacts")
+
+    runner._sandbox = Sandbox()
+    runner._sync_file_to_storage = must_not_sync
+    event = ToolEvent(
+        tool_call_id="file-read",
+        tool_name="file",
+        function_name="file_read",
+        function_args={"file": "/home/ubuntu/readme.md"},
+        function_result=ToolResult(
+            success=True,
+            message="ok",
+            data={"content": "already returned"},
+        ),
+        status=ToolStatus.CALLED,
+    )
+
+    await runner._handle_tool_event(event)
+
+    assert event.tool_content.content == "already returned"
+
+
+async def test_artifact_deadline_does_not_cancel_inflight_atomic_publish():
+    publish_started = asyncio.Event()
+    release_publish = asyncio.Event()
+
+    class Sandbox:
+        async def file_find(self, path, glob_pattern):
+            return type(
+                "Result",
+                (),
+                {"data": {"files": [f"{path}/report.md"]}},
+            )()
+
+        async def file_download(self, path):
+            return io.BytesIO(b"report")
+
+    class SessionRepository:
+        current = None
+        publish_cancelled = False
+
+        async def get_file_by_path(self, session_id, file_path):
+            return None
+
+        async def upsert_file_by_path(self, session_id, file_info):
+            publish_started.set()
+            try:
+                await release_publish.wait()
+            except asyncio.CancelledError:
+                self.publish_cancelled = True
+                raise
+            self.current = file_info
+            return None
+
+    class FileStorage:
+        async def upload_file(
+            self,
+            file_data,
+            file_name,
+            user_id,
+            metadata=None,
+        ):
+            return FileInfo(
+                file_id="new-file",
+                filename=file_name,
+                metadata=metadata,
+            )
+
+    runner = object.__new__(AgentTaskRunner)
+    runner._agent_id = "agent"
+    runner._session_id = "session"
+    runner._user_id = "user"
+    runner._sandbox = Sandbox()
+    runner._session_repository = SessionRepository()
+    runner._file_storage = FileStorage()
+    runner._generated_artifacts = {}
+    runner._synced_artifacts = {}
+    runner._artifact_cleanup_tasks = set()
+
+    deadline = asyncio.get_running_loop().time() + 0.01
+    file_info, timed_out = await runner._sync_auto_artifact_before_deadline(
+        "/home/ubuntu/upload/report.md",
+        deadline,
+        source="test",
+        generated=True,
+    )
+
+    assert (file_info, timed_out) == (None, True)
+    await asyncio.wait_for(publish_started.wait(), timeout=0.1)
+    assert runner._session_repository.publish_cancelled is False
+    release_publish.set()
+    for _ in range(100):
+        if not runner._artifact_cleanup_tasks:
+            break
+        await asyncio.sleep(0.01)
+
+    assert runner._session_repository.current.file_id == "new-file"
+    assert runner._artifact_cleanup_tasks == set()
+
+
+async def test_browser_deadline_does_not_cancel_inflight_session_publish():
+    publish_started = asyncio.Event()
+    release_publish = asyncio.Event()
+
+    class Browser:
+        async def screenshot(self):
+            return b"png"
+
+    class FileStorage:
+        async def upload_file(self, *args, **kwargs):
+            return FileInfo(file_id="screenshot-file", filename="screenshot.png")
+
+    class SessionRepository:
+        published = None
+        publish_cancelled = False
+
+        async def add_file(self, session_id, file_info):
+            publish_started.set()
+            try:
+                await release_publish.wait()
+            except asyncio.CancelledError:
+                self.publish_cancelled = True
+                raise
+            self.published = file_info
+
+    runner = object.__new__(AgentTaskRunner)
+    runner._agent_id = "agent"
+    runner._session_id = "session"
+    runner._user_id = "user"
+    runner._browser = Browser()
+    runner._file_storage = FileStorage()
+    runner._session_repository = SessionRepository()
+    runner._artifact_cleanup_tasks = set()
+    runner._ARTIFACT_SYNC_TIMEOUT_SECONDS = 0.01
+    event = ToolEvent(
+        tool_call_id="browser-publish",
+        tool_name="browser",
+        function_name="browser_view",
+        function_args={},
+        status=ToolStatus.CALLED,
+    )
+
+    await asyncio.wait_for(runner._handle_tool_event(event), timeout=0.1)
+
+    await asyncio.wait_for(publish_started.wait(), timeout=0.1)
+    assert runner._session_repository.publish_cancelled is False
+    release_publish.set()
+    for _ in range(100):
+        if not runner._artifact_cleanup_tasks:
+            break
+        await asyncio.sleep(0.01)
+
+    assert runner._session_repository.published.file_id == "screenshot-file"
+    assert runner._artifact_cleanup_tasks == set()

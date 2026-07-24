@@ -358,7 +358,8 @@ async def test_sandbox_http_error_never_logs_signed_gateway_url(
     )
 
     with caplog.at_level(logging.WARNING):
-        await sandbox.ensure_sandbox()
+        with pytest.raises(Exception, match="failed to become ready"):
+            await sandbox.ensure_sandbox()
 
     assert secret not in caplog.text
     assert "signature=" not in caplog.text

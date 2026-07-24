@@ -5,7 +5,12 @@ import pytest
 
 from app.application.services.agent_service import AgentService
 from app.core.config import get_settings
-from app.domain.services.agent_task_runner import AgentTaskRunner, AgentTaskRunnerFactory
+from app.domain.services import agent_task_runner as runner_module
+from app.domain.services.agent_task_runner import (
+    AgentTaskRunner,
+    AgentTaskRunnerFactory,
+    RunnerCleanupCapacityError,
+)
 from app.infrastructure.external.sandbox.agentbay_sandbox import AgentBaySandbox
 from app.infrastructure.external.sandbox.docker_sandbox import DockerSandbox
 from app.domain.external.sandbox_provisioner import (
@@ -92,22 +97,43 @@ async def test_dynamic_docker_sandbox_applies_configured_resource_limits(
 
     monkeypatch.setattr(
         "app.infrastructure.external.sandbox.docker_sandbox.docker.from_env",
-        lambda: SimpleNamespace(containers=Containers()),
+        lambda **kwargs: SimpleNamespace(containers=Containers()),
     )
     monkeypatch.setenv("SANDBOX_ADDRESS", "")
     monkeypatch.setenv("SANDBOX_IMAGE", "example/sandbox:tested")
     monkeypatch.setenv("SANDBOX_NAME_PREFIX", "bounded")
     monkeypatch.setenv("SANDBOX_NETWORK", "manus-network")
+    monkeypatch.setenv("RUNTIME_NETWORK_ISOLATION", "true")
     monkeypatch.setenv("SANDBOX_MEMORY_LIMIT", "768m")
     monkeypatch.setenv("SANDBOX_CPU_LIMIT", "1.5")
     monkeypatch.setenv("SANDBOX_PIDS_LIMIT", "123")
+    monkeypatch.setattr(
+        "app.infrastructure.external.sandbox.docker_sandbox."
+        "require_containerized_runtime_gateway",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "app.infrastructure.external.sandbox.docker_sandbox."
+        "ensure_runtime_egress_network",
+        lambda *_args, **_kwargs: "test-egress-network",
+    )
+    monkeypatch.setattr(
+        "app.infrastructure.external.sandbox.docker_sandbox."
+        "ensure_private_runtime_network",
+        lambda *_args, **_kwargs: "test-private-network",
+    )
+    monkeypatch.setattr(
+        "app.infrastructure.external.sandbox.docker_sandbox."
+        "connect_runtime_to_private_network",
+        lambda *_args, **_kwargs: "172.20.0.9",
+    )
     get_settings.cache_clear()
     sandbox = None
     try:
-        sandbox = DockerSandbox._create_task()
+        sandbox = await DockerSandbox._create_named("bounded-focused-test")
 
         assert captured["image"] == "example/sandbox:tested"
-        assert captured["network"] == "manus-network"
+        assert captured["network"] == "test-egress-network"
         assert captured["mem_limit"] == "768m"
         assert captured["nano_cpus"] == 1_500_000_000
         assert captured["pids_limit"] == 123
@@ -162,6 +188,8 @@ class _LLMCloseTracker:
 
 
 class _SandboxCloseTracker:
+    id = "sandbox-1"
+
     def __init__(self):
         self.close_count = 0
         self.destroy_count = 0
@@ -182,6 +210,10 @@ class _FactorySessionRepository:
             agent_id="agent-1",
             sandbox_id="sandbox-1",
             sandbox_provider="docker",
+            deleting=False,
+            sandbox_destroying=False,
+            task_id="task-1",
+            task_sandbox_id="sandbox-1",
         )
 
 
@@ -267,6 +299,8 @@ async def test_runner_factory_failure_closes_partial_handles_without_destroy(
                 "agent_id": "agent-1",
                 "user_id": "owner",
                 "sandbox_id": "sandbox-1",
+                "task_id": "task-1",
+                "task_sandbox_id": "sandbox-1",
             }
         )
 
@@ -274,6 +308,100 @@ async def test_runner_factory_failure_closes_partial_handles_without_destroy(
     assert llm.close_count == 1
     assert sandbox.close_count == 1
     assert sandbox.destroy_count == 0
+    assert runner_module._runner_cleanup_leases_for_loop() == set()
+
+
+async def test_runner_factory_backpressures_before_constructing_live_handles(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        runner_module,
+        "_MAX_RUNNER_CLEANUP_BUNDLES",
+        2,
+    )
+    sandboxes = []
+    browsers = []
+    llms = []
+
+    class Sandbox(_SandboxCloseTracker):
+        async def get_browser(self):
+            browser = _CloseTracker()
+            browsers.append(browser)
+            return browser
+
+    class SandboxClass:
+        get_count = 0
+
+        @classmethod
+        async def get(cls, sandbox_id):
+            cls.get_count += 1
+            sandbox = Sandbox()
+            sandboxes.append(sandbox)
+            return sandbox
+
+    class AgentRepository:
+        find_count = 0
+
+        async def find_by_id(self, agent_id):
+            self.find_count += 1
+            return SimpleNamespace(id=agent_id)
+
+    class LLMFactory:
+        create_count = 0
+
+        def create(self, agent):
+            self.create_count += 1
+            llm = _LLMCloseTracker()
+            llms.append(llm)
+            return llm
+
+    agent_repository = AgentRepository()
+    llm_factory = LLMFactory()
+    factory = AgentTaskRunnerFactory(
+        agent_repository=agent_repository,
+        session_repository=_FactorySessionRepository(),
+        sandbox_cls=SandboxClass,
+        file_storage=SimpleNamespace(),
+        mcp_repository=SimpleNamespace(),
+        llm_factory=llm_factory,
+    )
+    params = {
+        "session_id": "session-1",
+        "agent_id": "agent-1",
+        "user_id": "owner",
+        "sandbox_id": "sandbox-1",
+        "task_id": "task-1",
+        "task_sandbox_id": "sandbox-1",
+    }
+
+    first = await factory.create_runner(params)
+    second = await factory.create_runner(params)
+
+    with pytest.raises(RunnerCleanupCapacityError) as raised:
+        await factory.create_runner(params)
+
+    assert raised.value.transient is True
+    assert raised.value.retryable is True
+    assert SandboxClass.get_count == 2
+    assert agent_repository.find_count == 2
+    assert llm_factory.create_count == 2
+    assert len(runner_module._runner_cleanup_leases_for_loop()) == 2
+
+    await first.aclose()
+    assert len(runner_module._runner_cleanup_leases_for_loop()) == 1
+
+    third = await factory.create_runner(params)
+    assert SandboxClass.get_count == 3
+    assert agent_repository.find_count == 3
+    assert llm_factory.create_count == 3
+
+    await asyncio.gather(second.aclose(), third.aclose())
+
+    assert runner_module._runner_cleanup_leases_for_loop() == set()
+    assert all(browser.close_count == 1 for browser in browsers)
+    assert all(llm.close_count == 1 for llm in llms)
+    assert all(sandbox.close_count == 1 for sandbox in sandboxes)
+    assert all(sandbox.destroy_count == 0 for sandbox in sandboxes)
 
 
 async def test_runner_factory_never_allocates_an_exact_missing_sandbox():
@@ -305,10 +433,229 @@ async def test_runner_factory_never_allocates_an_exact_missing_sandbox():
                 "agent_id": "agent-1",
                 "user_id": "owner",
                 "sandbox_id": "sandbox-1",
+                "task_id": "task-1",
+                "task_sandbox_id": "sandbox-1",
             }
         )
 
     assert SandboxClass.create_count == 0
+
+
+async def test_runner_factory_prefers_owner_aware_sandbox_lookup():
+    class SandboxClass:
+        owned_calls = []
+        get_count = 0
+
+        @classmethod
+        async def get_owned(cls, sandbox_id, owner_id):
+            cls.owned_calls.append((sandbox_id, owner_id))
+            return None
+
+        @classmethod
+        async def get(cls, sandbox_id):
+            cls.get_count += 1
+            raise AssertionError("owner-aware providers must not use get()")
+
+    factory = AgentTaskRunnerFactory(
+        agent_repository=SimpleNamespace(),
+        session_repository=_FactorySessionRepository(),
+        sandbox_cls=SandboxClass,
+        file_storage=SimpleNamespace(),
+        mcp_repository=SimpleNamespace(),
+        llm=SimpleNamespace(),
+    )
+
+    with pytest.raises(SandboxProvisioningRequiredError):
+        await factory.create_runner(
+            {
+                "session_id": "session-1",
+                "agent_id": "agent-1",
+                "user_id": "owner",
+                "sandbox_id": "sandbox-1",
+                "task_id": "task-1",
+                "task_sandbox_id": "sandbox-1",
+            }
+        )
+
+    assert SandboxClass.owned_calls == [("sandbox-1", "session-1")]
+    assert SandboxClass.get_count == 0
+
+
+async def test_runner_factory_rejects_mismatched_runtime_handle_id():
+    sandbox = _SandboxCloseTracker()
+    sandbox.id = "different-sandbox"
+
+    class SandboxClass:
+        @classmethod
+        async def get(cls, sandbox_id):
+            return sandbox
+
+    factory = AgentTaskRunnerFactory(
+        agent_repository=SimpleNamespace(),
+        session_repository=_FactorySessionRepository(),
+        sandbox_cls=SandboxClass,
+        file_storage=SimpleNamespace(),
+        mcp_repository=SimpleNamespace(),
+        llm=SimpleNamespace(),
+    )
+
+    with pytest.raises(
+        SandboxProvisioningRequiredError,
+        match="different persisted runtime",
+    ):
+        await factory.create_runner(
+            {
+                "session_id": "session-1",
+                "agent_id": "agent-1",
+                "user_id": "owner",
+                "sandbox_id": "sandbox-1",
+                "task_id": "task-1",
+                "task_sandbox_id": "sandbox-1",
+            }
+        )
+
+    assert sandbox.close_count == 1
+    assert sandbox.destroy_count == 0
+    assert runner_module._runner_cleanup_leases_for_loop() == set()
+
+
+async def test_runner_factory_falls_back_for_provider_without_get_owned():
+    class LegacySandboxClass:
+        get_calls = []
+
+        @classmethod
+        async def get(cls, sandbox_id):
+            cls.get_calls.append(sandbox_id)
+            return None
+
+    factory = AgentTaskRunnerFactory(
+        agent_repository=SimpleNamespace(),
+        session_repository=_FactorySessionRepository(),
+        sandbox_cls=LegacySandboxClass,
+        file_storage=SimpleNamespace(),
+        mcp_repository=SimpleNamespace(),
+        llm=SimpleNamespace(),
+    )
+
+    with pytest.raises(SandboxProvisioningRequiredError):
+        await factory.create_runner(
+            {
+                "session_id": "session-1",
+                "agent_id": "agent-1",
+                "user_id": "owner",
+                "sandbox_id": "sandbox-1",
+                "task_id": "task-1",
+                "task_sandbox_id": "sandbox-1",
+            }
+        )
+
+    assert LegacySandboxClass.get_calls == ["sandbox-1"]
+
+
+async def test_runner_factory_does_not_fallback_after_owned_lookup_error():
+    class SandboxClass:
+        get_count = 0
+
+        @classmethod
+        async def get_owned(cls, sandbox_id, owner_id):
+            raise RuntimeError("owned lookup is inconclusive")
+
+        @classmethod
+        async def get(cls, sandbox_id):
+            cls.get_count += 1
+            return None
+
+    factory = AgentTaskRunnerFactory(
+        agent_repository=SimpleNamespace(),
+        session_repository=_FactorySessionRepository(),
+        sandbox_cls=SandboxClass,
+        file_storage=SimpleNamespace(),
+        mcp_repository=SimpleNamespace(),
+        llm=SimpleNamespace(),
+    )
+
+    with pytest.raises(RuntimeError, match="owned lookup is inconclusive"):
+        await factory.create_runner(
+            {
+                "session_id": "session-1",
+                "agent_id": "agent-1",
+                "user_id": "owner",
+                "sandbox_id": "sandbox-1",
+                "task_id": "task-1",
+                "task_sandbox_id": "sandbox-1",
+            }
+        )
+
+    assert SandboxClass.get_count == 0
+
+
+@pytest.mark.parametrize(
+    "session_overrides",
+    [
+        {"deleting": True},
+        {"sandbox_destroying": True},
+        {"task_id": "replacement-task"},
+        {"task_sandbox_id": "previous-sandbox"},
+        {"sandbox_id": "replacement-sandbox"},
+    ],
+)
+async def test_runner_factory_fences_delete_task_and_sandbox_generation(
+    monkeypatch,
+    session_overrides,
+):
+    class SessionRepository:
+        async def find_by_id_and_user_id(self, session_id, user_id):
+            values = {
+                "id": session_id,
+                "user_id": user_id,
+                "agent_id": "agent-1",
+                "sandbox_id": "sandbox-1",
+                "sandbox_provider": "docker",
+                "deleting": False,
+                "sandbox_destroying": False,
+                "task_id": "task-1",
+                "task_sandbox_id": "sandbox-1",
+            }
+            values.update(session_overrides)
+            return SimpleNamespace(**values)
+
+    class SandboxClass:
+        get_count = 0
+
+        @classmethod
+        async def get(cls, sandbox_id):
+            cls.get_count += 1
+            raise AssertionError("runtime lookup must be fenced first")
+
+    monkeypatch.setenv("SANDBOX_PROVIDER", "docker")
+    get_settings.cache_clear()
+    try:
+        factory = AgentTaskRunnerFactory(
+            agent_repository=SimpleNamespace(),
+            session_repository=SessionRepository(),
+            sandbox_cls=SandboxClass,
+            file_storage=SimpleNamespace(),
+            mcp_repository=SimpleNamespace(),
+            llm=SimpleNamespace(),
+        )
+        with pytest.raises(
+            SandboxProvisioningRequiredError,
+            match="ownership does not match",
+        ):
+            await factory.create_runner(
+                {
+                    "session_id": "session-1",
+                    "agent_id": "agent-1",
+                    "user_id": "owner",
+                    "sandbox_id": "sandbox-1",
+                    "sandbox_provider": "docker",
+                    "task_id": "task-1",
+                    "task_sandbox_id": "sandbox-1",
+                }
+            )
+        assert SandboxClass.get_count == 0
+    finally:
+        get_settings.cache_clear()
 
 
 async def test_runner_factory_rejects_cross_provider_session_before_lookup(
@@ -320,6 +667,10 @@ async def test_runner_factory_rejects_cross_provider_session_before_lookup(
                 agent_id="agent-1",
                 sandbox_id="agentbay-session",
                 sandbox_provider="agentbay",
+                deleting=False,
+                sandbox_destroying=False,
+                task_id="task-1",
+                task_sandbox_id="agentbay-session",
             )
 
     class SandboxClass:
@@ -352,6 +703,8 @@ async def test_runner_factory_rejects_cross_provider_session_before_lookup(
                     "user_id": "owner",
                     "sandbox_id": "agentbay-session",
                     "sandbox_provider": "agentbay",
+                    "task_id": "task-1",
+                    "task_sandbox_id": "agentbay-session",
                 }
             )
         assert SandboxClass.get_count == 0

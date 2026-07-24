@@ -3,6 +3,10 @@ from typing import Optional, List, Protocol
 from app.domain.models.claw import Claw, ClawMessage, ClawAttachment, ClawStatus
 
 
+class ClawWriteConflictError(RuntimeError):
+    """A stale Claw lifecycle snapshot lost an optimistic write race."""
+
+
 class ClawRepository(Protocol):
     """Repository interface for Claw aggregate"""
 
@@ -26,6 +30,10 @@ class ClawRepository(Protocol):
         """Update an existing claw instance"""
         ...
 
+    async def claim_runtime_destroy(self, claw: Claw) -> Optional[Claw]:
+        """Fence provider deletion by atomically claiming the exact revision."""
+        ...
+
     async def count_by_statuses(self, statuses: List[ClawStatus]) -> int:
         """Count claw instances in any of the supplied statuses."""
         ...
@@ -36,6 +44,10 @@ class ClawRepository(Protocol):
 
     async def delete_by_user_id(self, user_id: str) -> bool:
         """Delete claw instance by user ID"""
+        ...
+
+    async def delete_if_matches(self, claw: Claw) -> bool:
+        """Delete only the exact revision/runtime generation in ``claw``."""
         ...
 
     async def get_messages(self, user_id: str) -> List[ClawMessage]:

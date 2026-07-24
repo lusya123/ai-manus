@@ -27,6 +27,7 @@ from app.interfaces.schemas.claw import (
 )
 from app.interfaces.schemas.file import FileInfoResponse
 from app.domain.external.file import (
+    FileStorageBusyError,
     FileStorageQuotaExceededError,
     FileTooLargeError,
 )
@@ -123,6 +124,11 @@ async def upload_claw_file(
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail=str(exc),
+        ) from exc
+    except FileStorageBusyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="File storage is busy; please retry",
         ) from exc
     return APIResponse.success(await FileInfoResponse.from_domain(result))
 
@@ -353,6 +359,7 @@ async def claw_ws(websocket: WebSocket):
         try:
             # Catch-up for in-progress response
             pending = claw_service.get_pending_content(user.id, "default")
+            pending_thinking = None
             if pending:
                 await websocket.send_json({"type": "catchup", "content": pending})
             else:
@@ -363,6 +370,27 @@ async def claw_ws(websocket: WebSocket):
                     await websocket.send_json(
                         {"type": "thinking", "content": pending_thinking}
                     )
+            get_terminal_event = getattr(
+                claw_service, "get_terminal_event", lambda *_: None
+            )
+            terminal_event = get_terminal_event(user.id, "default")
+            if terminal_event is not None and queue.empty():
+                # The response may have completed just before this subscriber
+                # joined.  Its state-level terminal latch bridges the narrow
+                # interval between local fanout and state removal.
+                await websocket.send_json(terminal_event)
+            elif not pending and not pending_thinking:
+                # No active/latching state means the last turn is durably idle.
+                # Reconcile a client that disconnected after its final frame.
+                # If done is already queued, let that exact event win.
+                if queue.empty():
+                    is_processing = getattr(
+                        claw_service, "is_processing", lambda *_: True
+                    )
+                    if not is_processing(user.id, "default"):
+                        await websocket.send_json(
+                            {"type": "done", "stop_reason": "idle"}
+                        )
 
             while True:
                 try:
@@ -424,8 +452,11 @@ async def claw_ws(websocket: WebSocket):
 
         Mirrors kimi-claw's file resolution: download → save to workspace → reference tag.
         """
-        claw = await claw_service.claw_repository.get_by_user_id(uid)
-        claw_base_url = claw.http_base_url if claw else None
+        # A different API replica may not yet be attached to this user's
+        # internal control bridge. Resolve and owner-verify it before the first
+        # workspace request; never send attachments to a stale persisted IP.
+        claw = await claw_service.validate_claw_for_chat(uid)
+        claw_base_url = claw.http_base_url
 
         refs: list[str] = []
         attachments: list[ClawAttachment] = []

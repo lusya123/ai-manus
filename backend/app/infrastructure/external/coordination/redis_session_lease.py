@@ -11,6 +11,7 @@ from typing import Any, TypeVar
 from app.domain.external.coordination import (
     SessionLifecycleLeaseBusyError,
     SessionLifecycleLeaseUnavailableError,
+    mark_lifecycle_task_lease_lost,
 )
 from app.infrastructure.storage.redis import get_redis
 from app.domain.utils.error_reporting import safe_exception_summary
@@ -215,9 +216,12 @@ class RedisSessionLifecycleLease:
                 {renewal_task, operation_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            if operation_task in done:
+                return await operation_task
             if renewal_task in done:
                 coordination_error = renewal_task.exception()
                 if not operation_task.done():
+                    mark_lifecycle_task_lease_lost(operation_task)
                     operation_task.cancel()
                 await asyncio.gather(operation_task, return_exceptions=True)
                 raise coordination_error or SessionLifecycleLeaseUnavailableError(

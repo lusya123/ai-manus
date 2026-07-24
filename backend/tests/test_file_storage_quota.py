@@ -3,9 +3,11 @@ import io
 from types import SimpleNamespace
 
 import pytest
+from gridfs.errors import NoFile
 
 from app.core.config import get_settings
 from app.domain.external.file import (
+    FileStorageBusyError,
     FileStorageQuotaExceededError,
     FileTooLargeError,
 )
@@ -119,17 +121,24 @@ async def test_failed_gridfs_upload_releases_reserved_quota(monkeypatch):
     calls = []
 
     class Bucket:
-        async def upload_from_stream(self, *args, **kwargs):
+        async def upload_from_stream_with_id(self, *args, **kwargs):
             raise RuntimeError("gridfs unavailable")
 
-    async def reserve(user_id, size):
+        async def delete(self, file_id):
+            raise NoFile("upload never committed")
+
+    async def reserve(user_id, size, reservation_id=None):
         calls.append(("reserve", user_id, size))
 
-    async def release(user_id, size):
+    async def release(user_id, size, reservation_id=None):
         calls.append(("release", user_id, size))
+
+    async def record_intent(*args, **kwargs):
+        return None
 
     monkeypatch.setattr(storage, "_reserve_user_quota", reserve)
     monkeypatch.setattr(storage, "_release_user_quota", release)
+    monkeypatch.setattr(storage, "_record_deletion_intent", record_intent)
     monkeypatch.setattr(storage, "_get_gridfs_bucket", lambda: Bucket())
 
     with pytest.raises(RuntimeError, match="gridfs unavailable"):
@@ -139,3 +148,417 @@ async def test_failed_gridfs_upload_releases_reserved_quota(monkeypatch):
         ("reserve", "user-1", 5),
         ("release", "user-1", 5),
     ]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_gridfs_upload_deletes_known_id_and_releases_quota(
+    monkeypatch,
+):
+    storage = _storage()
+    calls = []
+    upload_started = asyncio.Event()
+    finish_upload = asyncio.Event()
+
+    class Bucket:
+        async def upload_from_stream_with_id(
+            self,
+            file_id,
+            filename,
+            file_data,
+            metadata=None,
+        ):
+            calls.append(("upload", file_id))
+            upload_started.set()
+            await finish_upload.wait()
+
+        async def delete(self, file_id):
+            calls.append(("delete", file_id))
+
+    bucket = Bucket()
+
+    async def reserve(user_id, size, reservation_id=None):
+        calls.append(("reserve", user_id, size))
+
+    async def release(user_id, size, reservation_id=None):
+        calls.append(("release", user_id, size))
+
+    async def record_intent(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(storage, "_reserve_user_quota", reserve)
+    monkeypatch.setattr(storage, "_release_user_quota", release)
+    monkeypatch.setattr(storage, "_record_deletion_intent", record_intent)
+    monkeypatch.setattr(storage, "_get_gridfs_bucket", lambda: bucket)
+
+    task = asyncio.create_task(
+        storage.upload_file(
+            io.BytesIO(b"12345"),
+            "small.bin",
+            "user-1",
+        )
+    )
+    await upload_started.wait()
+    task.cancel()
+    finish_upload.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    upload_id = next(item[1] for item in calls if item[0] == "upload")
+    assert ("delete", upload_id) in calls
+    assert ("release", "user-1", 5) in calls
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancel_does_not_detach_gridfs_rollback(monkeypatch):
+    storage = _storage()
+    calls = []
+    upload_started = asyncio.Event()
+    finish_upload = asyncio.Event()
+    rollback_started = asyncio.Event()
+    release_rollback = asyncio.Event()
+
+    class Bucket:
+        async def upload_from_stream_with_id(
+            self,
+            file_id,
+            filename,
+            file_data,
+            metadata=None,
+        ):
+            calls.append(("upload", file_id))
+            upload_started.set()
+            await finish_upload.wait()
+
+        async def delete(self, file_id):
+            calls.append(("delete", file_id))
+            rollback_started.set()
+            await release_rollback.wait()
+
+    async def reserve(user_id, size, reservation_id=None):
+        calls.append(("reserve", user_id, size))
+
+    async def release(user_id, size, reservation_id=None):
+        calls.append(("release", user_id, size))
+
+    async def record_intent(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(storage, "_reserve_user_quota", reserve)
+    monkeypatch.setattr(storage, "_release_user_quota", release)
+    monkeypatch.setattr(storage, "_record_deletion_intent", record_intent)
+    monkeypatch.setattr(storage, "_get_gridfs_bucket", lambda: Bucket())
+
+    task = asyncio.create_task(
+        storage.upload_file(io.BytesIO(b"12345"), "small.bin", "user-1")
+    )
+    await upload_started.wait()
+    task.cancel()
+    finish_upload.set()
+    await rollback_started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+
+    assert not task.done()
+    release_rollback.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(asyncio.shield(task), timeout=0.2)
+
+    assert ("release", "user-1", 5) in calls
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_quota_reserve_waits_then_releases(monkeypatch):
+    storage = _storage()
+    reserve_started = asyncio.Event()
+    release_reserve_reply = asyncio.Event()
+    calls = []
+
+    async def reserve(user_id, size, reservation_id=None):
+        calls.append(("reserve-committed", user_id, size))
+        reserve_started.set()
+        await release_reserve_reply.wait()
+
+    async def release(user_id, size, reservation_id=None):
+        calls.append(("release", user_id, size))
+
+    monkeypatch.setattr(storage, "_reserve_user_quota", reserve)
+    monkeypatch.setattr(storage, "_release_user_quota", release)
+    monkeypatch.setattr(
+        storage,
+        "_get_gridfs_bucket",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("upload must not begin after caller cancellation")
+        ),
+    )
+
+    task = asyncio.create_task(
+        storage.upload_file(io.BytesIO(b"12345"), "small.bin", "user-1")
+    )
+    await reserve_started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+
+    release_reserve_reply.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(asyncio.shield(task), timeout=0.2)
+
+    assert calls == [
+        ("reserve-committed", "user-1", 5),
+        ("release", "user-1", 5),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_hung_rollbacks_keep_bounded_upload_slots(monkeypatch):
+    storage = _storage()
+    storage._MAX_CONCURRENT_UPLOADS = 2
+    storage._ROLLBACK_TIMEOUT_SECONDS = 0.01
+    uploads_started = 0
+    all_uploads_started = asyncio.Event()
+    rollback_started = asyncio.Event()
+    rollback_count = 0
+    release_rollbacks = asyncio.Event()
+    finish_uploads = asyncio.Event()
+
+    class Bucket:
+        async def upload_from_stream_with_id(self, *args, **kwargs):
+            nonlocal uploads_started
+            uploads_started += 1
+            if uploads_started == 2:
+                all_uploads_started.set()
+            await finish_uploads.wait()
+
+        async def delete(self, file_id):
+            nonlocal rollback_count
+            rollback_count += 1
+            if rollback_count == 2:
+                rollback_started.set()
+            await release_rollbacks.wait()
+
+    async def reserve(user_id, size, reservation_id=None):
+        return None
+
+    async def release(user_id, size, reservation_id=None):
+        return None
+
+    async def record_intent(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(storage, "_reserve_user_quota", reserve)
+    monkeypatch.setattr(storage, "_release_user_quota", release)
+    monkeypatch.setattr(storage, "_record_deletion_intent", record_intent)
+    monkeypatch.setattr(storage, "_get_gridfs_bucket", lambda: Bucket())
+
+    first = asyncio.create_task(
+        storage.upload_file(io.BytesIO(b"1"), "one.bin", "user-1")
+    )
+    second = asyncio.create_task(
+        storage.upload_file(io.BytesIO(b"2"), "two.bin", "user-1")
+    )
+    await all_uploads_started.wait()
+    first.cancel()
+    second.cancel()
+    finish_uploads.set()
+    await rollback_started.wait()
+
+    with pytest.raises(FileStorageBusyError):
+        await storage.upload_file(io.BytesIO(b"3"), "three.bin", "user-1")
+
+    release_rollbacks.set()
+    results = await asyncio.gather(first, second, return_exceptions=True)
+    assert all(isinstance(result, asyncio.CancelledError) for result in results)
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_gridfs_delete_waits_for_quota_release(monkeypatch):
+    storage = _storage()
+    file_id = "507f1f77bcf86cd799439011"
+    delete_finished = asyncio.Event()
+    release_started = asyncio.Event()
+    allow_release = asyncio.Event()
+    calls = []
+
+    class Files:
+        async def find_one(self, query):
+            return {
+                "_id": query["_id"],
+                "length": 5,
+                "metadata": {"user_id": "user-1"},
+            }
+
+    class Bucket:
+        async def delete(self, object_id):
+            calls.append(("delete", str(object_id)))
+            delete_finished.set()
+
+    async def initialized(user_id):
+        return None
+
+    async def release(user_id, size, reservation_id=None):
+        calls.append(("release-start", user_id, size))
+        release_started.set()
+        await allow_release.wait()
+        calls.append(("release-done", user_id, size))
+
+    async def record_intent(user_id, reservation_id, size):
+        calls.append(("intent", user_id, reservation_id, size))
+
+    monkeypatch.setattr(storage, "_get_files_collection", lambda: Files())
+    monkeypatch.setattr(storage, "_get_gridfs_bucket", lambda: Bucket())
+    monkeypatch.setattr(storage, "_ensure_user_quota", initialized)
+    monkeypatch.setattr(storage, "_release_user_quota", release)
+    monkeypatch.setattr(storage, "_record_deletion_intent", record_intent)
+
+    task = asyncio.create_task(storage.delete_file(file_id, "user-1"))
+    await delete_finished.wait()
+    await release_started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+
+    assert not task.done()
+    allow_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+
+    assert calls == [
+        ("intent", "user-1", file_id, 5),
+        ("delete", file_id),
+        ("release-start", "user-1", 5),
+        ("release-done", "user-1", 5),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reserve_reply_lost_confirms_exact_operation(monkeypatch):
+    storage = _storage()
+    reservation_id = "507f1f77bcf86cd799439011"
+    document = {"active_reservations": []}
+    mutation_calls = 0
+
+    class Quotas:
+        async def find_one_and_update(self, selector, update, **kwargs):
+            nonlocal mutation_calls
+            mutation_calls += 1
+            document["active_reservations"].append(
+                update["$push"]["active_reservations"]
+            )
+            raise ConnectionError("reply lost after commit")
+
+        async def find_one(self, selector, projection=None):
+            return document
+
+    async def initialized(user_id):
+        return None
+
+    monkeypatch.setattr(storage, "_ensure_user_quota", initialized)
+    monkeypatch.setattr(storage, "_get_quota_collection", lambda: Quotas())
+
+    await storage._reserve_user_quota("user-1", 5, reservation_id)
+
+    assert mutation_calls == 1
+    assert [
+        item["reservation_id"] for item in document["active_reservations"]
+    ] == [reservation_id]
+
+
+@pytest.mark.asyncio
+async def test_release_reply_lost_is_exactly_once(monkeypatch):
+    storage = _storage()
+    reservation_id = "507f1f77bcf86cd799439011"
+    document = {
+        "bytes_used": 5,
+        "file_count": 1,
+        "active_reservations": [
+            {"reservation_id": reservation_id, "size": 5}
+        ],
+        "pending_deletions": [],
+        "released_reservation_ids": [],
+    }
+    mutation_calls = 0
+
+    class Quotas:
+        async def find_one_and_update(self, selector, update, **kwargs):
+            nonlocal mutation_calls
+            mutation_calls += 1
+            document["bytes_used"] -= 5
+            document["file_count"] -= 1
+            document["active_reservations"] = []
+            document["released_reservation_ids"].append(reservation_id)
+            raise ConnectionError("reply lost after commit")
+
+        async def find_one(self, selector, projection=None):
+            return document
+
+    monkeypatch.setattr(storage, "_get_quota_collection", lambda: Quotas())
+
+    await storage._release_user_quota("user-1", 5, reservation_id)
+
+    assert mutation_calls == 1
+    assert document["bytes_used"] == 0
+    assert document["file_count"] == 0
+    assert document["released_reservation_ids"] == [reservation_id]
+
+
+@pytest.mark.asyncio
+async def test_delete_records_intent_before_blob_and_survives_release_reply_lost(
+    monkeypatch,
+):
+    storage = _storage()
+    file_id = "507f1f77bcf86cd799439011"
+    calls = []
+    document = {
+        "bytes_used": 5,
+        "file_count": 1,
+        "active_reservations": [
+            {"reservation_id": file_id, "size": 5}
+        ],
+        "pending_deletions": [],
+        "released_reservation_ids": [],
+    }
+
+    class Files:
+        async def find_one(self, query, projection=None):
+            return {
+                "_id": query["_id"],
+                "length": 5,
+                "metadata": {"user_id": "user-1"},
+            }
+
+    class Bucket:
+        async def delete(self, object_id):
+            calls.append(("delete", str(object_id)))
+
+    class Quotas:
+        async def find_one_and_update(self, selector, update, **kwargs):
+            document["bytes_used"] = 0
+            document["file_count"] = 0
+            document["pending_deletions"] = []
+            document["active_reservations"] = []
+            document["released_reservation_ids"].append(file_id)
+            raise ConnectionError("release reply lost after commit")
+
+        async def find_one(self, selector, projection=None):
+            return document
+
+    async def initialized(user_id):
+        return None
+
+    async def record_intent(user_id, reservation_id, size):
+        calls.append(("intent", reservation_id, size))
+        document["active_reservations"] = []
+        document["pending_deletions"] = [
+            {"reservation_id": reservation_id, "size": size}
+        ]
+
+    monkeypatch.setattr(storage, "_get_files_collection", lambda: Files())
+    monkeypatch.setattr(storage, "_get_gridfs_bucket", lambda: Bucket())
+    monkeypatch.setattr(storage, "_get_quota_collection", lambda: Quotas())
+    monkeypatch.setattr(storage, "_ensure_user_quota", initialized)
+    monkeypatch.setattr(storage, "_record_deletion_intent", record_intent)
+
+    assert await storage.delete_file(file_id, "user-1") is True
+    assert calls == [("intent", file_id, 5), ("delete", file_id)]
+    assert document["bytes_used"] == 0
+    assert document["file_count"] == 0
+    assert document["released_reservation_ids"] == [file_id]

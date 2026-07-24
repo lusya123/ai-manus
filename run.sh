@@ -13,4 +13,19 @@ fi
 
 # Execute Docker Compose command
 PROJECT_NAME="${COMPOSE_PROJECT_NAME:-ai-manus}"
-$COMPOSE -p "$PROJECT_NAME" -f docker-compose.yml "$@"
+if [ -n "${CORE_RESOURCE_PREFIX:-}" ]; then
+    RESOURCE_PREFIX="$CORE_RESOURCE_PREFIX"
+elif [ "$PROJECT_NAME" = "ai-manus" ]; then
+    # Preserve the historical production network/volume names.
+    RESOURCE_PREFIX="manus"
+else
+    # A custom Compose project must never share the default deployment's
+    # control network, Mongo volume, or Redis volume on the same Docker host.
+    RESOURCE_PREFIX="manus-$PROJECT_NAME"
+fi
+
+CORE_RESOURCE_PREFIX="$RESOURCE_PREFIX" \
+SANDBOX_NETWORK="${SANDBOX_NETWORK:-$RESOURCE_PREFIX-network}" \
+CLAW_NETWORK="${CLAW_NETWORK:-$RESOURCE_PREFIX-network}" \
+RUNTIME_DEPLOYMENT_ID="${RUNTIME_DEPLOYMENT_ID:-$PROJECT_NAME}" \
+    $COMPOSE -p "$PROJECT_NAME" -f docker-compose.yml "$@"

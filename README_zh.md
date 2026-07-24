@@ -93,6 +93,12 @@ services:
       - sandbox
       - claw
     restart: unless-stopped
+    sysctls:
+      net.ipv4.ip_forward: "0"
+      net.ipv4.conf.all.forwarding: "0"
+      net.ipv4.conf.default.forwarding: "0"
+      net.ipv6.conf.all.forwarding: "0"
+      net.ipv6.conf.default.forwarding: "0"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       #- ./mcp.json:/etc/mcp.json # Mount MCP servers directory
@@ -117,6 +123,9 @@ services:
       - SANDBOX_PIDS_LIMIT=512
       - CLAW_IMAGE=simpleyyt/manus-claw
       - CLAW_NETWORK=manus-network
+      - RUNTIME_NETWORK_ISOLATION=true
+      - RUNTIME_DEPLOYMENT_ID=${RUNTIME_DEPLOYMENT_ID:-ai-manus}
+      - CLAW_PUBLISH_HOST_PORTS=false
 
   sandbox:
     image: simpleyyt/manus-sandbox
@@ -304,6 +313,9 @@ export IMAGE_TAG=latest
 - 启用 Claw 时配置独立 `CLAW_API_KEY_HMAC_KEYS` keyring。Claw 会限制 WebSocket 消息/附件、分布式请求/对话、上传大小及历史长度。
 - 文件上传有 multipart 解析前 body 上限、单文件上限和原子的每用户字节/文件数配额；反向代理限制必须与 backend 保持一致。
 - `TASK_BACKEND=local` 仅支持一个 backend Python 进程。填写真实 `BACKEND_REPLICA_COUNT`；多个副本或 worker 必须使用 Celery。
+- 生命周期围栏字段（`deleting`、`sandbox_destroying`、task/runtime generation 绑定）要求停机升级：必须先停止全部旧 backend 与 worker，再启动此版本；禁止新旧生命周期协议混跑。项目内置的 fork 部署流程会执行完整的停机/启动顺序。
+- `run.sh` 会为自定义 `COMPOSE_PROJECT_NAME` 派生唯一 `CORE_RESOURCE_PREFIX`，隔离控制网、数据网及 Mongo/Redis 数据卷。直接调用自定义 Compose 项目时也必须显式设置唯一前缀；同一 Docker daemon 上不同部署不得复用。
+- 每个运行时的控制网与出口网会阻断跨运行时和数据网访问，TTL AutoRemove 后的孤儿网桥也会定期回收；但它不是宿主机/VPC 出口防火墙。若还要禁止沙箱访问 Docker host、RFC1918、link-local 或云 metadata，请另配宿主机防火墙或目标过滤代理。
 - AgentBay 删除未获确认时会保留 provider ID 供重试；其 signed gateway URL 是 bearer capability，禁止写入日志。
 
 完整操作步骤见[配置说明](docs/configuration.md)与 [AgentBay 云沙箱](docs/agentbay.md)。

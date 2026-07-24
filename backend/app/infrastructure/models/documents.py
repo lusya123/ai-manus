@@ -166,8 +166,11 @@ class SessionDocument(BaseDocument[Session], id_field="session_id", domain_model
     user_id: str  # User ID that owns this session
     sandbox_id: Optional[str] = None
     sandbox_provider: Optional[str] = None
+    sandbox_destroying: bool = False
+    deleting: bool = False
     agent_id: str
     task_id: Optional[str] = None
+    task_sandbox_id: Optional[str] = None
     title: Optional[str] = None
     unread_message_count: int = 0
     latest_message: Optional[str] = None
@@ -332,6 +335,7 @@ class ClawDocument(BaseDocument[Claw], id_field="claw_id", domain_model_class=Cl
     api_key: Optional[str] = Field(default=None, repr=False, exclude=True)
     api_key_digest: Optional[str] = Field(default=None, repr=False)
     status: ClawStatus = ClawStatus.CREATING
+    revision: int = Field(default=0, ge=0)
     error_message: Optional[str] = None
     expires_at: Optional[datetime] = None
     last_activity_at: Optional[datetime] = None

@@ -24,5 +24,6 @@ defineProps<{
   sessionId: string;
   toolContent: ToolContent;
   live: boolean;
+  isShare?: boolean;
 }>();
 </script>

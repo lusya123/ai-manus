@@ -36,8 +36,17 @@ class Session(BaseModel):
     # Persist the allocator identity so changing the deployment-wide provider
     # cannot silently overwrite an existing billable sandbox pointer.
     sandbox_provider: Optional[str] = None
+    # Durable provider-delete fence. While true, no chat/provisioning path may
+    # adopt this runtime; only exact cleanup may resume and clear the flag.
+    sandbox_destroying: bool = False
+    # Durable whole-session deletion fence. Once claimed it is never cleared:
+    # retries resume cleanup and the final Mongo delete is conditional on it.
+    deleting: bool = False
     agent_id: str
     task_id: Optional[str] = None
+    # Sandbox generation captured when task_id was bound. A mismatch forces
+    # retirement instead of reusing a worker built for an older runtime.
+    task_sandbox_id: Optional[str] = None
     title: Optional[str] = None
     unread_message_count: int = 0
     latest_message: Optional[str] = None

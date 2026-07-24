@@ -75,16 +75,22 @@ class BrowserUseBrowser:
         raise last_error
 
     async def cleanup(self) -> None:
-        """Stop the browser session and release resources."""
-        if self._session is not None:
-            try:
-                await self._session.stop()
-            except Exception as exc:
-                logger.error(
-                    "Error stopping BrowserSession: %s",
-                    safe_exception_summary(exc),
-                )
-            finally:
+        """Stop the browser session, retaining an unknown handle for retry."""
+        session = self._session
+        if session is None:
+            return
+        try:
+            await session.stop()
+        except Exception as exc:
+            summary = safe_exception_summary(exc)
+            logger.error("Error stopping BrowserSession: %s", summary)
+            # Keep the exact session reference.  AgentTaskRunner's bounded,
+            # strongly-retained cleanup bundle will retry this adapter.
+            raise RuntimeError(
+                f"BrowserSession cleanup incomplete: {summary}"
+            ) from None
+        else:
+            if self._session is session:
                 self._session = None
 
     # ------------------------------------------------------------------

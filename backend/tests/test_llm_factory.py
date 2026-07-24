@@ -88,6 +88,10 @@ class _SessionRepository:
             ),
             sandbox_id="sandbox-1",
             sandbox_provider="docker",
+            deleting=False,
+            sandbox_destroying=False,
+            task_id="task-1",
+            task_sandbox_id="sandbox-1",
         )
 
 
@@ -137,11 +141,14 @@ async def test_task_runner_factory_reconstructs_llm_from_persisted_agent(monkeyp
             "agent_id": "agent-1",
             "user_id": "user-1",
             "sandbox_id": "sandbox-1",
+            "task_id": "task-1",
+            "task_sandbox_id": "sandbox-1",
         }
     )
 
     assert llm_factory.agent is agent
     assert captured["llm"] is llm_factory.llm
+    assert captured["sandbox_id"] == "sandbox-1"
 
 
 async def test_task_runner_factory_does_not_silently_fallback_when_agent_missing():
@@ -165,5 +172,7 @@ async def test_task_runner_factory_does_not_silently_fallback_when_agent_missing
                 "agent_id": "missing",
                 "user_id": "user-1",
                 "sandbox_id": "sandbox-1",
+                "task_id": "task-1",
+                "task_sandbox_id": "sandbox-1",
             }
         )

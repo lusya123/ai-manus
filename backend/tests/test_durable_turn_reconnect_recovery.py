@@ -1,4 +1,5 @@
 import asyncio
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from weakref import WeakValueDictionary
 
@@ -52,6 +53,7 @@ class SessionRepository:
             sandbox_id="dev-sandbox",
             sandbox_provider="docker",
             task_id="task-1",
+            task_sandbox_id="dev-sandbox",
         )
 
     async def find_by_id_and_user_id(self, session_id, user_id):
@@ -90,6 +92,7 @@ async def test_reconnect_kicks_an_enqueued_turn_after_producer_crash():
     service._turn_submission_repository = turns
     service._session_repository = SessionRepository()
     service._task_cls = TaskClass
+    service._session_lifecycle_lease = None
 
     events = []
     async for event in service._stream_durable_turn(
@@ -102,6 +105,64 @@ async def test_reconnect_kicks_an_enqueued_turn_after_producer_crash():
     assert task.run_calls == 1
     assert [event.type for event in events] == ["accepted", "done"]
     assert isinstance(events[-1], DoneEvent)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_recovers_expired_running_turn_after_local_restart():
+    turns = TurnRepository()
+    turns.turn.state = TurnSubmissionState.RUNNING
+    turns.turn.claim_owner = "dead-api-process"
+    turns.turn.claim_until = datetime.now(UTC) - timedelta(seconds=1)
+
+    class Task:
+        id = "task-1"
+
+        def __init__(self):
+            self.run_calls = 0
+
+        async def run(self):
+            self.run_calls += 1
+            # The real AgentTaskRunner reaches this state through
+            # claim_for_execution; an expired RUNNING claim is fenced as
+            # failed_unknown and its Redis input is acknowledged.
+            turns.turn.state = TurnSubmissionState.FAILED_UNKNOWN
+            turns.turn.terminal_error = "expired execution ownership"
+
+    task = Task()
+
+    class TaskClass:
+        get_calls = 0
+        recover_calls = 0
+
+        @classmethod
+        async def get(cls, task_id):
+            cls.get_calls += 1
+            return None
+
+        @classmethod
+        def recover(cls, task_id, params):
+            cls.recover_calls += 1
+            return task
+
+    service = object.__new__(AgentDomainService)
+    service._turn_submission_repository = turns
+    service._session_repository = SessionRepository()
+    service._task_cls = TaskClass
+    service._session_lifecycle_lease = None
+
+    events = []
+    async for event in service._stream_durable_turn(
+        session_id="session-1",
+        user_id="user-1",
+        turn=turns.turn,
+    ):
+        events.append(event)
+
+    assert TaskClass.get_calls == 1
+    assert TaskClass.recover_calls == 1
+    assert task.run_calls == 1
+    assert turns.turn.state == TurnSubmissionState.FAILED_UNKNOWN
+    assert [event.type for event in events] == ["accepted", "error"]
 
 
 @pytest.mark.asyncio
@@ -141,6 +202,99 @@ async def test_stale_reconnect_cannot_restore_replaced_task_ownership():
     assert TaskClass.get_calls == 0
     assert TaskClass.recover_calls == 0
     assert ownership_updates == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("deleting", "destroying", "task_sandbox_id"),
+    [
+        (True, False, "dev-sandbox"),
+        (False, True, "dev-sandbox"),
+        (False, False, "previous-sandbox"),
+        (False, False, None),
+    ],
+)
+async def test_task_recovery_fails_closed_during_cleanup_or_generation_mismatch(
+    deleting,
+    destroying,
+    task_sandbox_id,
+):
+    sessions = SessionRepository()
+    sessions.session.deleting = deleting
+    sessions.session.sandbox_destroying = destroying
+    sessions.session.task_sandbox_id = task_sandbox_id
+
+    class TaskClass:
+        get_calls = 0
+        recover_calls = 0
+
+        @classmethod
+        async def get(cls, task_id):
+            cls.get_calls += 1
+            return SimpleNamespace(id=task_id)
+
+        @classmethod
+        def recover(cls, task_id, params):
+            cls.recover_calls += 1
+            return SimpleNamespace(id=task_id)
+
+    service = object.__new__(AgentDomainService)
+    service._session_repository = sessions
+    service._task_cls = TaskClass
+
+    with pytest.raises(TurnSubmissionUnavailableError):
+        await service._recover_task(sessions.session, "task-1")
+
+    assert TaskClass.get_calls == 0
+    assert TaskClass.recover_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_reconnect_dispatch_rechecks_delete_claim_inside_lifecycle_lease():
+    turns = TurnRepository()
+    sessions = SessionRepository()
+
+    class Task:
+        id = "task-1"
+
+        def __init__(self):
+            self.run_calls = 0
+
+        async def run(self):
+            self.run_calls += 1
+
+    task = Task()
+
+    class TaskClass:
+        @classmethod
+        async def get(cls, task_id):
+            return task
+
+    class DeleteWinsLease:
+        async def run_exclusive(self, session_id, operation):
+            sessions.session.deleting = True
+            return await operation()
+
+    service = object.__new__(AgentDomainService)
+    service._turn_submission_repository = turns
+    service._session_repository = sessions
+    service._task_cls = TaskClass
+    service._session_lifecycle_lease = DeleteWinsLease()
+
+    async def collect_events():
+        return [
+            event
+            async for event in service._stream_durable_turn(
+                session_id="session-1",
+                user_id="user-1",
+                turn=turns.turn,
+            )
+        ]
+
+    events = await asyncio.wait_for(collect_events(), timeout=2)
+
+    assert [event.type for event in events] == ["accepted"]
+    assert task.run_calls == 0
 
 
 @pytest.mark.asyncio

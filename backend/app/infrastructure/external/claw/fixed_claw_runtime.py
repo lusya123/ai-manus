@@ -1,11 +1,9 @@
-import asyncio
 import logging
 from typing import Optional
 
-import httpx
-
 from app.domain.external.claw import ClawInstanceInfo
 from app.core.config import get_settings
+from app.infrastructure.external.claw.readiness import wait_for_http_health
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +16,8 @@ class FixedClawRuntime:
     """
 
     creates_immediately = True
+    _HEALTH_REQUEST_TIMEOUT_SECONDS = 5.0
+    _HEALTH_RETRY_INTERVAL_SECONDS = 2.0
 
     def __init__(self, address: str):
         self._address = address
@@ -37,19 +37,16 @@ class FixedClawRuntime:
         return True
 
     async def wait_for_ready(self, base_url: str) -> bool:
-        timeout = self.settings.claw_ready_timeout
-        interval = 2.0
-        max_retries = int(timeout / interval)
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            for _ in range(max_retries):
-                try:
-                    resp = await client.get(f"{base_url}/health")
-                    if resp.status_code == 200:
-                        logger.info("Fixed claw instance is ready")
-                        return True
-                except Exception:
-                    pass
-                await asyncio.sleep(interval)
+        timeout = float(self.settings.claw_ready_timeout)
+        ready = await wait_for_http_health(
+            base_url,
+            total_timeout_seconds=timeout,
+            request_timeout_seconds=self._HEALTH_REQUEST_TIMEOUT_SECONDS,
+            retry_interval_seconds=self._HEALTH_RETRY_INTERVAL_SECONDS,
+        )
+        if ready:
+            logger.info("Fixed claw instance is ready")
+            return True
         logger.warning(
             "Fixed claw instance not ready after %s seconds", timeout
         )

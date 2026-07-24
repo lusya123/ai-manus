@@ -589,7 +589,7 @@ async def test_create_session_rolls_back_agent_when_session_write_fails():
     assert repo.deleted == [repo.saved[0].id]
 
 
-async def test_delete_session_restores_agent_if_session_delete_fails():
+async def test_delete_session_never_restores_agent_after_destructive_cleanup():
     trace = []
     agent = Agent(id="agent-1", model_name="system-model", model_provider="openai")
     session = SimpleNamespace(
@@ -623,7 +623,7 @@ async def test_delete_session_restores_agent_if_session_delete_fails():
 
     with pytest.raises(RuntimeError, match="session delete failed"):
         await service.delete_session("session-1", "user-1")
-    assert trace == ["agent-delete", "session-delete", "agent-restore"]
+    assert trace == ["agent-delete", "session-delete"]
 
 
 def test_anthropic_defaults_use_anthropic_key_base_and_protect_required_headers():

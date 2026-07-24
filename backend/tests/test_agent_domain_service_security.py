@@ -15,7 +15,10 @@ from app.domain.models.event import (
 from app.domain.models.file import FileInfo
 from app.domain.models.session import Session, SessionStatus
 from app.domain.models.turn_submission import TurnSubmission
-from app.domain.models.turn_submission import TurnSubmissionConflictError
+from app.domain.models.turn_submission import (
+    TurnSubmissionConflictError,
+    TurnSubmissionUnavailableError,
+)
 from app.domain.services.agent_domain_service import AgentDomainService
 from app.application.services.agent_service import AgentService
 from app.domain.external.sandbox import (
@@ -81,10 +84,11 @@ def _attachment_acceptance_service(file_storage):
     class SessionRepository:
         def __init__(self):
             self.events = []
+            self.session = session
 
         async def find_by_id_and_user_id(self, session_id, user_id):
             if session_id == session.id and user_id == session.user_id:
-                return session
+                return self.session
             return None
 
     class TurnRepository:
@@ -130,6 +134,25 @@ def _attachment_acceptance_service(file_storage):
         continue_without_dispatch, service
     )
     return service, session_repository, turn_repository
+
+
+async def test_deleting_session_rejects_turn_before_durable_acceptance():
+    service, session_repository, turn_repository = (
+        _attachment_acceptance_service(SimpleNamespace())
+    )
+    session_repository.session.deleting = True
+
+    with pytest.raises(
+        TurnSubmissionUnavailableError, match="deletion is in progress"
+    ):
+        await service.accept_chat_submission(
+            session_id="session-attachment",
+            user_id="owner",
+            submission_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            message="must not be accepted",
+        )
+
+    assert turn_repository.candidates == []
 
 
 async def test_foreign_attachment_is_rejected_before_durable_acceptance():
@@ -305,7 +328,7 @@ async def test_transient_sandbox_lookup_never_creates_replacement():
     assert SandboxClass.create_count == 0
 
 
-async def test_unconfirmed_provisioning_rollback_persists_provider_id():
+async def test_unconfirmed_provisioning_failure_never_persists_adoptable_pointer():
     session = Session(id="session-1", user_id="owner", agent_id="agent-1")
 
     class Repository:
@@ -322,50 +345,99 @@ async def test_unconfirmed_provisioning_rollback_persists_provider_id():
                 "orphan-candidate", "rollback not confirmed"
             )
 
+        @classmethod
+        async def get(cls, sandbox_id):
+            assert sandbox_id == "orphan-candidate"
+            return None
+
     repository = Repository()
     service = _service(repository, SandboxClass, SimpleNamespace())
 
     with pytest.raises(SandboxProvisioningError):
         await service._create_task(session)
 
-    assert repository.saved[-1].sandbox_id == "orphan-candidate"
-    assert repository.saved[-1].sandbox_provider == "docker"
+    assert repository.saved == []
+    assert session.sandbox_id is None
+    assert session.sandbox_provider is None
 
 
-async def test_failed_initial_save_and_failed_destroy_retries_ownership_save():
+async def test_failed_initial_save_and_failed_destroy_uses_tombstone_only():
     session = Session(id="session-1", user_id="owner", agent_id="agent-1")
 
     class Repository:
         def __init__(self):
-            self.calls = 0
-            self.saved = None
+            self.save_calls = 0
+            self.publish_calls = 0
+            self.current = session.model_copy(deep=True)
 
         async def save(self, value):
-            self.calls += 1
-            if self.calls == 1:
-                raise RuntimeError("temporary mongo failure")
-            self.saved = value.model_copy(deep=True)
+            self.save_calls += 1
+            raise RuntimeError("temporary mongo failure")
+
+        async def find_by_id(self, session_id):
+            assert session_id == session.id
+            return self.current
+
+        async def claim_runtime_destroy(self, *_args):
+            raise AssertionError(
+                "an absent pointer must be atomically published as a tombstone"
+            )
+
+        async def publish_runtime_destroy_claim(
+            self,
+            session_id,
+            expected_task_id,
+            expected_task_sandbox_id,
+            expected_sandbox_provider,
+            sandbox_id,
+            sandbox_provider,
+        ):
+            assert session_id == session.id
+            assert self.current.sandbox_id is None
+            assert self.current.sandbox_provider is expected_sandbox_provider
+            assert self.current.task_id == expected_task_id
+            assert self.current.task_sandbox_id == expected_task_sandbox_id
+            self.publish_calls += 1
+            self.current.sandbox_id = sandbox_id
+            self.current.sandbox_provider = sandbox_provider
+            self.current.sandbox_destroying = True
+            return True
 
     class Sandbox:
         id = "sandbox-needs-cleanup"
 
+        def __init__(self):
+            self.destroy_calls = 0
+
         async def destroy(self):
+            self.destroy_calls += 1
             return False
+
+    sandbox = Sandbox()
 
     class SandboxClass:
         @classmethod
         async def create(cls):
-            return Sandbox()
+            return sandbox
 
     repository = Repository()
-    service = _service(repository, SandboxClass, SimpleNamespace())
 
-    with pytest.raises(RuntimeError, match="temporary mongo failure"):
+    service = _service(repository, SandboxClass, SimpleNamespace())
+    service._sandbox_provisioner._OWNERSHIP_RECONCILE_INTERVAL_SECONDS = 0
+    service._sandbox_provisioner._OWNERSHIP_RECONCILE_MAX_ATTEMPTS = 2
+
+    with pytest.raises(
+        SandboxProvisioningError,
+        match="rollback and ownership persistence",
+    ):
         await service._create_task(session)
 
-    assert repository.calls == 2
-    assert repository.saved.sandbox_id == "sandbox-needs-cleanup"
-    assert repository.saved.sandbox_provider == "docker"
+    assert repository.save_calls == 1
+    assert repository.publish_calls == 1
+    assert repository.current.sandbox_id == "sandbox-needs-cleanup"
+    assert repository.current.sandbox_provider == "docker"
+    assert repository.current.sandbox_destroying is True
+    assert sandbox.destroy_calls == 2
 
 
 async def test_task_creation_closes_provisioning_handle_without_deleting_sandbox():
@@ -427,7 +499,12 @@ async def test_replacement_retires_old_task_stream_before_persisting_new_params(
 
     class Repository:
         async def update_runtime_ownership(
-            self, session_id, sandbox_id, task_id, sandbox_provider=None
+            self,
+            session_id,
+            sandbox_id,
+            task_id,
+            sandbox_provider=None,
+            task_sandbox_id=None,
         ):
             trace.append(
                 ("persist", sandbox_id, task_id, sandbox_provider)
@@ -543,6 +620,179 @@ async def test_replacement_never_clears_task_while_a_turn_is_running():
         )
 
     assert session.task_id == "old-task"
+
+
+async def test_stopped_task_reconciles_expired_exact_running_turn():
+    trace = []
+
+    class TurnRepository:
+        def __init__(self):
+            self.running = 1
+
+        async def cancel_queued(self, session_id, *, user_id=None):
+            trace.append(("cancel", session_id, user_id))
+            return 0
+
+        async def count_running(self, session_id, *, user_id=None):
+            trace.append(("count", self.running))
+            return self.running
+
+        async def recover_factory_failure_for_task(
+            self, session_id, *, user_id, task_id, error
+        ):
+            trace.append(("recover", session_id, user_id, task_id, error))
+            self.running = 0
+            return True
+
+        async def list_active(self, session_id, *, user_id=None):
+            return []
+
+    class SessionRepository:
+        async def update_status(self, session_id, status):
+            trace.append(("status", session_id, status))
+
+    turns = TurnRepository()
+    service = AgentDomainService(
+        agent_repository=SimpleNamespace(),
+        session_repository=SessionRepository(),
+        sandbox_cls=SimpleNamespace(),
+        task_cls=SimpleNamespace(),
+        file_storage=SimpleNamespace(),
+        mcp_repository=SimpleNamespace(),
+        turn_submission_repository=turns,
+    )
+
+    await service._finalize_turns_after_task_stop(
+        "session-1",
+        user_id="owner",
+        task_id="lost-local-task",
+    )
+
+    assert trace[:4] == [
+        ("cancel", "session-1", "owner"),
+        ("count", 1),
+        (
+            "recover",
+            "session-1",
+            "owner",
+            "lost-local-task",
+            "Stopped task did not persist terminal turn state",
+        ),
+        ("count", 0),
+    ]
+    assert trace[-1] == (
+        "status",
+        "session-1",
+        SessionStatus.COMPLETED,
+    )
+
+
+async def test_task_without_runtime_is_replaced_after_crash_recovery():
+    session = Session(
+        id="session-crash-gap",
+        user_id="owner",
+        agent_id="agent-1",
+        sandbox_id=None,
+        sandbox_provider="docker",
+        task_id="old-task",
+    )
+
+    class Handle:
+        id = "new-generation"
+
+        async def aclose(self):
+            return None
+
+    class Provisioner:
+        async def ensure_locked(self, current):
+            current.sandbox_id = "new-generation"
+            return Handle()
+
+    service = AgentDomainService(
+        agent_repository=SimpleNamespace(),
+        session_repository=SimpleNamespace(),
+        sandbox_cls=SimpleNamespace(),
+        task_cls=SimpleNamespace(),
+        file_storage=SimpleNamespace(),
+        mcp_repository=SimpleNamespace(),
+        sandbox_provisioner=Provisioner(),
+    )
+
+    assert await service._ensure_sandbox_locked(session) is True
+
+
+async def test_task_bound_to_old_generation_is_retired_after_pointer_crash():
+    trace = []
+    session = Session(
+        id="session-pointer-crash",
+        user_id="owner",
+        agent_id="agent-1",
+        sandbox_id="generation-new",
+        sandbox_provider="docker",
+        task_id="task-old",
+        task_sandbox_id="generation-old",
+    )
+
+    class Handle:
+        id = "generation-new"
+
+        async def aclose(self):
+            trace.append("close")
+
+    class Provisioner:
+        async def ensure_locked(self, current):
+            return Handle()
+
+    class Task:
+        async def cancel(self):
+            trace.append("cancel-old")
+
+        async def wait_for_done(self, timeout_seconds):
+            trace.append("wait-old")
+            return True
+
+    class TaskClass:
+        @classmethod
+        async def get(cls, task_id):
+            assert task_id == "task-old"
+            return Task()
+
+    class Repository:
+        async def update_runtime_ownership(
+            self,
+            session_id,
+            sandbox_id,
+            task_id,
+            sandbox_provider,
+            task_sandbox_id,
+        ):
+            trace.append(
+                ("persist", task_id, task_sandbox_id, sandbox_id)
+            )
+
+    service = AgentDomainService(
+        agent_repository=SimpleNamespace(),
+        session_repository=Repository(),
+        sandbox_cls=SimpleNamespace(),
+        task_cls=TaskClass,
+        file_storage=SimpleNamespace(),
+        mcp_repository=SimpleNamespace(),
+        sandbox_provisioner=Provisioner(),
+    )
+
+    assert await service._ensure_sandbox_locked(session) is True
+    await service._retire_replaced_task_stream(
+        session, preserve_submission_id=None
+    )
+
+    assert session.task_id is None
+    assert session.task_sandbox_id is None
+    assert trace == [
+        "close",
+        "cancel-old",
+        "wait-old",
+        ("persist", None, None, "generation-new"),
+    ]
 
 
 async def test_concurrent_first_messages_share_one_sandbox_and_task():

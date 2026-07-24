@@ -81,6 +81,8 @@ class AgentBaySandbox(DockerSandbox):
     get_browser() from DockerSandbox; overrides lifecycle and URLs.
     """
 
+    _PROVIDER_DELETE_TIMEOUT_SECONDS = 30.0
+
     def __init__(
         self,
         session,
@@ -90,7 +92,9 @@ class AgentBaySandbox(DockerSandbox):
     ):
         # Intentionally NOT calling super().__init__: URLs come from the
         # AgentBay gateway, not from a container IP.
-        self.client = httpx.AsyncClient(timeout=600)
+        self.client = httpx.AsyncClient(
+            timeout=httpx.Timeout(self._API_TIMEOUT_SECONDS, connect=5.0)
+        )
         self.ip = None
         self.base_url = base_url.rstrip("/")
         self._cdp_url = cdp_url
@@ -237,7 +241,10 @@ class AgentBaySandbox(DockerSandbox):
         except Exception as provisioning_error:
             # Don't leak (and keep billing for) a session we can't reach.
             try:
-                delete_result = await session.delete()
+                async with asyncio.timeout(
+                    cls._PROVIDER_DELETE_TIMEOUT_SECONDS
+                ):
+                    delete_result = await session.delete()
                 if not getattr(delete_result, "success", False):
                     raise SandboxProvisioningError(
                         session.session_id,
@@ -278,7 +285,10 @@ class AgentBaySandbox(DockerSandbox):
         """Delete the AgentBay session (stops billing) and close the handle."""
         destroyed = False
         try:
-            result = await self._session.delete()
+            async with asyncio.timeout(
+                self._PROVIDER_DELETE_TIMEOUT_SECONDS
+            ):
+                result = await self._session.delete()
             if result.success:
                 logger.info("Deleted AgentBay session %s", self._session.session_id)
             else:

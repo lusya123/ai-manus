@@ -111,6 +111,12 @@ services:
       - sandbox
       - claw
     restart: unless-stopped
+    sysctls:
+      net.ipv4.ip_forward: "0"
+      net.ipv4.conf.all.forwarding: "0"
+      net.ipv4.conf.default.forwarding: "0"
+      net.ipv6.conf.all.forwarding: "0"
+      net.ipv6.conf.default.forwarding: "0"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       #- ./mcp.json:/etc/mcp.json # Mount MCP servers directory
@@ -135,6 +141,9 @@ services:
       - SANDBOX_PIDS_LIMIT=512
       - CLAW_IMAGE=simpleyyt/manus-claw
       - CLAW_NETWORK=manus-network
+      - RUNTIME_NETWORK_ISOLATION=true
+      - RUNTIME_DEPLOYMENT_ID=${RUNTIME_DEPLOYMENT_ID:-ai-manus}
+      - CLAW_PUBLISH_HOST_PORTS=false
 
   sandbox:
     image: simpleyyt/manus-sandbox
@@ -304,6 +313,9 @@ when a runtime intentionally comes from a different repository.
 - Configure an independent `CLAW_API_KEY_HMAC_KEYS` keyring when Claw is enabled. Claw applies WebSocket message/attachment limits, distributed request/turn limits, upload limits, and a bounded history.
 - File uploads have a pre-parser body cap, a per-file cap, and atomic per-user byte/file-count quotas. Keep reverse-proxy limits aligned with backend settings.
 - `TASK_BACKEND=local` supports exactly one backend Python process. Declare the real `BACKEND_REPLICA_COUNT`; use Celery for multiple replicas or workers.
+- Lifecycle fencing fields (`deleting`, `sandbox_destroying`, and task/runtime generation binding) require a quiesced upgrade: stop every old backend and worker before starting this release. Do not run old and new lifecycle protocols side by side; the bundled fork deployment performs this full stop/start sequence.
+- `run.sh` derives a unique `CORE_RESOURCE_PREFIX` for a custom `COMPOSE_PROJECT_NAME`, isolating its control/data networks and Mongo/Redis volumes. Direct custom Compose invocations must set the same unique prefix explicitly; never reuse a prefix between deployments on one Docker daemon.
+- Per-runtime control and egress bridges block cross-runtime and datastore access, and expired AutoRemove bridges are garbage-collected. This is not a host/VPC egress firewall: add host firewall rules or a destination-filtering proxy if sandboxes must also be blocked from Docker-host, RFC1918, link-local, or cloud-metadata addresses.
 - AgentBay cleanup preserves provider IDs when deletion cannot be confirmed, allowing retries. Its signed gateway URLs are bearer capabilities and must never be written to logs.
 
 See [Configuration](docs/en/configuration.md) and [AgentBay Cloud Sandbox](docs/en/agentbay.md) for the complete operational procedures.

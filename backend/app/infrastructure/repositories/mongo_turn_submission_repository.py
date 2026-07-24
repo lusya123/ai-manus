@@ -563,24 +563,83 @@ class MongoTurnSubmissionRepository(TurnSubmissionRepository):
         now = datetime.now(UTC)
         collection = self._turn_collection()
         try:
-            document = await collection.find_one_and_update(
-                {
-                    "session_id": session_id,
-                    "submission_id": submission_id,
-                    "task_id": task_id,
-                    "state": TurnSubmissionState.ENQUEUED.value,
-                },
-                {
-                    "$set": {
-                        "state": TurnSubmissionState.RUNNING.value,
-                        "claim_owner": owner,
-                        "claim_until": claim_until,
-                        "updated_at": now,
+            try:
+                document = await collection.find_one_and_update(
+                    {
+                        "session_id": session_id,
+                        "submission_id": submission_id,
+                        "task_id": task_id,
+                        "state": TurnSubmissionState.ENQUEUED.value,
                     },
-                    "$inc": {"attempt": 1},
-                },
-                return_document=ReturnDocument.AFTER,
-            )
+                    {
+                        "$set": {
+                            "state": TurnSubmissionState.RUNNING.value,
+                            "claim_owner": owner,
+                            "claim_until": claim_until,
+                            "updated_at": now,
+                        },
+                        "$inc": {"attempt": 1},
+                    },
+                    return_document=ReturnDocument.AFTER,
+                )
+            except Exception as claim_error:
+                # A socket timeout or lost Mongo response does not prove that
+                # find_one_and_update failed. Re-read the exact owner before
+                # allowing cancellation/retry to release this worker. Without
+                # this reconciliation a committed RUNNING row could outlive
+                # its task forever and pin the session's runtime deletion.
+                try:
+                    reconciled = self._to_domain(
+                        await collection.find_one(
+                            {
+                                "session_id": session_id,
+                                "submission_id": submission_id,
+                            }
+                        )
+                    )
+                except Exception as verify_error:
+                    raise TurnSubmissionUnavailableError(
+                        "Durable execution claim outcome is unknown"
+                    ) from verify_error
+                if (
+                    reconciled is not None
+                    and reconciled.state == TurnSubmissionState.RUNNING
+                    and reconciled.task_id == task_id
+                    and reconciled.claim_owner == owner
+                ):
+                    return TurnClaimResult(
+                        decision=TurnClaimDecision.EXECUTE,
+                        turn=reconciled,
+                    )
+                if (
+                    reconciled is not None
+                    and reconciled.state in TERMINAL_TURN_STATES
+                ):
+                    await self._repair_terminal_postconditions(reconciled)
+                    return TurnClaimResult(
+                        decision=TurnClaimDecision.ACK,
+                        turn=reconciled,
+                    )
+                if (
+                    reconciled is not None
+                    and reconciled.task_id
+                    and reconciled.task_id != task_id
+                ):
+                    return TurnClaimResult(
+                        decision=TurnClaimDecision.ACK,
+                        turn=reconciled,
+                    )
+                if (
+                    reconciled is not None
+                    and reconciled.state == TurnSubmissionState.RUNNING
+                ):
+                    return TurnClaimResult(
+                        decision=TurnClaimDecision.RETRY,
+                        turn=reconciled,
+                    )
+                raise TurnSubmissionUnavailableError(
+                    "Could not confirm durable execution claim"
+                ) from claim_error
             if document is not None:
                 return TurnClaimResult(
                     decision=TurnClaimDecision.EXECUTE,
@@ -602,13 +661,16 @@ class MongoTurnSubmissionRepository(TurnSubmissionRepository):
                 return TurnClaimResult(decision=TurnClaimDecision.ACK, turn=current)
             if current.state == TurnSubmissionState.RUNNING:
                 current_until = current.claim_until
-                if current_until is not None and current_until <= now:
+                if current_until is None or current_until <= now:
                     expired = await collection.find_one_and_update(
                         {
                             "session_id": session_id,
                             "submission_id": submission_id,
                             "state": TurnSubmissionState.RUNNING.value,
-                            "claim_until": {"$lte": now},
+                            "$or": [
+                                {"claim_until": {"$lte": now}},
+                                {"claim_until": None},
+                            ],
                         },
                         {
                             "$set": {
@@ -716,10 +778,23 @@ class MongoTurnSubmissionRepository(TurnSubmissionRepository):
                 return True
             await self._repair_terminal_postconditions(self._to_domain(document))
             return True
-        except Exception as exc:
+        except Exception as terminal_error:
+            # The owner-CAS may have committed even when its Mongo response
+            # was lost. Confirm the authoritative terminal postcondition
+            # before forcing the task backend into recovery; otherwise an
+            # explicit delete can wait on work that is already safely done.
+            try:
+                current = await self.find(session_id, submission_id)
+            except Exception as verify_error:
+                raise TurnSubmissionUnavailableError(
+                    "Terminal turn commit outcome is unknown"
+                ) from verify_error
+            if current is not None and current.state in TERMINAL_TURN_STATES:
+                await self._repair_terminal_postconditions(current)
+                return True
             raise TurnSubmissionUnavailableError(
                 "Could not persist terminal turn state"
-            ) from exc
+            ) from terminal_error
 
     async def mark_unclaimed_terminal(
         self,

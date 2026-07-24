@@ -1,6 +1,8 @@
 from pathlib import Path
 import json
 import re
+import shutil
+import subprocess
 import textwrap
 
 import pytest
@@ -10,6 +12,21 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_NETWORK = "manus-network"
 DATA_NETWORK = "manus-data-network"
+CHECKOUT_ACTION = (
+    "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+)
+QEMU_ACTION = (
+    "docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130"
+)
+BUILDX_ACTION = (
+    "docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f"
+)
+BUILD_PUSH_ACTION = (
+    "docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25"
+)
+SSH_ACTION = (
+    "appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262"
+)
 
 
 def _package_lock_resolved_urls(value) -> list[str]:
@@ -83,10 +100,26 @@ def test_user_controlled_runtimes_are_isolated_from_datastores(compose_name: str
     )
 
     assert compose["networks"][DATA_NETWORK]["internal"] is True
-    assert compose["networks"][RUNTIME_NETWORK]["name"] == runtime_network_name
+    expected_runtime_network = (
+        "${CORE_RESOURCE_PREFIX:-manus}-network"
+        if compose_name == "docker-compose.yml"
+        else (
+            "${DEV_RESOURCE_PREFIX:-manus}-network-dev"
+            if compose_name == "docker-compose-development.yml"
+            else runtime_network_name
+        )
+    )
+    assert compose["networks"][RUNTIME_NETWORK]["name"] == expected_runtime_network
     assert set(services["backend"]["networks"]) == {
         RUNTIME_NETWORK,
         DATA_NETWORK,
+    }
+    assert services["backend"]["sysctls"] == {
+        "net.ipv4.ip_forward": "0",
+        "net.ipv4.conf.all.forwarding": "0",
+        "net.ipv4.conf.default.forwarding": "0",
+        "net.ipv6.conf.all.forwarding": "0",
+        "net.ipv6.conf.default.forwarding": "0",
     }
     assert set(services["mongodb"]["networks"]) == {DATA_NETWORK}
     assert set(services["redis"]["networks"]) == {DATA_NETWORK}
@@ -102,8 +135,38 @@ def test_user_controlled_runtimes_are_isolated_from_datastores(compose_name: str
         assert set(services[runtime_name]["networks"]) == {RUNTIME_NETWORK}
 
     backend_environment = _environment_map(services["backend"])
-    assert backend_environment["SANDBOX_NETWORK"] == runtime_network_name
-    assert backend_environment["CLAW_NETWORK"] == runtime_network_name
+    expected_configured_runtime_network = (
+        "${SANDBOX_NETWORK:-manus-network}"
+        if compose_name == "docker-compose.yml"
+        else (
+            "${DEV_SANDBOX_NETWORK:-manus-network-dev}"
+            if compose_name == "docker-compose-development.yml"
+            else runtime_network_name
+        )
+    )
+    expected_configured_claw_network = (
+        "${CLAW_NETWORK:-manus-network}"
+        if compose_name == "docker-compose.yml"
+        else (
+            "${DEV_CLAW_NETWORK:-manus-network-dev}"
+            if compose_name == "docker-compose-development.yml"
+            else runtime_network_name
+        )
+    )
+    assert (
+        backend_environment["SANDBOX_NETWORK"]
+        == expected_configured_runtime_network
+    )
+    assert backend_environment["CLAW_NETWORK"] == expected_configured_claw_network
+    assert backend_environment["RUNTIME_NETWORK_ISOLATION"] == "true"
+    expected_deployment = (
+        "${RUNTIME_DEPLOYMENT_ID:-ai-manus-dev}"
+        if compose_name == "docker-compose-development.yml"
+        else "${RUNTIME_DEPLOYMENT_ID:-ai-manus}"
+    )
+    assert backend_environment["RUNTIME_DEPLOYMENT_ID"] == expected_deployment
+    if compose_name != "docker-compose-development.yml":
+        assert backend_environment["CLAW_PUBLISH_HOST_PORTS"] == "false"
     if compose_name == "docker-compose-development.yml":
         assert backend_environment["SANDBOX_PROVIDER"] == "docker"
 
@@ -116,7 +179,7 @@ def test_fork_deployment_worker_bridges_runtime_and_data_networks_safely():
     ssh_step = next(
         step
         for step in workflow["jobs"]["deploy-fork"]["steps"]
-        if step.get("uses") == "appleboy/ssh-action@v1.0.3"
+        if step.get("uses") == SSH_ACTION
     )
     deploy_script = ssh_step["with"]["script"]
     override = deploy_script.split('cat > "$incoming_override" <<EOF', 1)[1]
@@ -127,14 +190,92 @@ def test_fork_deployment_worker_bridges_runtime_and_data_networks_safely():
     assert set(worker["networks"]) == {RUNTIME_NETWORK, DATA_NETWORK}
     assert worker["restart"] == "unless-stopped"
     assert worker["command"] == ["./start_worker.sh"]
+    assert set(worker["sysctls"]) == {
+        "net.ipv4.ip_forward=0",
+        "net.ipv4.conf.all.forwarding=0",
+        "net.ipv4.conf.default.forwarding=0",
+        "net.ipv6.conf.all.forwarding=0",
+        "net.ipv6.conf.default.forwarding=0",
+    }
     worker_environment = _environment_map(worker)
     assert worker_environment["SANDBOX_NETWORK"] == RUNTIME_NETWORK
     assert worker_environment["CLAW_NETWORK"] == RUNTIME_NETWORK
+    assert worker_environment["RUNTIME_DEPLOYMENT_ID"] == "ai-manus"
+    assert worker_environment["MONGODB_URI"] == "mongodb://mongodb:27017"
+    assert worker_environment["REDIS_HOST"] == "redis"
+    assert worker_environment["REDIS_PORT"] == "6379"
 
     health_command = worker["healthcheck"]["test"][1].replace("\\$", "$")
     assert "/app/.venv/bin/celery" in health_command
     assert "inspect ping" in health_command
     assert 'celery@$$(hostname)' in health_command
+
+
+def test_fork_worker_internal_datastore_addresses_override_polluted_env(tmp_path):
+    docker = shutil.which("docker")
+    if docker is None:
+        pytest.skip("docker compose is required for Compose merge verification")
+    compose_version = subprocess.run(
+        [docker, "compose", "version"],
+        capture_output=True,
+        text=True,
+    )
+    if compose_version.returncode != 0:
+        pytest.skip("docker compose plugin is required for merge verification")
+
+    workflow = yaml.safe_load(
+        (PROJECT_ROOT / ".github/workflows/docker-build-and-push.yml").read_text()
+    )
+    ssh_step = next(
+        step
+        for step in workflow["jobs"]["deploy-fork"]["steps"]
+        if step.get("uses") == SSH_ACTION
+    )
+    deploy_script = ssh_step["with"]["script"]
+    override = deploy_script.split('cat > "$incoming_override" <<EOF', 1)[1]
+    override = override.split("\nEOF", 1)[0]
+    worker = yaml.safe_load(textwrap.dedent(override))["services"]["worker"]
+
+    (tmp_path / ".env").write_text(
+        "MONGODB_URI=mongodb://127.0.0.1:27017\n"
+        "REDIS_HOST=127.0.0.1\n"
+        "REDIS_PORT=6383\n"
+    )
+    (tmp_path / "base.yml").write_text(
+        "services:\n"
+        "  worker:\n"
+        "    image: busybox:latest\n"
+        "    env_file:\n"
+        "      - .env\n"
+    )
+    (tmp_path / "override.yml").write_text(
+        yaml.safe_dump(
+            {"services": {"worker": {"environment": worker["environment"]}}},
+            sort_keys=False,
+        )
+    )
+    result = subprocess.run(
+        [
+            docker,
+            "compose",
+            "--env-file",
+            str(tmp_path / ".env"),
+            "-f",
+            str(tmp_path / "base.yml"),
+            "-f",
+            str(tmp_path / "override.yml"),
+            "config",
+            "--format",
+            "json",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    environment = json.loads(result.stdout)["services"]["worker"]["environment"]
+    assert environment["MONGODB_URI"] == "mongodb://mongodb:27017"
+    assert environment["REDIS_HOST"] == "redis"
+    assert environment["REDIS_PORT"] == "6379"
 
 
 def test_fork_deployment_transfers_and_rolls_back_both_compose_files():
@@ -144,11 +285,11 @@ def test_fork_deployment_transfers_and_rolls_back_both_compose_files():
     workflow = yaml.safe_load(workflow_text)
     steps = workflow["jobs"]["deploy-fork"]["steps"]
 
-    assert any(step.get("uses") == "actions/checkout@v4" for step in steps)
+    assert any(step.get("uses") == CHECKOUT_ACTION for step in steps)
     prepare = next(step for step in steps if step.get("id") == "deploy")
     assert "base64 < docker-compose.yml" in prepare["run"]
     ssh_step = next(
-        step for step in steps if step.get("uses") == "appleboy/ssh-action@v1.0.3"
+        step for step in steps if step.get("uses") == SSH_ACTION
     )
     assert "COMPOSE_B64" in ssh_step["env"]
     assert "COMPOSE_B64" in ssh_step["with"]["envs"].split(",")
@@ -173,13 +314,117 @@ def test_multiarch_build_registers_emulation_before_buildx():
     steps = workflow["jobs"]["build-and-push"]["steps"]
     uses = [step.get("uses") for step in steps]
 
-    qemu_index = uses.index("docker/setup-qemu-action@v3")
-    buildx_index = uses.index("docker/setup-buildx-action@v3")
+    qemu_index = uses.index(QEMU_ACTION)
+    buildx_index = uses.index(BUILDX_ACTION)
     assert qemu_index < buildx_index
     build_step = next(
-        step for step in steps if step.get("uses") == "docker/build-push-action@v5"
+        step for step in steps if step.get("uses") == BUILD_PUSH_ACTION
     )
     assert build_step["with"]["platforms"] == "linux/amd64,linux/arm64"
+
+
+def test_workflow_actions_are_pinned_to_immutable_commits():
+    workflow = yaml.safe_load(
+        (PROJECT_ROOT / ".github/workflows/docker-build-and-push.yml").read_text()
+    )
+
+    action_refs = [
+        step["uses"]
+        for job in workflow["jobs"].values()
+        for step in job.get("steps", [])
+        if "uses" in step
+    ]
+
+    assert action_refs
+    assert all(
+        re.fullmatch(r"[^@]+@[0-9a-f]{40}", action_ref)
+        for action_ref in action_refs
+    )
+
+
+def test_fork_deployment_uses_approved_sha_and_immutable_image_digests():
+    workflow = yaml.safe_load(
+        (PROJECT_ROOT / ".github/workflows/docker-build-and-push.yml").read_text()
+    )
+    preflight = workflow["jobs"]["deploy-preflight"]
+    publish = workflow["jobs"]["publish-fork-images"]
+    deploy = workflow["jobs"]["deploy-fork"]
+
+    assert preflight["environment"] == "fork-production"
+    approval_step = next(
+        step for step in preflight["steps"] if step.get("id") == "secrets"
+    )
+    assert approval_step["env"]["APPROVED_SHA"] == (
+        "${{ vars.FORK_DEPLOY_APPROVED_SHA }}"
+    )
+    assert '"$APPROVED_SHA" != "$GITHUB_SHA"' in approval_step["run"]
+
+    build_step = next(step for step in publish["steps"] if step.get("id") == "build")
+    assert build_step["uses"] == BUILD_PUSH_ACTION
+    digest_step = next(
+        step
+        for step in publish["steps"]
+        if step.get("name") == "Record immutable fork image digest"
+    )
+    assert digest_step["env"]["IMAGE_DIGEST"] == (
+        "${{ steps.build.outputs.digest }}"
+    )
+    assert "sha256:[0-9a-f]{64}" in digest_step["run"]
+
+    prepare_step = next(step for step in deploy["steps"] if step.get("id") == "deploy")
+    assert "ai-manus-${component}@${digest}" in prepare_step["run"]
+    ssh_step = next(step for step in deploy["steps"] if step.get("uses") == SSH_ACTION)
+    deploy_script = ssh_step["with"]["script"]
+    for image_variable in (
+        "FRONTEND_IMAGE",
+        "BACKEND_IMAGE",
+        "SANDBOX_IMAGE",
+        "CLAW_IMAGE",
+        "MOCKSERVER_IMAGE",
+    ):
+        assert image_variable in ssh_step["env"]
+        assert image_variable in ssh_step["with"]["envs"].split(",")
+    assert "image: ${FRONTEND_IMAGE}" in deploy_script
+    assert "image: ${BACKEND_IMAGE}" in deploy_script
+    assert "image: ${SANDBOX_IMAGE}" in deploy_script
+    assert "image: ${CLAW_IMAGE}" in deploy_script
+    assert "image: ${MOCKSERVER_IMAGE}" in deploy_script
+    assert 'hotpatch_image="$SANDBOX_IMAGE"' in deploy_script
+    assert ".RepoDigests" in deploy_script
+    assert "ai-manus-frontend:${IMAGE_TAG}" not in deploy_script
+    assert "ai-manus-backend:${IMAGE_TAG}" not in deploy_script
+    assert "ai-manus-sandbox:${IMAGE_TAG}" not in deploy_script
+
+
+def test_fork_deployment_fails_closed_and_bounds_hotpatch_state():
+    workflow = yaml.safe_load(
+        (PROJECT_ROOT / ".github/workflows/docker-build-and-push.yml").read_text()
+    )
+    ssh_step = next(
+        step
+        for step in workflow["jobs"]["deploy-fork"]["steps"]
+        if step.get("uses") == SSH_ACTION
+    )
+    deploy_script = ssh_step["with"]["script"]
+
+    retained_guard = (
+        'docker container inspect "$HOTPATCH_TARGET" >/dev/null 2>&1 && '
+        "\\\n  "
+        '[ "${HOTPATCH_ENABLED:-false}" != true ]'
+    )
+    assert retained_guard in deploy_script
+    assert deploy_script.index(retained_guard) < deploy_script.index("changed=true")
+    assert "maximum_entries=200000" in deploy_script
+    assert "timeout 30s find . -mindepth 1 -xdev" in deploy_script
+    assert 'head -z -n "$maximum_fields"' in deploy_script
+    assert "exceeded ${maximum_entries} entries" in deploy_script
+
+    assert 'registry_docker_config="$(mktemp -d /tmp/ai-manus-registry.XXXXXX)"' in (
+        deploy_script
+    )
+    assert 'export DOCKER_CONFIG="$registry_docker_config"' in deploy_script
+    assert deploy_script.count("cleanup_registry_login") >= 3
+    assert 'docker logout "$REGISTRY"' in deploy_script
 
 
 def test_public_compose_example_requires_host_injected_secrets():
@@ -197,10 +442,18 @@ def test_development_data_volumes_cannot_reuse_production_storage():
         (PROJECT_ROOT / "docker-compose-development.yml").read_text()
     )
 
-    assert production["volumes"]["mongodb_data"]["name"] == "manus-mongodb-data"
-    assert development["volumes"]["mongodb_data"]["name"] == "manus-mongodb-data-dev"
-    assert production["volumes"]["redis_data"]["name"] == "manus-redis-data"
-    assert development["volumes"]["redis_data"]["name"] == "manus-redis-data-dev"
+    assert production["volumes"]["mongodb_data"]["name"] == (
+        "${CORE_RESOURCE_PREFIX:-manus}-mongodb-data"
+    )
+    assert development["volumes"]["mongodb_data"]["name"] == (
+        "${DEV_RESOURCE_PREFIX:-manus}-mongodb-data-dev"
+    )
+    assert production["volumes"]["redis_data"]["name"] == (
+        "${CORE_RESOURCE_PREFIX:-manus}-redis-data"
+    )
+    assert development["volumes"]["redis_data"]["name"] == (
+        "${DEV_RESOURCE_PREFIX:-manus}-redis-data-dev"
+    )
 
 
 def test_helper_scripts_use_distinct_compose_projects():
@@ -212,9 +465,15 @@ def test_helper_scripts_use_distinct_compose_projects():
         development_script
     )
     assert '-p "$PROJECT_NAME" -f docker-compose.yml' in production_script
+    assert 'RESOURCE_PREFIX="manus-$PROJECT_NAME"' in production_script
+    assert 'CORE_RESOURCE_PREFIX="$RESOURCE_PREFIX"' in production_script
     assert '-p "$PROJECT_NAME" -f docker-compose-development.yml' in (
         development_script
     )
+    assert 'RESOURCE_PREFIX="manus-$PROJECT_NAME"' in development_script
+    assert 'DEV_RESOURCE_PREFIX="$RESOURCE_PREFIX"' in development_script
+    assert 'DEV_SANDBOX_NETWORK=' in development_script
+    assert 'DEV_CLAW_NETWORK=' in development_script
 
 
 def test_local_docker_sandboxes_have_cpu_memory_and_process_limits():
@@ -252,11 +511,26 @@ def test_production_dynamic_runtime_images_follow_the_compose_release():
 
 def test_container_entrypoints_do_not_sync_dependencies_or_log_claw_token():
     backend_dockerfile = (PROJECT_ROOT / "backend/Dockerfile").read_text()
+    sandbox_dockerfile = (PROJECT_ROOT / "sandbox/Dockerfile").read_text()
+    mockserver_dockerfile = (PROJECT_ROOT / "mockserver/Dockerfile").read_text()
     worker_entrypoint = (PROJECT_ROOT / "backend/start_worker.sh").read_text()
     sandbox_supervisor = (PROJECT_ROOT / "sandbox/supervisord.conf").read_text()
     claw_entrypoint = (PROJECT_ROOT / "claw/entrypoint.sh").read_text()
+    workflow = yaml.safe_load(
+        (PROJECT_ROOT / ".github/workflows/docker-build-and-push.yml").read_text()
+    )
+    development = yaml.safe_load(
+        (PROJECT_ROOT / "docker-compose-development.yml").read_text()
+    )
+    uv_version = workflow["env"]["UV_VERSION"]
 
     assert 'CMD ["/app/.venv/bin/uvicorn"' in backend_dockerfile
+    assert f"pip install uv=={uv_version}" in backend_dockerfile
+    assert f"pip3 install uv=={uv_version}" in sandbox_dockerfile
+    assert "--reload" not in mockserver_dockerfile
+    assert (
+        development["services"]["mockserver"]["command"] == ["./dev.sh"]
+    )
     assert 'exec "${SCRIPT_DIR}/.venv/bin/celery"' in worker_entrypoint
     assert "command=/app/.venv/bin/uvicorn" in sandbox_supervisor
     assert "uv run" not in backend_dockerfile.split("CMD ", 1)[1]

@@ -1,6 +1,7 @@
 import asyncio
 import pytest
 
+from app.domain.services.agent_task_runner import RunnerCleanupCapacityError
 from app.infrastructure.external.task.celery_task import (
     CeleryTask,
     DispatchRequest,
@@ -31,6 +32,19 @@ async def test_local_task_cancel_waits_for_coroutine_acknowledgement():
     assert await task.cancel() is True
     assert await task.wait_for_done(0.5) is True
     assert task._execution_task.done()
+
+
+def test_stale_local_task_cleanup_preserves_replacement_registry_entry():
+    stale = object.__new__(RedisStreamTask)
+    stale._id = "shared-task-id"
+    replacement = object.__new__(RedisStreamTask)
+    replacement._id = "shared-task-id"
+    RedisStreamTask._task_registry = {stale.id: replacement}
+    try:
+        stale._cleanup_registry()
+        assert RedisStreamTask._task_registry[stale.id] is replacement
+    finally:
+        RedisStreamTask._task_registry.clear()
 
 
 async def test_local_task_wait_is_bounded_when_cleanup_is_stuck():
@@ -101,6 +115,55 @@ async def test_local_task_shutdown_closes_runner_only_after_task_stops():
         RedisStreamTask._task_registry.clear()
 
     assert trace == ["cancel-ack-start", "cancel-ack-done", "close"]
+
+
+async def test_local_shutdown_broadcasts_cancel_before_shared_deadline_waits():
+    task_count = 3
+    all_waiters_started = asyncio.Event()
+    waiters_started = 0
+
+    class Runner:
+        def __init__(self, task_id):
+            self.task_id = task_id
+            self.close_count = 0
+
+        async def aclose(self):
+            self.close_count += 1
+
+    class SlowTask:
+        def __init__(self, task_id):
+            self.id = task_id
+            self.cancel_received = False
+            self.wait_timeout = None
+            self._runner = Runner(task_id)
+
+        async def cancel(self):
+            self.cancel_received = True
+            return True
+
+        async def wait_for_done(self, timeout_seconds):
+            nonlocal waiters_started
+            assert all(task.cancel_received for task in tasks)
+            self.wait_timeout = timeout_seconds
+            waiters_started += 1
+            if waiters_started == task_count:
+                all_waiters_started.set()
+            await all_waiters_started.wait()
+            return True
+
+    tasks = [SlowTask(f"slow-{index}") for index in range(task_count)]
+    RedisStreamTask._task_registry = {task.id: task for task in tasks}
+    try:
+        await asyncio.wait_for(RedisStreamTask.destroy(), timeout=1.0)
+    finally:
+        RedisStreamTask._task_registry.clear()
+
+    assert all(task.cancel_received for task in tasks)
+    assert all(task.wait_timeout is not None for task in tasks)
+    assert max(task.wait_timeout for task in tasks) - min(
+        task.wait_timeout for task in tasks
+    ) < 0.1
+    assert [task._runner.close_count for task in tasks] == [1, 1, 1]
 
 
 async def test_wait_for_done_does_not_swallow_caller_cancellation():
@@ -226,6 +289,342 @@ async def test_local_task_restarts_when_run_arrives_during_runner_finalization()
     assert task._rerun_requested is False
 
 
+async def test_local_rerun_waits_for_cleanup_capacity_without_reconnect(
+    monkeypatch,
+):
+    finalizing = asyncio.Event()
+    release_finalizer = asyncio.Event()
+    capacity_attempted = asyncio.Event()
+
+    class Runner:
+        def __init__(self, *, block_finalize=False):
+            self.block_finalize = block_finalize
+            self.run_count = 0
+
+        async def run(self, task):
+            self.run_count += 1
+
+        async def on_done(self, task):
+            if self.block_finalize:
+                finalizing.set()
+                await release_finalizer.wait()
+
+        async def aclose(self):
+            return None
+
+    first_runner = Runner(block_finalize=True)
+    rebuilt_runner = Runner()
+
+    class Factory:
+        def __init__(self):
+            self.calls = 0
+
+        async def create_runner(self, params):
+            self.calls += 1
+            if self.calls == 1:
+                capacity_attempted.set()
+                raise RunnerCleanupCapacityError(
+                    "cleanup bundles are full"
+                )
+            return rebuilt_runner
+
+    factory = Factory()
+    previous_factory = RedisStreamTask._runner_factory
+    RedisStreamTask._task_registry = {}
+    RedisStreamTask.set_runner_factory(factory)
+    monkeypatch.setattr(
+        RedisStreamTask,
+        "_RUNNER_CAPACITY_RETRY_INITIAL_SECONDS",
+        0.001,
+    )
+    task = object.__new__(RedisStreamTask)
+    task._id = "capacity-rerun-task"
+    task._params = {}
+    task._runner = first_runner
+    task._runner_closed = False
+    task._execution_task = None
+    task._rerun_requested = False
+    task._cancel_requested = False
+    try:
+        await task.run()
+        execution = task._execution_task
+        await finalizing.wait()
+
+        # This is the only request needed for the queued second generation.
+        await task.run()
+        release_finalizer.set()
+        await capacity_attempted.wait()
+        await asyncio.wait_for(execution, timeout=1.0)
+    finally:
+        RedisStreamTask._runner_factory = previous_factory
+        RedisStreamTask._task_registry.clear()
+
+    assert factory.calls == 2
+    assert first_runner.run_count == 1
+    assert rebuilt_runner.run_count == 1
+    assert task._rerun_requested is False
+
+
+async def test_local_rerun_retries_transient_factory_error_without_reconnect(
+    monkeypatch,
+):
+    finalizing = asyncio.Event()
+    release_finalizer = asyncio.Event()
+
+    class Runner:
+        def __init__(self, *, block_finalize=False):
+            self.block_finalize = block_finalize
+            self.run_count = 0
+
+        async def run(self, task):
+            self.run_count += 1
+
+        async def on_done(self, task):
+            if self.block_finalize:
+                finalizing.set()
+                await release_finalizer.wait()
+
+        async def aclose(self):
+            return None
+
+    first_runner = Runner(block_finalize=True)
+    rebuilt_runner = Runner()
+
+    class Factory:
+        def __init__(self):
+            self.calls = 0
+
+        async def create_runner(self, params):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("temporary sandbox lookup failure")
+            return rebuilt_runner
+
+    factory = Factory()
+    previous_factory = RedisStreamTask._runner_factory
+    RedisStreamTask._task_registry = {}
+    RedisStreamTask.set_runner_factory(factory)
+    monkeypatch.setattr(
+        RedisStreamTask,
+        "_RUNNER_CAPACITY_RETRY_INITIAL_SECONDS",
+        0.001,
+    )
+    task = object.__new__(RedisStreamTask)
+    task._id = "transient-factory-rerun-task"
+    task._params = {}
+    task._runner = first_runner
+    task._runner_closed = False
+    task._execution_task = None
+    task._rerun_requested = False
+    task._cancel_requested = False
+    try:
+        await task.run()
+        execution = task._execution_task
+        await finalizing.wait()
+        await task.run()
+        release_finalizer.set()
+        await asyncio.wait_for(execution, timeout=1.0)
+    finally:
+        RedisStreamTask._runner_factory = previous_factory
+        RedisStreamTask._task_registry.clear()
+
+    assert factory.calls == 2
+    assert first_runner.run_count == 1
+    assert rebuilt_runner.run_count == 1
+
+
+async def test_local_permanent_factory_error_is_durably_resolved(
+    monkeypatch,
+):
+    finalizing = asyncio.Event()
+    release_finalizer = asyncio.Event()
+    recoveries = []
+
+    class Runner:
+        async def run(self, task):
+            return None
+
+        async def on_done(self, task):
+            finalizing.set()
+            await release_finalizer.wait()
+
+        async def aclose(self):
+            return None
+
+    class Factory:
+        async def create_runner(self, params):
+            raise RuntimeError("permanent agent configuration failure")
+
+        async def recover_factory_failure(
+            self,
+            params,
+            *,
+            task_id,
+            error,
+        ):
+            recoveries.append((params, task_id, error))
+            return True
+
+    previous_factory = RedisStreamTask._runner_factory
+    RedisStreamTask._task_registry = {}
+    RedisStreamTask.set_runner_factory(Factory())
+    monkeypatch.setattr(
+        RedisStreamTask,
+        "_GENERIC_FACTORY_RETRIES_BEFORE_RECOVERY",
+        1,
+    )
+    task = object.__new__(RedisStreamTask)
+    task._id = "permanent-factory-rerun-task"
+    task._params = {"session_id": "session-1", "user_id": "user-1"}
+    task._runner = Runner()
+    task._runner_closed = False
+    task._execution_task = None
+    task._rerun_requested = False
+    task._cancel_requested = False
+    try:
+        await task.run()
+        execution = task._execution_task
+        await finalizing.wait()
+        await task.run()
+        release_finalizer.set()
+        await asyncio.wait_for(execution, timeout=1.0)
+    finally:
+        RedisStreamTask._runner_factory = previous_factory
+        RedisStreamTask._task_registry.clear()
+
+    assert len(recoveries) == 1
+    assert recoveries[0][0] == task._params
+    assert recoveries[0][1] == task.id
+    assert "RuntimeError" in recoveries[0][2]
+
+
+async def test_local_factory_recovery_reuses_error_after_partial_commit(
+    monkeypatch,
+):
+    recovery_errors = []
+
+    class FactoryError(RuntimeError):
+        def __init__(self, status_code):
+            super().__init__(f"status {status_code}")
+            self.response = type(
+                "Response",
+                (),
+                {"status_code": status_code},
+            )()
+
+    class Factory:
+        def __init__(self):
+            self.create_calls = 0
+
+        async def create_runner(self, params):
+            self.create_calls += 1
+            raise FactoryError(499 + self.create_calls)
+
+        async def recover_factory_failure(
+            self,
+            params,
+            *,
+            task_id,
+            error,
+        ):
+            recovery_errors.append(error)
+            if len(recovery_errors) == 1:
+                # Simulate ENQUEUED -> FAILED committing before quota repair
+                # or the Mongo response is lost.
+                raise ConnectionError("repair response lost")
+            return True
+
+    factory = Factory()
+    previous_factory = RedisStreamTask._runner_factory
+    RedisStreamTask._task_registry = {}
+    RedisStreamTask.set_runner_factory(factory)
+    monkeypatch.setattr(
+        RedisStreamTask,
+        "_GENERIC_FACTORY_RETRIES_BEFORE_RECOVERY",
+        1,
+    )
+    monkeypatch.setattr(
+        RedisStreamTask,
+        "_RUNNER_CAPACITY_RETRY_INITIAL_SECONDS",
+        0.001,
+    )
+    task = object.__new__(RedisStreamTask)
+    task._id = "partial-factory-recovery-task"
+    task._params = {"session_id": "session-1", "user_id": "user-1"}
+    task._rerun_requested = False
+    task._cancel_requested = False
+    RedisStreamTask._task_registry = {task.id: task}
+    try:
+        rebuilt = await asyncio.wait_for(
+            task._rebuild_runner_until_resolved(),
+            timeout=1.0,
+        )
+    finally:
+        RedisStreamTask._runner_factory = previous_factory
+        RedisStreamTask._task_registry.clear()
+
+    assert rebuilt is False
+    assert factory.create_calls == 2
+    assert recovery_errors == [
+        "Runner factory failed: FactoryError (HTTP 500)",
+        "Runner factory failed: FactoryError (HTTP 500)",
+    ]
+
+
+async def test_local_capacity_wait_is_cancellable_and_cleans_registry(
+    monkeypatch,
+):
+    finalizing = asyncio.Event()
+    release_finalizer = asyncio.Event()
+    capacity_attempted = asyncio.Event()
+
+    class Runner:
+        async def run(self, task):
+            return None
+
+        async def on_done(self, task):
+            finalizing.set()
+            await release_finalizer.wait()
+
+        async def aclose(self):
+            return None
+
+    class Factory:
+        async def create_runner(self, params):
+            capacity_attempted.set()
+            raise RunnerCleanupCapacityError("cleanup bundles are full")
+
+    previous_factory = RedisStreamTask._runner_factory
+    RedisStreamTask._task_registry = {}
+    RedisStreamTask.set_runner_factory(Factory())
+    monkeypatch.setattr(
+        RedisStreamTask,
+        "_RUNNER_CAPACITY_RETRY_INITIAL_SECONDS",
+        60.0,
+    )
+    task = object.__new__(RedisStreamTask)
+    task._id = "cancel-capacity-wait-task"
+    task._params = {}
+    task._runner = Runner()
+    task._runner_closed = False
+    task._execution_task = None
+    task._rerun_requested = False
+    task._cancel_requested = False
+    try:
+        await task.run()
+        await finalizing.wait()
+        await task.run()
+        release_finalizer.set()
+        await capacity_attempted.wait()
+
+        assert await task.cancel() is True
+        assert await task.wait_for_done(1.0) is True
+        assert task.id not in RedisStreamTask._task_registry
+    finally:
+        RedisStreamTask._runner_factory = previous_factory
+        RedisStreamTask._task_registry.clear()
+
+
 async def test_local_task_closes_each_rebuilt_runner_across_multiple_turns():
     runners = []
 
@@ -270,13 +669,20 @@ async def test_local_task_closes_each_rebuilt_runner_across_multiple_turns():
     assert [runner.close_count for runner in runners] == [1, 1]
 
 
-async def test_local_task_closes_runner_after_execution_exception():
+async def test_local_task_rebuilds_after_execution_exception_without_reconnect(
+    monkeypatch,
+):
     class Runner:
-        close_count = 0
-        on_done_count = 0
+        def __init__(self, *, fail=False):
+            self.fail = fail
+            self.run_count = 0
+            self.close_count = 0
+            self.on_done_count = 0
 
         async def run(self, task):
-            raise RuntimeError("runner failed")
+            self.run_count += 1
+            if self.fail:
+                raise RuntimeError("runner failed")
 
         async def on_done(self, task):
             self.on_done_count += 1
@@ -284,20 +690,158 @@ async def test_local_task_closes_runner_after_execution_exception():
         async def aclose(self):
             self.close_count += 1
 
-    runner = Runner()
+    failed_runner = Runner(fail=True)
+    recovered_runner = Runner()
+
+    class Factory:
+        async def create_runner(self, params):
+            return recovered_runner
+
+    previous_factory = RedisStreamTask._runner_factory
+    RedisStreamTask._task_registry = {}
+    RedisStreamTask.set_runner_factory(Factory())
+    monkeypatch.setattr(
+        RedisStreamTask,
+        "_RUNNER_CAPACITY_RETRY_INITIAL_SECONDS",
+        0.001,
+    )
     task = object.__new__(RedisStreamTask)
     task._id = "failed-task"
-    task._runner = runner
+    task._params = {}
+    task._runner = failed_runner
     task._runner_closed = False
     task._rerun_requested = False
     task._cancel_requested = False
     RedisStreamTask._task_registry = {task.id: task}
     try:
-        await task._execute_task()
+        await asyncio.wait_for(task._execute_task(), timeout=1.0)
     finally:
+        RedisStreamTask._runner_factory = previous_factory
         RedisStreamTask._task_registry.clear()
 
-    assert runner.on_done_count == 1
+    assert failed_runner.run_count == 1
+    assert failed_runner.on_done_count == 1
+    assert failed_runner.close_count == 1
+    assert recovered_runner.run_count == 1
+    assert recovered_runner.on_done_count == 1
+    assert recovered_runner.close_count == 1
+
+
+async def test_local_claim_loss_rebuilds_worker_without_new_http_request(
+    monkeypatch,
+):
+    class ClaimLostRunner:
+        run_count = 0
+        close_count = 0
+
+        async def run(self, task):
+            self.run_count += 1
+            asyncio.current_task().cancel("mongo_claim_lost")
+            await asyncio.sleep(0)
+
+        async def on_done(self, task):
+            return None
+
+        async def aclose(self):
+            self.close_count += 1
+
+    class RecoveredRunner:
+        run_count = 0
+        close_count = 0
+
+        async def run(self, task):
+            self.run_count += 1
+
+        async def on_done(self, task):
+            return None
+
+        async def aclose(self):
+            self.close_count += 1
+
+    first_runner = ClaimLostRunner()
+    recovered_runner = RecoveredRunner()
+
+    class Factory:
+        async def create_runner(self, params):
+            return recovered_runner
+
+    previous_factory = RedisStreamTask._runner_factory
+    RedisStreamTask._task_registry = {}
+    RedisStreamTask.set_runner_factory(Factory())
+    monkeypatch.setattr(
+        RedisStreamTask,
+        "_RUNNER_CAPACITY_RETRY_INITIAL_SECONDS",
+        0.001,
+    )
+    task = object.__new__(RedisStreamTask)
+    task._id = "claim-loss-task"
+    task._params = {}
+    task._runner = first_runner
+    task._runner_closed = False
+    task._rerun_requested = False
+    task._cancel_requested = False
+    RedisStreamTask._task_registry = {task.id: task}
+    try:
+        await asyncio.wait_for(task._execute_task(), timeout=1.0)
+    finally:
+        RedisStreamTask._runner_factory = previous_factory
+        RedisStreamTask._task_registry.clear()
+
+    assert first_runner.run_count == 1
+    assert first_runner.close_count == 1
+    assert recovered_runner.run_count == 1
+    assert recovered_runner.close_count == 1
+
+
+async def test_runtime_shutdown_cancellation_stops_without_rebuild():
+    started = asyncio.Event()
+
+    class Runner:
+        close_count = 0
+
+        async def run(self, task):
+            started.set()
+            await asyncio.Event().wait()
+
+        async def on_done(self, task):
+            return None
+
+        async def aclose(self):
+            self.close_count += 1
+
+    class Factory:
+        calls = 0
+
+        async def create_runner(self, params):
+            self.calls += 1
+            raise AssertionError("runtime shutdown must not rebuild")
+
+    runner = Runner()
+    factory = Factory()
+    previous_factory = RedisStreamTask._runner_factory
+    RedisStreamTask._task_registry = {}
+    RedisStreamTask.set_runner_factory(factory)
+    task = object.__new__(RedisStreamTask)
+    task._id = "runtime-shutdown-task"
+    task._params = {}
+    task._runner = runner
+    task._runner_closed = False
+    task._rerun_requested = False
+    task._cancel_requested = False
+    RedisStreamTask._task_registry = {task.id: task}
+    task._execution_task = asyncio.create_task(task._execute_task())
+    try:
+        await started.wait()
+        task._execution_task.cancel()
+        await asyncio.wait_for(
+            asyncio.shield(task._execution_task),
+            timeout=1.0,
+        )
+    finally:
+        RedisStreamTask._runner_factory = previous_factory
+        RedisStreamTask._task_registry.clear()
+
+    assert factory.calls == 0
     assert runner.close_count == 1
 
 
@@ -587,6 +1131,54 @@ async def test_celery_worker_factory_failure_terminalizes_before_done(monkeypatc
     assert trace[2][0:4] == ("terminal", "session-1", "user-1", "task-1")
     assert trace[2][4] == celery_worker._FACTORY_FAILURE_MESSAGE
     assert trace[3] == ("finish", False)
+
+
+async def test_celery_worker_retries_cleanup_capacity_without_terminalizing(
+    monkeypatch,
+):
+    terminal_calls = []
+    finish_calls = []
+
+    class Factory:
+        async def create_runner(self, params):
+            raise RunnerCleanupCapacityError("cleanup bundles are full")
+
+    class Repository:
+        async def recover_factory_failure_for_task(self, *args, **kwargs):
+            terminal_calls.append((args, kwargs))
+            return True
+
+    async def initialized():
+        return None
+
+    async def claim(*args, **kwargs):
+        return "claimed"
+
+    async def finish(*args, **kwargs):
+        finish_calls.append((args, kwargs))
+        return "done"
+
+    monkeypatch.setattr(celery_worker, "_ensure_initialized", initialized)
+    monkeypatch.setattr(celery_worker, "claim_dispatch", claim)
+    monkeypatch.setattr(celery_worker, "finish_cycle", finish)
+    monkeypatch.setattr(celery_worker, "_turn_submission_repository", Repository())
+    monkeypatch.setattr(
+        CeleryTask,
+        "get_runner_factory",
+        classmethod(lambda cls: Factory()),
+    )
+
+    with pytest.raises(celery_worker.WorkerStateRetry) as retry:
+        await celery_worker._run_agent(
+            "task-capacity",
+            {"session_id": "session-1", "user_id": "user-1"},
+            "generation-1",
+        )
+
+    assert retry.value.mode == "run"
+    assert retry.value.claim_id
+    assert terminal_calls == []
+    assert finish_calls == []
 
 
 async def test_celery_worker_retries_without_done_when_terminalization_fails(

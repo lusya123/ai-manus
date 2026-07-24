@@ -50,6 +50,12 @@ services:
       - sandbox
       - claw
     restart: unless-stopped
+    sysctls:
+      net.ipv4.ip_forward: "0"
+      net.ipv4.conf.all.forwarding: "0"
+      net.ipv4.conf.default.forwarding: "0"
+      net.ipv6.conf.all.forwarding: "0"
+      net.ipv6.conf.default.forwarding: "0"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       #- ./mcp.json:/etc/mcp.json # Mount MCP servers directory
@@ -74,6 +80,9 @@ services:
       - SANDBOX_PIDS_LIMIT=512
       - CLAW_IMAGE=simpleyyt/manus-claw
       - CLAW_NETWORK=manus-network
+      - RUNTIME_NETWORK_ISOLATION=true
+      - RUNTIME_DEPLOYMENT_ID=${RUNTIME_DEPLOYMENT_ID:-ai-manus}
+      - CLAW_PUBLISH_HOST_PORTS=false
 
   sandbox:
     image: simpleyyt/manus-sandbox
@@ -189,6 +198,16 @@ SANDBOX_NETWORK=manus-network
 SANDBOX_MEMORY_LIMIT=2g
 SANDBOX_CPU_LIMIT=2.0
 SANDBOX_PIDS_LIMIT=512
+# Dynamic Docker runtimes use an internal control bridge plus a one-container
+# egress bridge. Each live runtime therefore consumes two /28 subnets.
+RUNTIME_NETWORK_ISOLATION=true
+#RUNTIME_GATEWAY_CONTAINER=
+#RUNTIME_NETWORK_ADDRESS_POOL=10.240.0.0/12
+#RUNTIME_NETWORK_SUBNET_PREFIX=28
+#RUNTIME_NETWORK_GC_INTERVAL_SECONDS=60
+#RUNTIME_NETWORK_GC_GRACE_SECONDS=300
+# This blocks cross-runtime/datastore access, not Docker-host, RFC1918,
+# link-local, or cloud-metadata egress; use a host firewall/proxy for that.
 #SANDBOX_CHROME_ARGS=
 #SANDBOX_HTTPS_PROXY=
 #SANDBOX_HTTP_PROXY=
@@ -409,6 +428,7 @@ Before exposing the service, verify the following:
 4. Keep the default upload body, per-file, and per-user quotas unless you have deliberately sized MongoDB, Nginx, and storage for larger values.
 5. Keep `TASK_BACKEND=local` and `BACKEND_REPLICA_COUNT=1` together. Before adding a second backend process or replica, switch to Celery and give every backend/worker the same Redis, MongoDB, JWT, model-keyring, and sandbox settings.
 6. With AgentBay, treat every signed gateway link as a secret. Cleanup failures preserve the provider session ID for retry; do not delete the database record manually until the provider confirms deletion.
+7. Dynamic Docker runtimes use separate control and egress bridges, isolating other runtimes and MongoDB/Redis, and TTL AutoRemove orphan bridges are collected. This is not a host/VPC egress firewall; add host firewall rules or a destination-filtering proxy to block Docker-host, RFC1918, link-local, or cloud-metadata destinations.
 
 Refresh tokens are single-use and are replaced on every refresh; logout revokes their family. Sub2API redirects additionally require a one-time random `state` and verified fragment handoff. See [Configuration](configuration.md) for key rotation and legacy credential migration commands.
 

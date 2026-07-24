@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from contextlib import asynccontextmanager
 import logging
 import sys
 
@@ -15,6 +16,7 @@ from app.core.exceptions import (
     general_exception_handler
 )
 from app.core.middleware import auto_extend_timeout_middleware
+from app.services.shell import shell_service
 
 # Configure logging
 def setup_logging():
@@ -46,8 +48,18 @@ def setup_logging():
 setup_logging()
 logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # The fixed shell-UID lease table lives in this process. Reclaim anything
+    # left by a crashed/reloaded predecessor before the API starts accepting
+    # requests, otherwise a reused UID could make cleanup target a new command.
+    await shell_service.initialize_process_isolation()
+    yield
+
 app = FastAPI(
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 # Set up CORS
@@ -73,4 +85,4 @@ app.add_exception_handler(Exception, general_exception_handler)
 # Register routes
 app.include_router(api_router, prefix="/api/v1")
 
-logger.info("Sandbox API routes registered and server ready")
+logger.info("Sandbox API routes registered; readiness follows lifespan startup")

@@ -89,6 +89,65 @@ def test_config_rejects_unsafe_or_unknown_task_backend_topology():
     _settings(task_backend="celery", backend_replica_count=2).validate()
 
 
+@pytest.mark.parametrize(
+    "pool",
+    ["not-a-cidr", "10.240.0.1/12", "fd00::/48"],
+)
+def test_runtime_network_pool_must_be_canonical_ipv4(pool):
+    with pytest.raises(ValueError, match="RUNTIME_NETWORK_ADDRESS_POOL"):
+        _settings(runtime_network_address_pool=pool).validate()
+
+
+def test_runtime_subnet_must_be_smaller_than_its_address_pool():
+    with pytest.raises(ValueError, match="RUNTIME_NETWORK_SUBNET_PREFIX"):
+        _settings(
+            runtime_network_address_pool="10.240.0.0/24",
+            runtime_network_subnet_prefix=24,
+        ).validate()
+
+
+def test_runtime_network_gc_grace_covers_multiple_scan_intervals():
+    with pytest.raises(ValueError, match="GC_GRACE_SECONDS"):
+        _settings(
+            runtime_network_gc_interval_seconds=60,
+            runtime_network_gc_grace_seconds=60,
+        ).validate()
+
+
+def test_dynamic_docker_runtimes_cannot_disable_network_intent():
+    with pytest.raises(ValueError, match="RUNTIME_NETWORK_ISOLATION=false"):
+        _settings(
+            runtime_network_isolation=False,
+            sandbox_address=None,
+            claw_enabled=False,
+        ).validate()
+
+    with pytest.raises(ValueError, match="RUNTIME_NETWORK_ISOLATION=false"):
+        _settings(
+            runtime_network_isolation=False,
+            sandbox_address="fixed-sandbox",
+            claw_enabled=True,
+            claw_address=None,
+        ).validate()
+
+
+def test_fixed_or_non_docker_runtimes_may_use_external_isolation():
+    _settings(
+        runtime_network_isolation=False,
+        sandbox_address="fixed-sandbox",
+        claw_enabled=False,
+    ).validate()
+
+    _settings(
+        runtime_network_isolation=False,
+        sandbox_provider="agentbay",
+        agentbay_api_key="provider-key",
+        agentbay_image_id="image-id",
+        agentbay_deployment_id="deployment-id",
+        claw_enabled=False,
+    ).validate()
+
+
 def test_agentbay_per_user_limit_cannot_exceed_global_cost_cap():
     with pytest.raises(ValueError, match="AGENTBAY_MAX_SESSIONS_PER_USER"):
         _settings(
@@ -140,6 +199,50 @@ def test_claw_hmac_keyring_rejects_weak_rotation_keys():
     )
 
     with pytest.raises(ValueError, match="CLAW_API_KEY_HMAC_KEYS"):
+        settings.validate()
+
+
+def test_claw_history_budget_defaults_leave_mongo_document_headroom():
+    settings = _settings()
+
+    assert settings.claw_history_max_messages == 128
+    assert settings.claw_history_max_bytes == 8 * 1024 * 1024
+    assert settings.claw_history_max_bytes < 16 * 1024 * 1024
+
+
+def test_claw_history_budget_rejects_unsafe_or_internally_inconsistent_values():
+    with pytest.raises(ValueError, match="less than or equal to 12582912"):
+        _settings(claw_history_max_bytes=12 * 1024 * 1024 + 1)
+
+    with pytest.raises(ValueError, match="less than or equal to 128"):
+        _settings(claw_history_max_messages=129)
+
+    settings = _settings(claw_history_max_bytes=2 * 1024 * 1024)
+    with pytest.raises(ValueError, match="CLAW_HISTORY_MAX_BYTES"):
+        settings.validate()
+
+
+def test_session_history_budget_reserves_room_for_embedded_files():
+    settings = _settings()
+
+    assert settings.session_history_max_events == 512
+    assert settings.session_event_max_bytes == 256 * 1024
+    assert settings.session_history_max_bytes == 6 * 1024 * 1024
+    assert settings.session_history_max_bytes <= 6 * 1024 * 1024
+
+
+def test_session_history_budget_rejects_unsafe_or_inconsistent_values():
+    with pytest.raises(ValueError, match="less than or equal to 6291456"):
+        _settings(session_history_max_bytes=6 * 1024 * 1024 + 1)
+
+    with pytest.raises(ValueError, match="less than or equal to 512"):
+        _settings(session_history_max_events=513)
+
+    settings = _settings(
+        session_event_max_bytes=256 * 1024,
+        session_history_max_bytes=256 * 1024,
+    )
+    with pytest.raises(ValueError, match="SESSION_HISTORY_MAX_BYTES"):
         settings.validate()
 
 

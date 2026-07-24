@@ -83,6 +83,7 @@ class FakeRepository:
         sandbox_id: str | None,
         task_id: str | None,
         sandbox_provider: str | None = None,
+        task_sandbox_id: str | None = None,
     ) -> None:
         self.events.append("session-save-start")
         self.update_started.set()

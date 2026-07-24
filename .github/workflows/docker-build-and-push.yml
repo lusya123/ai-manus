@@ -8,7 +8,7 @@ on:
       - custom
     tags:
       - 'v*'
-      - 'deploy-test-20260717-integration-01'
+      - 'deploy-test-20260721-artifact-fix-01'
   pull_request:
     branches:
       - main
@@ -21,6 +21,10 @@ on:
         required: true
         type: boolean
         default: false
+      expected_sha:
+        description: Exact 40-character commit SHA authorized for deployment
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -36,10 +40,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
           cache: npm
@@ -67,7 +71,7 @@ jobs:
 
       - name: Set up Chrome
         id: setup-chrome
-        uses: browser-actions/setup-chrome@v1
+        uses: browser-actions/setup-chrome@c785b87e244131f27c9f19c1a33e2ead956ab7ce # v1
 
       - name: Smoke test production frontend
         working-directory: frontend
@@ -77,7 +81,7 @@ jobs:
 
       - name: Upload smoke failure artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: frontend-smoke-failure
           path: |
@@ -95,15 +99,15 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
@@ -126,15 +130,15 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.10'
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
@@ -144,9 +148,13 @@ jobs:
         working-directory: sandbox
         run: uv sync --frozen
 
-      - name: Run sandbox proxy unit tests
+      - name: Run sandbox unit tests
         working-directory: sandbox
-        run: uv run pytest tests/test_proxy.py
+        run: >-
+          uv run pytest
+          tests/test_proxy.py
+          tests/test_file_service_unit.py
+          tests/test_shell_service_unit.py
 
   build-and-push:
     runs-on: ubuntu-latest
@@ -158,17 +166,17 @@ jobs:
     
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to Docker Hub
         if: github.event_name != 'pull_request' && github.repository == 'Simpleyyt/ai-manus'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -176,19 +184,20 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_REGISTRY }}/manus-${{ matrix.component }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
+            type=ref,event=tag
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: ./${{ matrix.component }}
           file: ./${{ matrix.component }}/Dockerfile
@@ -201,24 +210,25 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Fork-only deployment is deliberately explicit and opt-in. Manual deployment
-  # requires ENABLE_FORK_DEPLOY=true; both paths require SERVER_* secrets. The
-  # exact tag below is a one-time deployment authorization for this integration.
-  # Normal branch and version-tag pushes never contact a server.
+  # Fork-only deployment is deliberately explicit and opt-in. A tag push runs
+  # the complete test/build pipeline but never contacts a server. Deployment
+  # requires a separate workflow_dispatch, an exact ref, an exact SHA and the
+  # repository-level ENABLE_FORK_DEPLOY gate.
   deploy-preflight:
     runs-on: ubuntu-latest
     needs: build-and-push
+    environment: fork-production
     if: >-
       (
         github.event_name == 'workflow_dispatch' &&
         inputs.deploy_fork == true &&
-        (github.ref_name == 'main' || github.ref_name == 'custom') &&
+        (
+          github.ref == 'refs/heads/main' ||
+          github.ref == 'refs/heads/custom' ||
+          github.ref == 'refs/tags/deploy-test-20260721-artifact-fix-01'
+        ) &&
+        inputs.expected_sha == github.sha &&
         vars.ENABLE_FORK_DEPLOY == 'true'
-      ) ||
-      (
-        github.event_name == 'push' &&
-        github.event.created == true &&
-        github.ref == 'refs/tags/deploy-test-20260717-integration-01'
       )
     outputs:
       enabled: ${{ steps.secrets.outputs.enabled }}
@@ -229,13 +239,18 @@ jobs:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
           SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          APPROVED_SHA: ${{ vars.FORK_DEPLOY_APPROVED_SHA }}
         shell: bash
         run: |
+          if [[ ! "$APPROVED_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$APPROVED_SHA" != "$GITHUB_SHA" ]]; then
+            echo "::error::FORK_DEPLOY_APPROVED_SHA does not authorize this immutable commit."
+            exit 1
+          fi
           if [[ -n "$SERVER_HOST" && -n "$SERVER_USER" && -n "$SERVER_PASSWORD" ]]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::Fork deployment is enabled, but one or more SERVER_* secrets are missing."
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::error::Fork deployment was authorized, but one or more SERVER_* secrets are missing."
+            exit 1
           fi
 
   publish-fork-images:
@@ -256,7 +271,7 @@ jobs:
       IMAGE_TAG: sha-${{ github.sha }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Prepare image name
         id: image
@@ -266,17 +281,18 @@ jobs:
           echo "name=${REGISTRY}/${owner}/ai-manus-${{ matrix.component }}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push fork image
-        uses: docker/build-push-action@v5
+        id: build
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: ./${{ matrix.component }}
           file: ./${{ matrix.component }}/Dockerfile
@@ -289,8 +305,29 @@ jobs:
           cache-from: type=gha,scope=fork-${{ matrix.component }}
           cache-to: type=gha,mode=max,scope=fork-${{ matrix.component }}
 
+      - name: Record immutable fork image digest
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Build did not return an immutable image digest."
+            exit 1
+          fi
+          mkdir -p image-digests
+          printf '%s\n' "$IMAGE_DIGEST" > "image-digests/${{ matrix.component }}.txt"
+
+      - name: Upload immutable fork image digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fork-image-digest-${{ matrix.component }}
+          path: image-digests/${{ matrix.component }}.txt
+          if-no-files-found: error
+          retention-days: 7
+
   deploy-fork:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: publish-fork-images
     if: needs.publish-fork-images.result == 'success'
     concurrency:
@@ -307,7 +344,14 @@ jobs:
       FRONTEND_HOST_PORT: ${{ vars.FORK_FRONTEND_HOST_PORT || '18081' }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download immutable fork image digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: fork-image-digest-*
+          path: image-digests
+          merge-multiple: true
 
       - name: Prepare deploy variables
         id: deploy
@@ -315,25 +359,45 @@ jobs:
         run: |
           owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
           echo "owner=${owner}" >> "$GITHUB_OUTPUT"
+          for component in frontend backend sandbox claw mockserver; do
+            digest="$(cat "image-digests/${component}.txt")"
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Invalid immutable digest for ${component}."
+              exit 1
+            fi
+            echo "${component}_image=${REGISTRY}/${owner}/ai-manus-${component}@${digest}" >> "$GITHUB_OUTPUT"
+          done
           compose_b64="$(base64 < docker-compose.yml | tr -d '\n')"
           echo "compose_b64=${compose_b64}" >> "$GITHUB_OUTPUT"
 
       - name: Deploy fork images on server
-        uses: appleboy/ssh-action@v1.0.3
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
         env:
           REGISTRY: ${{ env.REGISTRY }}
           OWNER: ${{ steps.deploy.outputs.owner }}
           IMAGE_TAG: ${{ env.IMAGE_TAG }}
+          FRONTEND_IMAGE: ${{ steps.deploy.outputs.frontend_image }}
+          BACKEND_IMAGE: ${{ steps.deploy.outputs.backend_image }}
+          SANDBOX_IMAGE: ${{ steps.deploy.outputs.sandbox_image }}
+          CLAW_IMAGE: ${{ steps.deploy.outputs.claw_image }}
+          MOCKSERVER_IMAGE: ${{ steps.deploy.outputs.mockserver_image }}
           DEPLOY_PATH: ${{ env.DEPLOY_PATH }}
           FRONTEND_HOST_PORT: ${{ env.FRONTEND_HOST_PORT }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GHCR_USER: ${{ github.actor }}
           COMPOSE_B64: ${{ steps.deploy.outputs.compose_b64 }}
+          DEPLOY_REF: ${{ github.ref }}
+          EXPECTED_SHA: ${{ github.sha }}
+          PUBLIC_HOST: ${{ secrets.SERVER_HOST }}
+          CORE_RESOURCE_PREFIX: manus
+          HOTPATCH_ENABLED: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/tags/deploy-test-20260721-artifact-fix-01' }}
+          HOTPATCH_TARGET: ai-manus-sandbox-ab145dc2
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           password: ${{ secrets.SERVER_PASSWORD }}
-          envs: REGISTRY,OWNER,IMAGE_TAG,DEPLOY_PATH,FRONTEND_HOST_PORT,GHCR_TOKEN,GHCR_USER,COMPOSE_B64
+          command_timeout: 30m
+          envs: REGISTRY,OWNER,IMAGE_TAG,FRONTEND_IMAGE,BACKEND_IMAGE,SANDBOX_IMAGE,CLAW_IMAGE,MOCKSERVER_IMAGE,DEPLOY_PATH,FRONTEND_HOST_PORT,GHCR_TOKEN,GHCR_USER,COMPOSE_B64,DEPLOY_REF,EXPECTED_SHA,PUBLIC_HOST,CORE_RESOURCE_PREFIX,HOTPATCH_ENABLED,HOTPATCH_TARGET
           script: |
             set -eu
             cd "$DEPLOY_PATH"
@@ -345,6 +409,47 @@ jobs:
             had_previous_compose=false
             had_previous_override=false
             changed=false
+            hotpatch_restore_required=false
+            hotpatch_target_id=""
+            hotpatch_source_container=""
+            hotpatch_host_dir=""
+            hotpatch_container_stage=""
+            hotpatch_image=""
+            hotpatch_added_users=""
+            hotpatch_launcher_existed=false
+            hotpatch_reaper_existed=false
+            hotpatch_api_sudoers_existed=false
+            hotpatch_legacy_sudoers_existed=false
+            hotpatch_home_mode=""
+            hotpatch_home_fingerprint_before=""
+            hotpatch_target_fingerprint_before=""
+            hotpatch_old_app_pid=""
+            hotpatch_peer_pids=""
+            mongodb_id_before=""
+            redis_id_before=""
+            registry_docker_config=""
+            hotpatch_files='app/main.py
+            app/services/file.py
+            app/services/shell.py
+            app/schemas/file.py
+            app/schemas/shell.py
+            app/api/v1/file.py'
+
+            if [ "${HOTPATCH_ENABLED:-false}" = true ]; then
+              if [ "$DEPLOY_REF" != \
+                refs/tags/deploy-test-20260721-artifact-fix-01 ] || \
+                [ "$PUBLIC_HOST" != 43.156.115.199 ] || \
+                [ "$FRONTEND_HOST_PORT" != 18081 ] || \
+                [ "$DEPLOY_PATH" != /home/ubuntu/ai-manus ]; then
+                echo "Refusing test-server hotpatch outside its exact authorized target." >&2
+                exit 1
+              fi
+            fi
+            if docker container inspect "$HOTPATCH_TARGET" >/dev/null 2>&1 && \
+              [ "${HOTPATCH_ENABLED:-false}" != true ]; then
+              echo "Refusing deployment while the retained dynamic sandbox exists without an authorized hotpatch." >&2
+              exit 1
+            fi
             if [ -f docker-compose.yml ]; then
               cp docker-compose.yml "$previous_compose"
               had_previous_compose=true
@@ -378,10 +483,1548 @@ jobs:
               fi
             }
 
+            bind_worker_gateway_override() {
+              gateway_override_path="$1"
+              gateway_container_id="$2"
+              python3 - "$gateway_override_path" "$gateway_container_id" <<'PY'
+            import os
+            import re
+            import stat
+            import sys
+            import tempfile
+
+            path = os.path.abspath(sys.argv[1])
+            gateway = sys.argv[2]
+            if not re.fullmatch(r"[0-9a-f]{64}", gateway):
+                raise SystemExit("runtime gateway is not an exact container ID")
+            with open(path, "r", encoding="utf-8") as stream:
+                original = stream.read()
+            pattern = re.compile(
+                r"(?m)^([ \t]*-[ \t]*RUNTIME_GATEWAY_CONTAINER=).*$"
+            )
+            matches = list(pattern.finditer(original))
+            if len(matches) != 1:
+                raise SystemExit(
+                    "worker runtime gateway override is not uniquely replaceable"
+                )
+            updated = pattern.sub(
+                lambda match: match.group(1) + gateway,
+                original,
+                count=1,
+            )
+            source_stat = os.stat(path, follow_symlinks=False)
+            descriptor, temporary = tempfile.mkstemp(
+                prefix=".docker-compose.deploy.gateway.",
+                dir=os.path.dirname(path),
+                text=True,
+            )
+            try:
+                os.fchmod(descriptor, stat.S_IMODE(source_stat.st_mode))
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    descriptor = -1
+                    stream.write(updated)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+                directory = os.open(os.path.dirname(path), os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+            PY
+            }
+
+            if [ "$had_previous_compose" = true ] && \
+              restore_compose config -q >/dev/null 2>&1; then
+              mongodb_id_before="$(restore_compose ps -q mongodb 2>/dev/null || true)"
+              redis_id_before="$(restore_compose ps -q redis 2>/dev/null || true)"
+            fi
+            if [ "${HOTPATCH_ENABLED:-false}" = true ] && \
+              { [ -z "$mongodb_id_before" ] || [ -z "$redis_id_before" ]; }; then
+              echo "Refusing deployment without the existing MongoDB and Redis fingerprints." >&2
+              exit 1
+            fi
+
+            verify_expected_container() {
+              verify_service="$1"
+              verify_image_component="$2"
+              verify_running="$3"
+              verify_id="$(compose ps -aq "$verify_service")"
+              if [ -z "$verify_id" ]; then
+                echo "Compose service ${verify_service} has no container." >&2
+                return 1
+              fi
+              case "$verify_image_component" in
+                frontend) verify_expected_image="$FRONTEND_IMAGE" ;;
+                backend) verify_expected_image="$BACKEND_IMAGE" ;;
+                sandbox) verify_expected_image="$SANDBOX_IMAGE" ;;
+                claw) verify_expected_image="$CLAW_IMAGE" ;;
+                mockserver) verify_expected_image="$MOCKSERVER_IMAGE" ;;
+                *)
+                  echo "Unknown image component: ${verify_image_component}." >&2
+                  return 1
+                  ;;
+              esac
+              verify_expected_digest="${verify_expected_image##*@}"
+              if ! printf '%s\n' "$verify_expected_digest" | \
+                grep -Eq '^sha256:[0-9a-f]{64}$'; then
+                echo "Invalid immutable image reference for ${verify_service}." >&2
+                return 1
+              fi
+              verify_actual_image="$(
+                docker inspect --format '{{.Config.Image}}' "$verify_id"
+              )"
+              verify_revision="$(
+                docker inspect --format \
+                  '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+                  "$verify_id"
+              )"
+              verify_is_running="$(
+                docker inspect --format '{{.State.Running}}' "$verify_id"
+              )"
+              verify_repo_digests="$(
+                docker image inspect --format \
+                  '{{range .RepoDigests}}{{println .}}{{end}}' \
+                  "$verify_expected_image"
+              )"
+              if [ "$verify_actual_image" != "$verify_expected_image" ] || \
+                [ "$verify_revision" != "$EXPECTED_SHA" ] || \
+                [ "$verify_is_running" != "$verify_running" ]; then
+                echo "Unexpected fingerprint for ${verify_service}: image=${verify_actual_image}, revision=${verify_revision}, running=${verify_is_running}." >&2
+                return 1
+              fi
+              if ! printf '%s\n' "$verify_repo_digests" | \
+                grep -Fq "@${verify_expected_digest}"; then
+                echo "Image store lacks the expected RepoDigest for ${verify_service}." >&2
+                return 1
+              fi
+            }
+
+            smoke_frontend_url() {
+              smoke_base_url="$1"
+              smoke_label="$2"
+              smoke_root="$(mktemp)"
+              smoke_chat="$(mktemp)"
+              smoke_config="$(mktemp)"
+              smoke_attempt=1
+              while [ "$smoke_attempt" -le 20 ]; do
+                if curl --fail --silent --show-error \
+                  --connect-timeout 2 --max-time 5 \
+                  "${smoke_base_url}/" > "$smoke_root" && \
+                  grep -Fq '<div id="app"></div>' "$smoke_root" && \
+                  curl --fail --silent --show-error \
+                  --connect-timeout 2 --max-time 5 \
+                  "${smoke_base_url}/chat/aa52b4bb52b84b52" > "$smoke_chat" && \
+                  grep -Fq '<div id="app"></div>' "$smoke_chat" && \
+                  curl --fail --silent --show-error \
+                  --connect-timeout 2 --max-time 5 \
+                  "${smoke_base_url}/api/v1/config/frontend" > "$smoke_config" && \
+                  [ -s "$smoke_config" ]; then
+                  rm -f "$smoke_root" "$smoke_chat" "$smoke_config"
+                  return 0
+                fi
+                smoke_attempt=$((smoke_attempt + 1))
+                sleep 1
+              done
+              rm -f "$smoke_root" "$smoke_chat" "$smoke_config"
+              echo "${smoke_label} frontend smoke failed: ${smoke_base_url}." >&2
+              return 1
+            }
+
+            hotpatch_app_state() {
+              hotpatch_state_output="$(
+                docker exec "$HOTPATCH_TARGET" \
+                  supervisorctl status services:app 2>/dev/null || true
+              )"
+              printf '%s\n' "$hotpatch_state_output" | awk 'NR == 1 { print $2 }'
+            }
+
+            hotpatch_app_pid() {
+              hotpatch_pid_status=0
+              hotpatch_pid_output="$(
+                docker exec "$HOTPATCH_TARGET" \
+                  supervisorctl pid services:app 2>/dev/null
+              )" || hotpatch_pid_status="$?"
+              # supervisorctl intentionally exits non-zero for a known,
+              # quiesced process while still printing the authoritative PID
+              # value 0. Accept only that exact non-zero result; a live PID
+              # still requires a successful supervisorctl command.
+              if [ "$hotpatch_pid_output" = 0 ]; then
+                printf '0\n'
+                return 0
+              fi
+              if [ "$hotpatch_pid_status" -ne 0 ]; then
+                return 1
+              fi
+              printf '%s\n' "$hotpatch_pid_output" | \
+                awk 'NR == 1 && /^[0-9]+$/ { print; found = 1 } END { exit !found }'
+            }
+
+            hotpatch_app_is_quiesced() {
+              if ! hotpatch_quiesced_pid="$(hotpatch_app_pid)"; then
+                return 1
+              fi
+              if [ "$hotpatch_quiesced_pid" = 0 ]; then
+                return 0
+              fi
+              # Treat a reported PID as live while its proc entry exists,
+              # regardless of supervisor's state label. This is deliberately
+              # fail-closed for STARTING/BACKOFF/FATAL/EXITED/UNKNOWN states.
+              if docker exec -u 0 "$HOTPATCH_TARGET" \
+                test -e "/proc/${hotpatch_quiesced_pid}"; then
+                return 1
+              fi
+              return 0
+            }
+
+            stop_hotpatch_app() {
+              if hotpatch_app_is_quiesced; then
+                return 0
+              fi
+              timeout 25s docker exec "$HOTPATCH_TARGET" \
+                supervisorctl stop services:app >/dev/null 2>&1 || true
+              if ! hotpatch_app_is_quiesced; then
+                echo "Dynamic sandbox services:app retained a live supervisor PID after stop." >&2
+                return 1
+              fi
+            }
+
+            wait_for_hotpatch_health() {
+              hotpatch_health_attempt=1
+              while [ "$hotpatch_health_attempt" -le 20 ]; do
+                if docker exec "$HOTPATCH_TARGET" \
+                  curl --fail --silent --show-error \
+                    --connect-timeout 1 --max-time 2 \
+                    http://127.0.0.1:8080/openapi.json >/dev/null 2>&1; then
+                  return 0
+                fi
+                hotpatch_health_attempt=$((hotpatch_health_attempt + 1))
+                sleep 1
+              done
+              echo "Dynamic sandbox FastAPI health check failed." >&2
+              return 1
+            }
+
+            snapshot_hotpatch_peer_processes() {
+              if ! hotpatch_supervisor_status="$(
+                docker exec "$HOTPATCH_TARGET" supervisorctl status 2>/dev/null
+              )"; then
+                return 1
+              fi
+              printf '%s\n' "$hotpatch_supervisor_status" | awk '
+                $1 != "services:app" {
+                  pid = "-"
+                  if ($3 == "pid") {
+                    pid = $4
+                    sub(/,$/, "", pid)
+                  }
+                  print $1, $2, pid
+                }
+              ' | LC_ALL=C sort
+            }
+
+            legacy_app_process_guard() {
+              legacy_guard_action="$1"
+              docker exec -i -u 0 \
+                -e "LEGACY_GUARD_ACTION=${legacy_guard_action}" \
+                -e "LEGACY_APP_PID=${hotpatch_old_app_pid}" \
+                -e "LEGACY_PEER_PIDS=${hotpatch_peer_pids}" \
+                -e "LEGACY_SNAPSHOT=${hotpatch_container_stage}/legacy-processes.json" \
+                "$HOTPATCH_TARGET" /usr/bin/python3 - \
+                <<'LEGACY_PROCESS_GUARD_PY'
+            import json
+            import hashlib
+            import os
+            import signal
+            import sys
+            import time
+
+            ACTION = os.environ["LEGACY_GUARD_ACTION"]
+            APP_PID = int(os.environ["LEGACY_APP_PID"])
+            SNAPSHOT = os.environ["LEGACY_SNAPSHOT"]
+            PEER_PIDS = {
+                int(value)
+                for value in os.environ.get("LEGACY_PEER_PIDS", "").split(",")
+                if value
+            }
+
+
+            def identity(pid: int):
+                if pid <= 1:
+                    return None
+                try:
+                    with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as stream:
+                        raw_stat = stream.read()
+                    fields = raw_stat[raw_stat.rfind(")") + 2 :].split()
+                    with open(f"/proc/{pid}/status", "r", encoding="utf-8") as stream:
+                        effective_uid = None
+                        for line in stream:
+                            if line.startswith("Uid:"):
+                                effective_uid = int(line.split()[2])
+                                break
+                    with open(f"/proc/{pid}/cmdline", "rb") as stream:
+                        raw_cmdline = stream.read()
+                    with open(f"/proc/{pid}/cgroup", "rb") as stream:
+                        raw_cgroup = stream.read()
+                    if effective_uid is None:
+                        return None
+                    return {
+                        "pid": pid,
+                        "state": fields[0],
+                        "ppid": int(fields[1]),
+                        "pgrp": int(fields[2]),
+                        "session": int(fields[3]),
+                        "starttime": int(fields[19]),
+                        "euid": effective_uid,
+                        # Keep command contents out of CI logs and staging
+                        # artifacts while retaining exact exec/cgroup
+                        # fingerprints for every later signal.
+                        "cmdline": hashlib.sha256(raw_cmdline).hexdigest(),
+                        "cgroup": hashlib.sha256(raw_cgroup).hexdigest(),
+                    }
+                except (FileNotFoundError, PermissionError, ProcessLookupError, OSError, ValueError, IndexError):
+                    return None
+
+
+            def scan():
+                result = {}
+                try:
+                    entries = os.scandir("/proc")
+                except OSError as exc:
+                    raise RuntimeError("cannot scan /proc") from exc
+                with entries:
+                    for entry in entries:
+                        if not entry.name.isdigit():
+                            continue
+                        record = identity(int(entry.name))
+                        if record is not None:
+                            result[record["pid"]] = record
+                return result
+
+
+            def same_process(record, *, allow_zombie=True):
+                current = identity(record["pid"])
+                if current is None:
+                    return None
+                if (
+                    current["starttime"] != record["starttime"]
+                    or current["cgroup"] != record["cgroup"]
+                ):
+                    return None
+                if not allow_zombie and current["state"] == "Z":
+                    return None
+                return current
+
+
+            def same_attributed_process(record, *, allow_zombie=True):
+                current = same_process(record, allow_zombie=allow_zombie)
+                if current is None:
+                    return None
+                if (
+                    current["euid"] != record["euid"]
+                    or current["cmdline"] != record["cmdline"]
+                ):
+                    return None
+                return current
+
+
+            def send_exact(record, signum, *, require_attribution=False):
+                matcher = (
+                    same_attributed_process if require_attribution else same_process
+                )
+                if matcher(record, allow_zombie=False) is None:
+                    return False
+                pid = record["pid"]
+                if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
+                    try:
+                        descriptor = os.pidfd_open(pid, 0)
+                    except ProcessLookupError:
+                        return False
+                    try:
+                        if matcher(record, allow_zombie=False) is None:
+                            return False
+                        signal.pidfd_send_signal(descriptor, signum, None, 0)
+                        return True
+                    except ProcessLookupError:
+                        return False
+                    finally:
+                        os.close(descriptor)
+                if matcher(record, allow_zombie=False) is None:
+                    return False
+                try:
+                    os.kill(pid, signum)
+                    return True
+                except ProcessLookupError:
+                    return False
+
+
+            def descendants(processes, root_pid):
+                owned = {root_pid}
+                changed = True
+                while changed:
+                    changed = False
+                    for record in processes.values():
+                        if record["pid"] not in owned and record["ppid"] in owned:
+                            owned.add(record["pid"])
+                            changed = True
+                owned.discard(root_pid)
+                return owned
+
+
+            def protected_peer_tree(processes):
+                protected = set(PEER_PIDS)
+                changed = True
+                while changed:
+                    changed = False
+                    for record in processes.values():
+                        if (
+                            record["pid"] not in protected
+                            and record["ppid"] in protected
+                        ):
+                            protected.add(record["pid"])
+                            changed = True
+                return protected
+
+
+            def classify_legacy_candidates(processes, app):
+                app_owned = descendants(processes, APP_PID)
+                protected = protected_peer_tree(processes)
+                if APP_PID in protected or app_owned.intersection(protected):
+                    raise RuntimeError("an app process overlapped a supervisor peer tree")
+                candidates = {}
+                for pid in sorted(app_owned):
+                    record = processes[pid]
+                    if record["state"] == "Z":
+                        continue
+                    if record["euid"] != app["euid"]:
+                        raise RuntimeError(
+                            f"refusing unexpected-EUID app descendant: {pid}"
+                        )
+                    candidates[pid] = (record, "app-descendant")
+
+                # The legacy shell implementation ran arbitrary commands as
+                # the app's UID. A killed shell wrapper could leave its child
+                # reparented to PID 1, outside APP_PID's tree. Backend and
+                # worker are stopped before this guard runs; after protecting
+                # every supervisor peer and its complete descendant tree, any
+                # remaining non-zombie EUID-1000 process is an unmanaged
+                # process. Only the old app's cgroup + process-group/session
+                # execution context is attributable to a reparented legacy
+                # shell. Any other EUID-1000 orphan makes the deployment fail
+                # closed instead of risking a false-positive kill. Record and
+                # signal each exact process object; never issue a UID-wide or
+                # group-wide signal.
+                ambiguous = []
+                for pid, record in processes.items():
+                    if (
+                        pid != APP_PID
+                        and pid not in app_owned
+                        and pid not in protected
+                        and record["state"] != "Z"
+                        and record["euid"] == app["euid"]
+                    ):
+                        if (
+                            record["cgroup"] == app["cgroup"]
+                            and record["pgrp"] == app["pgrp"]
+                            and record["session"] == app["session"]
+                        ):
+                            candidates[pid] = (record, "legacy-orphan")
+                        else:
+                            ambiguous.append(pid)
+                if ambiguous:
+                    raise RuntimeError(
+                        "refusing ambiguous unmanaged EUID-1000 processes: "
+                        + ",".join(str(pid) for pid in sorted(ambiguous))
+                    )
+                return candidates, protected
+
+
+            def freeze_exact(record, origin):
+                current = same_attributed_process(record, allow_zombie=False)
+                if current is None:
+                    return None
+                guarded = dict(record)
+                guarded["origin"] = origin
+                guarded["stopped_by_guard"] = current["state"] not in {"T", "t"}
+                if guarded["stopped_by_guard"] and not send_exact(
+                    record, signal.SIGSTOP, require_attribution=True
+                ):
+                    return None
+                deadline = time.monotonic() + 0.5
+                while time.monotonic() < deadline:
+                    stopped = same_process(guarded, allow_zombie=False)
+                    if stopped is None:
+                        return None
+                    if stopped["state"] in {"T", "t"}:
+                        return guarded
+                    time.sleep(0.01)
+                raise RuntimeError(
+                    f"fingerprinted {origin} did not stop: {record['pid']}"
+                )
+
+
+            def verify_peers(peer_records):
+                for record in peer_records:
+                    current = same_attributed_process(record, allow_zombie=False)
+                    if current is None:
+                        raise RuntimeError(
+                            f"supervisor peer identity changed: {record['pid']}"
+                        )
+
+
+            if ACTION == "snapshot-freeze":
+                app = identity(APP_PID)
+                if app is None or app["state"] == "Z" or app["euid"] != 1000:
+                    raise RuntimeError("legacy app PID is absent or has an unexpected EUID")
+                processes = scan()
+                peer_records = []
+                for peer_pid in sorted(PEER_PIDS):
+                    peer = processes.get(peer_pid)
+                    if peer is None or peer["state"] == "Z":
+                        raise RuntimeError(f"supervisor peer is absent: {peer_pid}")
+                    peer_records.append(peer)
+
+                frozen = {}
+                app_frozen = None
+                stable_passes = 0
+                try:
+                    for _ in range(12):
+                        processes = scan()
+                        current_app = processes.get(APP_PID)
+                        if (
+                            current_app is None
+                            or current_app["starttime"] != app["starttime"]
+                            or current_app["euid"] != app["euid"]
+                        ):
+                            raise RuntimeError("legacy app identity changed during snapshot")
+                        candidates, _ = classify_legacy_candidates(processes, app)
+                        new_candidates = [
+                            candidate
+                            for pid, candidate in sorted(candidates.items())
+                            if pid not in frozen
+                        ]
+                        for record, origin in new_candidates:
+                            guarded_record = freeze_exact(record, origin)
+                            if guarded_record is not None:
+                                frozen[record["pid"]] = guarded_record
+                        if new_candidates:
+                            stable_passes = 0
+                        else:
+                            stable_passes += 1
+                            if stable_passes >= 2:
+                                break
+                        time.sleep(0.05)
+                    else:
+                        raise RuntimeError("legacy process set did not stabilize")
+                    verify_peers(peer_records)
+                    app_frozen = freeze_exact(app, "app-root")
+                    if app_frozen is None:
+                        raise RuntimeError("could not freeze the fingerprinted legacy app")
+
+                    # The app root is now frozen, and all previously observed
+                    # descendants/orphans are frozen. A final bounded rescan
+                    # closes the last-scan-to-supervisor-stop fork window.
+                    stable_passes = 0
+                    protected = set()
+                    for _ in range(8):
+                        processes = scan()
+                        current_app = processes.get(APP_PID)
+                        if (
+                            current_app is None
+                            or current_app["starttime"] != app["starttime"]
+                            or current_app["euid"] != app["euid"]
+                            or current_app["state"] not in {"T", "t"}
+                        ):
+                            raise RuntimeError("frozen legacy app identity changed")
+                        candidates, protected = classify_legacy_candidates(
+                            processes, app
+                        )
+                        new_candidates = [
+                            candidate
+                            for pid, candidate in sorted(candidates.items())
+                            if pid not in frozen
+                        ]
+                        for record, origin in new_candidates:
+                            guarded_record = freeze_exact(record, origin)
+                            if guarded_record is not None:
+                                frozen[record["pid"]] = guarded_record
+                        if new_candidates:
+                            stable_passes = 0
+                        else:
+                            stable_passes += 1
+                            if stable_passes >= 2:
+                                break
+                        time.sleep(0.03)
+                    else:
+                        raise RuntimeError("post-freeze descendant set did not stabilize")
+                    verify_peers(peer_records)
+                    payload = {
+                        "app": app_frozen,
+                        "app_stopped_by_guard": app_frozen["stopped_by_guard"],
+                        "peers": peer_records,
+                        "protected_peer_processes": [
+                            processes[pid]
+                            for pid in sorted(protected)
+                            if pid in processes
+                        ],
+                        # pgrp/session are audit fingerprints only. Cleanup
+                        # always targets exact PIDs and never killpg/UID scans.
+                        "processes": list(frozen.values()),
+                    }
+                    temporary = SNAPSHOT + ".tmp"
+                    with open(temporary, "w", encoding="utf-8") as stream:
+                        json.dump(payload, stream, sort_keys=True)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temporary, SNAPSHOT)
+                except BaseException:
+                    for record in frozen.values():
+                        if record.get("stopped_by_guard", False):
+                            send_exact(record, signal.SIGCONT)
+                    if app_frozen is not None and app_frozen.get(
+                        "stopped_by_guard", False
+                    ):
+                        send_exact(app, signal.SIGCONT)
+                    raise
+            else:
+                if not os.path.exists(SNAPSHOT):
+                    raise SystemExit(0)
+                with open(SNAPSHOT, "r", encoding="utf-8") as stream:
+                    payload = json.load(stream)
+                records = payload.get("processes", [])
+                peer_records = payload.get("peers", [])
+                verify_peers(peer_records)
+
+                if ACTION == "resume":
+                    if payload.get("app_stopped_by_guard", False):
+                        send_exact(payload["app"], signal.SIGCONT)
+                    for record in records:
+                        if record.get("stopped_by_guard", False):
+                            send_exact(record, signal.SIGCONT)
+                    verify_peers(peer_records)
+                elif ACTION == "cleanup":
+                    current_app = same_process(payload["app"], allow_zombie=False)
+                    if current_app is not None:
+                        raise RuntimeError("refusing cleanup while legacy app is still running")
+                    # Every attributed legacy process was already frozen while
+                    # the app root could no longer fork. Do not deliver TERM
+                    # or CONT: either would run user-controlled trap handlers
+                    # that could exec, fork, or double-fork a new unrecorded
+                    # process. Kill the exact pidfd/starttime+cgroup identity
+                    # directly, then verify that every record disappeared.
+                    for record in records:
+                        send_exact(record, signal.SIGKILL)
+                    deadline = time.monotonic() + 2.0
+                    while time.monotonic() < deadline:
+                        survivors = [
+                            record
+                            for record in records
+                            if same_process(record, allow_zombie=False) is not None
+                        ]
+                        if not survivors:
+                            break
+                        time.sleep(0.05)
+                    else:
+                        raise RuntimeError(
+                            "legacy app descendants survived exact PID cleanup"
+                        )
+                    verify_peers(peer_records)
+                else:
+                    raise RuntimeError(f"unknown legacy guard action: {ACTION}")
+            LEGACY_PROCESS_GUARD_PY
+            }
+
+            cleanup_hotpatch_source_container() {
+              if [ -z "$hotpatch_source_container" ]; then
+                return 0
+              fi
+              if ! docker rm "$hotpatch_source_container" >/dev/null 2>&1; then
+                echo "Could not remove the stopped hotpatch source container." >&2
+                return 1
+              fi
+              hotpatch_source_container=""
+            }
+
+            compile_hotpatch_tree() {
+              hotpatch_compile_root="$1"
+              while IFS= read -r hotpatch_relative_path; do
+                if ! docker exec -u 0 \
+                  -e "PYTHONPYCACHEPREFIX=${hotpatch_container_stage}/pycache" \
+                  "$HOTPATCH_TARGET" \
+                  /app/.venv/bin/python -m py_compile \
+                  "${hotpatch_compile_root}/${hotpatch_relative_path}"; then
+                  echo "py_compile failed for ${hotpatch_relative_path}." >&2
+                  return 1
+                fi
+              done <<HOTPATCH_FILE_LIST
+            $hotpatch_files
+            HOTPATCH_FILE_LIST
+            }
+
+            install_hotpatch_tree() {
+              hotpatch_source_root="$1"
+              while IFS= read -r hotpatch_relative_path; do
+                hotpatch_source_path="${hotpatch_source_root}/${hotpatch_relative_path}"
+                hotpatch_destination_path="/app/${hotpatch_relative_path}"
+                if ! docker exec -u 0 \
+                  -e "SOURCE_PATH=${hotpatch_source_path}" \
+                  -e "DESTINATION_PATH=${hotpatch_destination_path}" \
+                  "$HOTPATCH_TARGET" /bin/sh -ceu '
+                    [ -f "$SOURCE_PATH" ]
+                    [ ! -L "$SOURCE_PATH" ]
+                    [ -f "$DESTINATION_PATH" ]
+                    [ ! -L "$DESTINATION_PATH" ]
+                    destination_uid="$(stat -c %u "$DESTINATION_PATH")"
+                    destination_gid="$(stat -c %g "$DESTINATION_PATH")"
+                    destination_mode="$(stat -c %a "$DESTINATION_PATH")"
+                    temporary="$(mktemp "${DESTINATION_PATH}.hotpatch.XXXXXX")"
+                    cleanup() {
+                      if [ -n "${temporary:-}" ]; then
+                        rm -f -- "$temporary"
+                      fi
+                    }
+                    trap cleanup EXIT HUP INT TERM
+                    install \
+                      -o "$destination_uid" \
+                      -g "$destination_gid" \
+                      -m "$destination_mode" \
+                      "$SOURCE_PATH" "$temporary"
+                    mv -f -- "$temporary" "$DESTINATION_PATH"
+                    temporary=""
+                    trap - EXIT HUP INT TERM
+                  '; then
+                  echo "Atomic install failed for ${hotpatch_relative_path}." >&2
+                  return 1
+                fi
+              done <<HOTPATCH_FILE_LIST
+            $hotpatch_files
+            HOTPATCH_FILE_LIST
+            }
+
+            verify_hotpatch_hashes() {
+              hotpatch_hash_source_root="$1"
+              while IFS= read -r hotpatch_relative_path; do
+                hotpatch_expected_hash="$(
+                  sha256sum "${hotpatch_hash_source_root}/${hotpatch_relative_path}" |
+                    awk '{ print $1 }'
+                )"
+                hotpatch_actual_hash="$(
+                  docker exec "$HOTPATCH_TARGET" \
+                    sha256sum "/app/${hotpatch_relative_path}" |
+                    awk '{ print $1 }'
+                )"
+                if [ "$hotpatch_actual_hash" != "$hotpatch_expected_hash" ]; then
+                  echo "Hash mismatch for ${hotpatch_relative_path}." >&2
+                  return 1
+                fi
+              done <<HOTPATCH_FILE_LIST
+            $hotpatch_files
+            HOTPATCH_FILE_LIST
+            }
+
+            hotpatch_target_fingerprint() {
+              docker inspect --format \
+                '{{.Id}}|{{.Image}}|{{.HostConfig.AutoRemove}}|{{json .Mounts}}|{{json .NetworkSettings.Networks}}' \
+                "$HOTPATCH_TARGET"
+            }
+
+            hotpatch_home_fingerprint() {
+              docker exec -u 0 "$HOTPATCH_TARGET" /bin/bash -ceu -o pipefail '
+                cd /home/ubuntu
+                maximum_entries=200000
+                maximum_fields=$(( (maximum_entries + 1) * 7 ))
+                snapshot="$(mktemp /tmp/manus-home-fingerprint.XXXXXX)"
+                cleanup() { rm -f -- "$snapshot"; }
+                trap cleanup EXIT HUP INT TERM
+                set +e
+                LC_ALL=C timeout 30s find . -mindepth 1 -xdev \
+                  -printf "%P\0%y\0%s\0%T@\0%u\0%g\0%m\0" |
+                  head -z -n "$maximum_fields" > "$snapshot"
+                pipeline_status=("${PIPESTATUS[@]}")
+                set -e
+                if [ "${pipeline_status[1]}" -ne 0 ]; then
+                  echo "Could not bound the dynamic sandbox home fingerprint." >&2
+                  exit 1
+                fi
+                case "${pipeline_status[0]}" in
+                  0|141) ;;
+                  124)
+                    echo "Dynamic sandbox home fingerprint exceeded 30 seconds." >&2
+                    exit 1
+                    ;;
+                  *)
+                    echo "Dynamic sandbox home fingerprint scan failed." >&2
+                    exit 1
+                    ;;
+                esac
+                field_count="$(tr -cd "\\000" < "$snapshot" | wc -c)"
+                if [ "$field_count" -gt $((maximum_entries * 7)) ]; then
+                  echo "Dynamic sandbox home fingerprint exceeded ${maximum_entries} entries." >&2
+                  exit 1
+                fi
+                LC_ALL=C sort -z "$snapshot" |
+                  sha256sum |
+                  awk "{ print \$1 }"
+              '
+            }
+
+            cleanup_registry_login() {
+              if [ -z "$registry_docker_config" ]; then
+                return 0
+              fi
+              DOCKER_CONFIG="$registry_docker_config" \
+                docker logout "$REGISTRY" >/dev/null 2>&1 || true
+              case "$registry_docker_config" in
+                /tmp/ai-manus-registry.*)
+                  rm -rf -- "$registry_docker_config"
+                  ;;
+                *)
+                  echo "Refusing to remove an unexpected Docker credential directory." >&2
+                  return 1
+                  ;;
+              esac
+              registry_docker_config=""
+              unset DOCKER_CONFIG
+            }
+
+            restore_hotpatch_system_file() {
+              hotpatch_restore_existed="$1"
+              hotpatch_restore_source="$2"
+              hotpatch_restore_destination="$3"
+              hotpatch_restore_mode="$4"
+              if [ "$hotpatch_restore_existed" != true ]; then
+                docker exec -u 0 "$HOTPATCH_TARGET" \
+                  rm -f -- "$hotpatch_restore_destination"
+                return 0
+              fi
+              docker exec -u 0 \
+                -e "SOURCE_PATH=${hotpatch_restore_source}" \
+                -e "DESTINATION_PATH=${hotpatch_restore_destination}" \
+                -e "DESTINATION_MODE=${hotpatch_restore_mode}" \
+                "$HOTPATCH_TARGET" /bin/sh -ceu '
+                  [ -f "$SOURCE_PATH" ]
+                  [ ! -L "$SOURCE_PATH" ]
+                  temporary="$(mktemp "${DESTINATION_PATH}.restore.XXXXXX")"
+                  trap '\''rm -f -- "$temporary"'\'' EXIT HUP INT TERM
+                  install -o root -g root -m "$DESTINATION_MODE" \
+                    "$SOURCE_PATH" "$temporary"
+                  mv -f -- "$temporary" "$DESTINATION_PATH"
+                  trap - EXIT HUP INT TERM
+                '
+            }
+
+            restore_hotpatch_system_state() {
+              # Reap only the exact per-command UIDs before removing accounts
+              # or helpers. This cannot target the app, browser, or user files.
+              if docker exec -u 0 "$HOTPATCH_TARGET" \
+                test -x /usr/local/sbin/manus-shell-reaper; then
+                # Numeric UIDs are accepted by both the legacy and new
+                # helper, so rollback also works after a partial helper
+                # install that failed before replacing an existing reaper.
+                docker exec -u 0 "$HOTPATCH_TARGET" /bin/sh -ceu '
+                  reap_uid=20000
+                  while [ "$reap_uid" -le 20063 ]; do
+                    /usr/local/sbin/manus-shell-reaper \
+                      "$reap_uid" >/dev/null 2>&1
+                    reap_uid=$((reap_uid + 1))
+                  done
+                '
+              fi
+
+              restore_hotpatch_system_file \
+                "$hotpatch_launcher_existed" \
+                "${hotpatch_container_stage}/backup-system/manus-shell-launcher" \
+                /usr/local/sbin/manus-shell-launcher \
+                0755
+              restore_hotpatch_system_file \
+                "$hotpatch_reaper_existed" \
+                "${hotpatch_container_stage}/backup-system/manus-shell-reaper" \
+                /usr/local/sbin/manus-shell-reaper \
+                0755
+              restore_hotpatch_system_file \
+                "$hotpatch_api_sudoers_existed" \
+                "${hotpatch_container_stage}/backup-system/manus-api" \
+                /etc/sudoers.d/manus-api \
+                0440
+              restore_hotpatch_system_file \
+                "$hotpatch_legacy_sudoers_existed" \
+                "${hotpatch_container_stage}/backup-system/ubuntu" \
+                /etc/sudoers.d/ubuntu \
+                0440
+
+              docker exec -u 0 \
+                -e "ADDED_USERS=${hotpatch_added_users}" \
+                "$HOTPATCH_TARGET" /bin/sh -ceu '
+                  for added_user in $ADDED_USERS; do
+                    userdel "$added_user"
+                  done
+                '
+              docker exec -u 0 "$HOTPATCH_TARGET" \
+                chmod "00${hotpatch_home_mode}" /home/ubuntu
+              docker exec -u 0 "$HOTPATCH_TARGET" visudo -c >/dev/null
+            }
+
+            install_hotpatch_system_state() {
+              docker exec -u 0 \
+                -e "STAGE=${hotpatch_container_stage}/new-system" \
+                "$HOTPATCH_TARGET" /bin/sh -ceu '
+                  [ "$(getent group ubuntu | cut -d: -f3)" = 1000 ]
+                  [ -f "$STAGE/manus-shell-launcher" ]
+                  [ -f "$STAGE/manus-shell-reaper" ]
+                  [ -f "$STAGE/manus-api" ]
+                  [ ! -L "$STAGE/manus-shell-launcher" ]
+                  [ ! -L "$STAGE/manus-shell-reaper" ]
+                  [ ! -L "$STAGE/manus-api" ]
+                  visudo -cf "$STAGE/manus-api" >/dev/null
+                '
+
+              hotpatch_slot=0
+              while [ "$hotpatch_slot" -lt 64 ]; do
+                hotpatch_user="manus-shell-${hotpatch_slot}"
+                hotpatch_uid=$((20000 + hotpatch_slot))
+                if docker exec -u 0 "$HOTPATCH_TARGET" \
+                  getent passwd "$hotpatch_user" >/dev/null; then
+                  docker exec -u 0 \
+                    -e "EXPECTED_NAME=${hotpatch_user}" \
+                    -e "EXPECTED_UID=${hotpatch_uid}" \
+                    "$HOTPATCH_TARGET" /bin/sh -ceu '
+                      entry="$(getent passwd "$EXPECTED_NAME")"
+                      [ "$(printf "%s" "$entry" | cut -d: -f3)" = "$EXPECTED_UID" ]
+                      [ "$(printf "%s" "$entry" | cut -d: -f4)" = 1000 ]
+                      [ "$(printf "%s" "$entry" | cut -d: -f6)" = /home/ubuntu ]
+                      [ "$(printf "%s" "$entry" | cut -d: -f7)" = /bin/bash ]
+                    '
+                else
+                  if docker exec -u 0 "$HOTPATCH_TARGET" \
+                    getent passwd "$hotpatch_uid" >/dev/null; then
+                    echo "UID ${hotpatch_uid} is already owned by another account." >&2
+                    return 1
+                  fi
+                  docker exec -u 0 "$HOTPATCH_TARGET" \
+                    useradd -M -u "$hotpatch_uid" -g ubuntu \
+                      -d /home/ubuntu -s /bin/bash "$hotpatch_user"
+                  hotpatch_added_users="${hotpatch_added_users} ${hotpatch_user}"
+                fi
+                hotpatch_slot=$((hotpatch_slot + 1))
+              done
+
+              docker exec -u 0 \
+                -e "STAGE=${hotpatch_container_stage}/new-system" \
+                "$HOTPATCH_TARGET" /bin/sh -ceu '
+                  install_atomic() {
+                    source_path="$1"
+                    destination_path="$2"
+                    mode="$3"
+                    temporary="$(mktemp "${destination_path}.hotpatch.XXXXXX")"
+                    install -o root -g root -m "$mode" \
+                      "$source_path" "$temporary"
+                    mv -f -- "$temporary" "$destination_path"
+                  }
+                  install_atomic "$STAGE/manus-shell-launcher" \
+                    /usr/local/sbin/manus-shell-launcher 0755
+                  install_atomic "$STAGE/manus-shell-reaper" \
+                    /usr/local/sbin/manus-shell-reaper 0755
+                  install_atomic "$STAGE/manus-api" \
+                    /etc/sudoers.d/manus-api 0440
+                  rm -f /etc/sudoers.d/ubuntu
+                  chmod 2775 /home/ubuntu
+                  visudo -c >/dev/null
+                '
+            }
+
+            verify_hotpatch_system_state() {
+              hotpatch_slot=0
+              while [ "$hotpatch_slot" -lt 64 ]; do
+                hotpatch_uid=$((20000 + hotpatch_slot))
+                hotpatch_user="manus-shell-${hotpatch_slot}"
+                hotpatch_entry="$({
+                  docker exec -u 0 "$HOTPATCH_TARGET" \
+                    getent passwd "$hotpatch_user"
+                })"
+                if [ "$(printf '%s' "$hotpatch_entry" | cut -d: -f3-4)" != \
+                  "${hotpatch_uid}:1000" ]; then
+                  echo "Invalid isolated shell account: ${hotpatch_user}." >&2
+                  return 1
+                fi
+                hotpatch_slot=$((hotpatch_slot + 1))
+              done
+              for hotpatch_asset in manus-shell-launcher manus-shell-reaper; do
+                hotpatch_expected_hash="$({
+                  sha256sum "${hotpatch_host_dir}/new-system/${hotpatch_asset}"
+                } | awk '{ print $1 }')"
+                hotpatch_actual_hash="$({
+                  docker exec "$HOTPATCH_TARGET" sha256sum \
+                    "/usr/local/sbin/${hotpatch_asset}"
+                } | awk '{ print $1 }')"
+                [ "$hotpatch_actual_hash" = "$hotpatch_expected_hash" ] || return 1
+              done
+              hotpatch_expected_hash="$({
+                sha256sum "${hotpatch_host_dir}/new-system/manus-api"
+              } | awk '{ print $1 }')"
+              hotpatch_actual_hash="$({
+                docker exec "$HOTPATCH_TARGET" sha256sum \
+                  /etc/sudoers.d/manus-api
+              } | awk '{ print $1 }')"
+              [ "$hotpatch_actual_hash" = "$hotpatch_expected_hash" ]
+              ! docker exec -u 0 "$HOTPATCH_TARGET" \
+                test -e /etc/sudoers.d/ubuntu
+              docker exec -u 0 "$HOTPATCH_TARGET" visudo -c >/dev/null
+              docker exec -u ubuntu "$HOTPATCH_TARGET" sudo -n \
+                /usr/local/sbin/manus-shell-launcher 20000 \
+                /bin/sh -c '[ "$(id -u)" -eq 20000 ]'
+              if docker exec -u 20000 "$HOTPATCH_TARGET" \
+                sudo -n true >/dev/null 2>&1; then
+                echo "Isolated model shell unexpectedly retained sudo access." >&2
+                return 1
+              fi
+            }
+
+            import_hotpatch_runtime() {
+              docker exec -u ubuntu \
+                -e PYTHONDONTWRITEBYTECODE=1 \
+                "$HOTPATCH_TARGET" /app/.venv/bin/python -c \
+                'import app.main, app.api.v1.file, app.schemas.file, app.schemas.shell, app.services.file, app.services.shell'
+            }
+
+            ensure_hotpatch_app_ready() {
+              hotpatch_ready_attempt=1
+              while [ "$hotpatch_ready_attempt" -le 3 ]; do
+                if [ "$(hotpatch_app_state)" != RUNNING ]; then
+                  docker exec "$HOTPATCH_TARGET" \
+                    supervisorctl start services:app >/dev/null 2>&1 || true
+                fi
+                if [ "$(hotpatch_app_state)" = RUNNING ] && \
+                  wait_for_hotpatch_health; then
+                  return 0
+                fi
+                if [ "$hotpatch_ready_attempt" -lt 3 ]; then
+                  timeout 25s docker exec "$HOTPATCH_TARGET" \
+                    supervisorctl stop services:app >/dev/null 2>&1 || true
+                fi
+                hotpatch_ready_attempt=$((hotpatch_ready_attempt + 1))
+              done
+              echo "Dynamic sandbox app could not be made healthy after three bounded attempts." >&2
+              return 1
+            }
+
+            restore_dynamic_sandbox_hotpatch() {
+              if [ "$hotpatch_restore_required" != true ]; then
+                return 0
+              fi
+              hotpatch_current_id="$(
+                docker inspect --format '{{.Id}}' "$HOTPATCH_TARGET" 2>/dev/null || true
+              )"
+              if [ -z "$hotpatch_current_id" ] || \
+                [ "$hotpatch_current_id" != "$hotpatch_target_id" ]; then
+                echo "Cannot restore hotpatch: the exact dynamic container changed or disappeared." >&2
+                return 1
+              fi
+              restore_errors=""
+              restore_had_failure=false
+              old_candidate_ok=true
+              legacy_cleanup_ok=true
+              app_ready=false
+
+              record_restore_failure() {
+                restore_had_failure=true
+                if [ -n "$restore_errors" ]; then
+                  restore_errors="${restore_errors}; $1"
+                else
+                  restore_errors="$1"
+                fi
+                echo "Dynamic sandbox rollback step failed: $1" >&2
+              }
+
+              if ! docker exec -u 0 "$HOTPATCH_TARGET" \
+                mkdir -p \
+                  "${hotpatch_container_stage}/backup" \
+                  "${hotpatch_container_stage}/backup-system"; then
+                record_restore_failure "prepare backup staging"
+                old_candidate_ok=false
+              fi
+              if ! docker cp "${hotpatch_host_dir}/backup/." \
+                "${HOTPATCH_TARGET}:${hotpatch_container_stage}/backup/"; then
+                record_restore_failure "copy application backup"
+                old_candidate_ok=false
+              fi
+              if ! docker cp "${hotpatch_host_dir}/backup-system/." \
+                "${HOTPATCH_TARGET}:${hotpatch_container_stage}/backup-system/"; then
+                record_restore_failure "copy system backup"
+                old_candidate_ok=false
+              fi
+
+              if ! stop_hotpatch_app; then
+                record_restore_failure "stop services:app before restore"
+                old_candidate_ok=false
+                legacy_cleanup_ok=false
+              fi
+
+              if hotpatch_app_is_quiesced; then
+                if ! legacy_app_process_guard cleanup; then
+                  record_restore_failure "clean fingerprinted legacy descendants"
+                  old_candidate_ok=false
+                  legacy_cleanup_ok=false
+                  if ! legacy_app_process_guard resume; then
+                    record_restore_failure "resume fingerprinted legacy descendants"
+                  fi
+                fi
+              else
+                if ! legacy_app_process_guard resume; then
+                  record_restore_failure "resume descendants after failed app stop"
+                fi
+              fi
+
+              if hotpatch_app_is_quiesced && \
+                [ "$old_candidate_ok" = true ]; then
+                if ! install_hotpatch_tree "${hotpatch_container_stage}/backup"; then
+                  record_restore_failure "install application backup"
+                  old_candidate_ok=false
+                fi
+                if ! verify_hotpatch_hashes "${hotpatch_host_dir}/backup"; then
+                  record_restore_failure "verify application backup"
+                  old_candidate_ok=false
+                fi
+                if ! restore_hotpatch_system_state; then
+                  record_restore_failure "restore helper, account, and sudo state"
+                  old_candidate_ok=false
+                fi
+                if ! compile_hotpatch_tree /app; then
+                  record_restore_failure "compile restored application"
+                  old_candidate_ok=false
+                fi
+                if ! import_hotpatch_runtime; then
+                  record_restore_failure "import restored application"
+                  old_candidate_ok=false
+                fi
+              fi
+
+              if [ "$old_candidate_ok" = true ]; then
+                if ensure_hotpatch_app_ready; then
+                  app_ready=true
+                else
+                  record_restore_failure "start restored application"
+                  old_candidate_ok=false
+                fi
+              fi
+
+              # If any old-state restoration step failed, repair a complete
+              # new-state tree before the final start attempt. This avoids
+              # leaving a half-old/half-new app or privilege boundary.
+              if [ "$old_candidate_ok" != true ]; then
+                if [ "$legacy_cleanup_ok" = true ] && \
+                  ! hotpatch_app_is_quiesced; then
+                  if ! stop_hotpatch_app; then
+                    record_restore_failure "stop app before forward recovery"
+                  fi
+                fi
+                forward_candidate_ok="$legacy_cleanup_ok"
+                if ! hotpatch_app_is_quiesced; then
+                  forward_candidate_ok=false
+                fi
+                if [ "$forward_candidate_ok" = true ]; then
+                  if ! install_hotpatch_tree "${hotpatch_container_stage}/new"; then
+                    record_restore_failure "forward-install new application"
+                    forward_candidate_ok=false
+                  fi
+                  if ! verify_hotpatch_hashes "${hotpatch_host_dir}/new"; then
+                    record_restore_failure "forward-verify new application"
+                    forward_candidate_ok=false
+                  fi
+                  if ! install_hotpatch_system_state; then
+                    record_restore_failure "forward-install new system state"
+                    forward_candidate_ok=false
+                  fi
+                  if ! verify_hotpatch_system_state; then
+                    record_restore_failure "forward-verify new system state"
+                    forward_candidate_ok=false
+                  fi
+                  if ! compile_hotpatch_tree /app; then
+                    record_restore_failure "forward-compile new application"
+                    forward_candidate_ok=false
+                  fi
+                  if ! import_hotpatch_runtime; then
+                    record_restore_failure "forward-import new application"
+                    forward_candidate_ok=false
+                  fi
+                fi
+                if ensure_hotpatch_app_ready; then
+                  app_ready=true
+                else
+                  record_restore_failure "final services:app recovery"
+                  app_ready=false
+                fi
+              fi
+
+              if [ "$app_ready" = true ]; then
+                if [ "$(hotpatch_target_fingerprint)" != \
+                  "$hotpatch_target_fingerprint_before" ]; then
+                  record_restore_failure "container fingerprint changed"
+                fi
+                if [ "$(hotpatch_home_fingerprint)" != \
+                  "$hotpatch_home_fingerprint_before" ]; then
+                  record_restore_failure "user-home fingerprint changed"
+                fi
+                if [ -f "${hotpatch_host_dir}/peer-processes.before" ]; then
+                  if ! snapshot_hotpatch_peer_processes > \
+                    "${hotpatch_host_dir}/peer-processes.rollback"; then
+                    record_restore_failure "read supervisor peer fingerprint"
+                  elif ! cmp -s \
+                    "${hotpatch_host_dir}/peer-processes.before" \
+                    "${hotpatch_host_dir}/peer-processes.rollback"; then
+                    record_restore_failure "supervisor peer fingerprint changed"
+                  fi
+                fi
+                hotpatch_restore_required=false
+              else
+                record_restore_failure "services:app remains unhealthy"
+              fi
+
+              if [ "$restore_had_failure" = true ]; then
+                echo "Dynamic sandbox rollback completed with errors: ${restore_errors}" >&2
+                return 1
+              fi
+              echo "Restored the original dynamic sandbox application and system files." >&2
+            }
+
+            run_dynamic_sandbox_hotpatch() {
+              if [ "${HOTPATCH_ENABLED:-false}" != true ]; then
+                return 0
+              fi
+              if [ "$DEPLOY_REF" != \
+                refs/tags/deploy-test-20260721-artifact-fix-01 ]; then
+                echo "Refusing dynamic sandbox hotpatch for non-authorized ref." >&2
+                return 1
+              fi
+              if [ "$HOTPATCH_TARGET" != ai-manus-sandbox-ab145dc2 ]; then
+                echo "Refusing dynamic sandbox hotpatch for an unexpected target." >&2
+                return 1
+              fi
+              if ! printf '%s\n' "$EXPECTED_SHA" | \
+                grep -Eq '^[0-9a-f]{40}$'; then
+                echo "Refusing dynamic sandbox hotpatch for an invalid revision." >&2
+                return 1
+              fi
+              if [ "$IMAGE_TAG" != "sha-${EXPECTED_SHA}" ]; then
+                echo "Dynamic sandbox image tag does not match the deployment revision." >&2
+                return 1
+              fi
+
+              if ! docker container inspect "$HOTPATCH_TARGET" >/dev/null 2>&1; then
+                echo "Legacy dynamic sandbox is absent; no hotpatch is needed."
+                return 0
+              fi
+              hotpatch_image="$SANDBOX_IMAGE"
+              hotpatch_image_digest="${hotpatch_image##*@}"
+              hotpatch_repo_digests="$(
+                docker image inspect --format \
+                  '{{range .RepoDigests}}{{println .}}{{end}}' \
+                  "$hotpatch_image"
+              )"
+              if ! printf '%s\n' "$hotpatch_image_digest" | \
+                grep -Eq '^sha256:[0-9a-f]{64}$' || \
+                ! printf '%s\n' "$hotpatch_repo_digests" | \
+                grep -Fq "@${hotpatch_image_digest}"; then
+                echo "Dynamic sandbox image is not bound to the expected RepoDigest." >&2
+                return 1
+              fi
+              hotpatch_image_revision="$(
+                docker image inspect --format \
+                  '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+                  "$hotpatch_image"
+              )"
+              if [ "$hotpatch_image_revision" != "$EXPECTED_SHA" ]; then
+                echo "Dynamic sandbox image revision label is not the expected commit." >&2
+                return 1
+              fi
+              if [ "$(docker inspect --format '{{.Name}}' "$HOTPATCH_TARGET")" != \
+                "/${HOTPATCH_TARGET}" ]; then
+                echo "Dynamic sandbox resolved to an unexpected container name." >&2
+                return 1
+              fi
+              if [ "$(docker inspect --format '{{.State.Running}}' "$HOTPATCH_TARGET")" != \
+                true ]; then
+                echo "Dynamic sandbox exists but is not running; it will not be recreated." >&2
+                return 1
+              fi
+              if [ "$(docker inspect --format '{{.HostConfig.AutoRemove}}' "$HOTPATCH_TARGET")" != \
+                true ]; then
+                echo "Dynamic sandbox does not have the expected auto-remove fingerprint." >&2
+                return 1
+              fi
+              hotpatch_target_id="$(
+                docker inspect --format '{{.Id}}' "$HOTPATCH_TARGET"
+              )"
+              hotpatch_target_fingerprint_before="$(hotpatch_target_fingerprint)"
+              hotpatch_home_fingerprint_before="$(hotpatch_home_fingerprint)"
+              hotpatch_home_mode="$(
+                docker exec -u 0 "$HOTPATCH_TARGET" \
+                  stat -c %a /home/ubuntu
+              )"
+              if [ "$(hotpatch_app_state)" != RUNNING ]; then
+                echo "Dynamic sandbox services:app is not healthy before hotpatch." >&2
+                return 1
+              fi
+
+              hotpatch_host_dir="$(
+                mktemp -d "/var/tmp/ai-manus-hotpatch.${IMAGE_TAG}.XXXXXX"
+              )"
+              mkdir -p \
+                "${hotpatch_host_dir}/new" \
+                "${hotpatch_host_dir}/backup" \
+                "${hotpatch_host_dir}/new-system" \
+                "${hotpatch_host_dir}/backup-system"
+              hotpatch_source_container="$(docker create "$hotpatch_image")"
+              docker cp \
+                "${hotpatch_source_container}:/usr/local/sbin/manus-shell-launcher" \
+                "${hotpatch_host_dir}/new-system/manus-shell-launcher"
+              docker cp \
+                "${hotpatch_source_container}:/usr/local/sbin/manus-shell-reaper" \
+                "${hotpatch_host_dir}/new-system/manus-shell-reaper"
+              docker cp \
+                "${hotpatch_source_container}:/etc/sudoers.d/manus-api" \
+                "${hotpatch_host_dir}/new-system/manus-api"
+              for hotpatch_system_asset in \
+                manus-shell-launcher manus-shell-reaper manus-api; do
+                if [ ! -f \
+                  "${hotpatch_host_dir}/new-system/${hotpatch_system_asset}" ] || \
+                  [ -L \
+                  "${hotpatch_host_dir}/new-system/${hotpatch_system_asset}" ]; then
+                  echo "Invalid system asset in sandbox image: ${hotpatch_system_asset}." >&2
+                  return 1
+                fi
+              done
+
+              if docker exec -u 0 "$HOTPATCH_TARGET" \
+                test -e /usr/local/sbin/manus-shell-launcher; then
+                docker exec -u 0 "$HOTPATCH_TARGET" /bin/sh -ceu \
+                  '[ -f /usr/local/sbin/manus-shell-launcher ] && [ ! -L /usr/local/sbin/manus-shell-launcher ]'
+                hotpatch_launcher_existed=true
+                docker cp \
+                  "${HOTPATCH_TARGET}:/usr/local/sbin/manus-shell-launcher" \
+                  "${hotpatch_host_dir}/backup-system/manus-shell-launcher"
+              fi
+              if docker exec -u 0 "$HOTPATCH_TARGET" \
+                test -e /usr/local/sbin/manus-shell-reaper; then
+                docker exec -u 0 "$HOTPATCH_TARGET" /bin/sh -ceu \
+                  '[ -f /usr/local/sbin/manus-shell-reaper ] && [ ! -L /usr/local/sbin/manus-shell-reaper ]'
+                hotpatch_reaper_existed=true
+                docker cp \
+                  "${HOTPATCH_TARGET}:/usr/local/sbin/manus-shell-reaper" \
+                  "${hotpatch_host_dir}/backup-system/manus-shell-reaper"
+              fi
+              if docker exec -u 0 "$HOTPATCH_TARGET" \
+                test -e /etc/sudoers.d/manus-api; then
+                docker exec -u 0 "$HOTPATCH_TARGET" /bin/sh -ceu \
+                  '[ -f /etc/sudoers.d/manus-api ] && [ ! -L /etc/sudoers.d/manus-api ]'
+                hotpatch_api_sudoers_existed=true
+                docker cp \
+                  "${HOTPATCH_TARGET}:/etc/sudoers.d/manus-api" \
+                  "${hotpatch_host_dir}/backup-system/manus-api"
+              fi
+              if docker exec -u 0 "$HOTPATCH_TARGET" \
+                test -e /etc/sudoers.d/ubuntu; then
+                docker exec -u 0 "$HOTPATCH_TARGET" /bin/sh -ceu \
+                  '[ -f /etc/sudoers.d/ubuntu ] && [ ! -L /etc/sudoers.d/ubuntu ]'
+                hotpatch_legacy_sudoers_existed=true
+                docker cp \
+                  "${HOTPATCH_TARGET}:/etc/sudoers.d/ubuntu" \
+                  "${hotpatch_host_dir}/backup-system/ubuntu"
+              fi
+              while IFS= read -r hotpatch_relative_path; do
+                mkdir -p \
+                  "${hotpatch_host_dir}/new/$(dirname "$hotpatch_relative_path")" \
+                  "${hotpatch_host_dir}/backup/$(dirname "$hotpatch_relative_path")"
+                # The source container is intentionally never started.
+                if ! docker cp \
+                  "${hotpatch_source_container}:/app/${hotpatch_relative_path}" \
+                  "${hotpatch_host_dir}/new/${hotpatch_relative_path}"; then
+                  return 1
+                fi
+                if ! docker exec "$HOTPATCH_TARGET" /bin/sh -ceu \
+                  "[ -f '/app/${hotpatch_relative_path}' ] && [ ! -L '/app/${hotpatch_relative_path}' ]"; then
+                  echo "Unexpected target file type: ${hotpatch_relative_path}." >&2
+                  return 1
+                fi
+                if ! docker cp \
+                  "${HOTPATCH_TARGET}:/app/${hotpatch_relative_path}" \
+                  "${hotpatch_host_dir}/backup/${hotpatch_relative_path}"; then
+                  return 1
+                fi
+                if [ ! -f "${hotpatch_host_dir}/new/${hotpatch_relative_path}" ] || \
+                  [ -L "${hotpatch_host_dir}/new/${hotpatch_relative_path}" ] || \
+                  [ ! -f "${hotpatch_host_dir}/backup/${hotpatch_relative_path}" ] || \
+                  [ -L "${hotpatch_host_dir}/backup/${hotpatch_relative_path}" ]; then
+                  echo "Hotpatch staging contains a non-regular file." >&2
+                  return 1
+                fi
+              done <<HOTPATCH_FILE_LIST
+            $hotpatch_files
+            HOTPATCH_FILE_LIST
+              if ! cleanup_hotpatch_source_container; then
+                return 1
+              fi
+
+              hotpatch_container_stage="$(
+                docker exec -u 0 "$HOTPATCH_TARGET" \
+                  mktemp -d /tmp/ai-manus-hotpatch.XXXXXX
+              )"
+              docker exec -u 0 "$HOTPATCH_TARGET" \
+                mkdir -p \
+                  "${hotpatch_container_stage}/new" \
+                  "${hotpatch_container_stage}/backup" \
+                  "${hotpatch_container_stage}/new-system" \
+                  "${hotpatch_container_stage}/backup-system"
+              docker cp "${hotpatch_host_dir}/new/." \
+                "${HOTPATCH_TARGET}:${hotpatch_container_stage}/new/"
+              docker cp "${hotpatch_host_dir}/backup/." \
+                "${HOTPATCH_TARGET}:${hotpatch_container_stage}/backup/"
+              docker cp "${hotpatch_host_dir}/new-system/." \
+                "${HOTPATCH_TARGET}:${hotpatch_container_stage}/new-system/"
+              docker cp "${hotpatch_host_dir}/backup-system/." \
+                "${HOTPATCH_TARGET}:${hotpatch_container_stage}/backup-system/"
+              compile_hotpatch_tree "${hotpatch_container_stage}/new"
+
+              snapshot_hotpatch_peer_processes > \
+                "${hotpatch_host_dir}/peer-processes.before"
+              if [ ! -s "${hotpatch_host_dir}/peer-processes.before" ] || \
+                ! awk '$2 != "RUNNING" { failed = 1 } END { exit failed }' \
+                  "${hotpatch_host_dir}/peer-processes.before"; then
+                echo "A non-app supervisor process is not running before hotpatch." >&2
+                return 1
+              fi
+              hotpatch_peer_pids="$(
+                awk '
+                  $3 ~ /^[1-9][0-9]*$/ {
+                    if (result != "") result = result ","
+                    result = result $3
+                  }
+                  END { print result }
+                ' "${hotpatch_host_dir}/peer-processes.before"
+              )"
+              hotpatch_old_app_pid="$(
+                docker exec "$HOTPATCH_TARGET" supervisorctl pid services:app
+              )"
+              if ! printf '%s\n' "$hotpatch_old_app_pid" | grep -Eq '^[1-9][0-9]*$'; then
+                echo "Could not fingerprint the original services:app process." >&2
+                return 1
+              fi
+
+              hotpatch_restore_required=true
+              # Freeze only fingerprinted EUID-1000 descendants while their
+              # parentage is still attributable to the legacy app. This
+              # closes the stop/reparent/fork race without UID-wide or
+              # process-group signals that could touch Chrome or peers.
+              legacy_app_process_guard snapshot-freeze
+              stop_hotpatch_app
+              legacy_app_process_guard cleanup
+              install_hotpatch_tree "${hotpatch_container_stage}/new"
+              verify_hotpatch_hashes "${hotpatch_host_dir}/new"
+              install_hotpatch_system_state
+              verify_hotpatch_system_state
+              compile_hotpatch_tree /app
+              docker exec -u ubuntu \
+                -e PYTHONDONTWRITEBYTECODE=1 \
+                "$HOTPATCH_TARGET" /app/.venv/bin/python -c \
+                'import app.api.v1.file, app.schemas.file, app.schemas.shell, app.services.file, app.services.shell'
+              docker exec "$HOTPATCH_TARGET" \
+                supervisorctl start services:app >/dev/null
+              wait_for_hotpatch_health
+
+              hotpatch_glob_response="${hotpatch_container_stage}/root-glob.json"
+              hotpatch_glob_status="$(
+                docker exec "$HOTPATCH_TARGET" curl \
+                  --silent --show-error \
+                  --connect-timeout 1 --max-time 3 \
+                  --output "$hotpatch_glob_response" \
+                  --write-out '%{http_code}' \
+                  --request POST \
+                  --header 'Content-Type: application/json' \
+                  --data '{"path":"/","glob":"**/PLAN.md"}' \
+                  http://127.0.0.1:8080/api/v1/file/find
+              )"
+              if [ "$hotpatch_glob_status" != 400 ]; then
+                echo "Dangerous root glob was not rejected with HTTP 400." >&2
+                return 1
+              fi
+              docker exec "$HOTPATCH_TARGET" /app/.venv/bin/python -c \
+                "import json,sys; payload=json.load(open(sys.argv[1], encoding='utf-8')); ok=payload.get('success') is False and 'Only root-level' in str(payload.get('message', '')); raise SystemExit(0 if ok else 1)" \
+                "$hotpatch_glob_response"
+              wait_for_hotpatch_health
+
+              hotpatch_new_app_pid="$(
+                docker exec "$HOTPATCH_TARGET" supervisorctl pid services:app
+              )"
+              if ! printf '%s\n' "$hotpatch_new_app_pid" | grep -Eq '^[1-9][0-9]*$' || \
+                [ "$hotpatch_new_app_pid" = "$hotpatch_old_app_pid" ]; then
+                echo "services:app did not restart with a new process ID." >&2
+                return 1
+              fi
+              hotpatch_current_id="$(
+                docker inspect --format '{{.Id}}' "$HOTPATCH_TARGET"
+              )"
+              if [ "$hotpatch_current_id" != "$hotpatch_target_id" ]; then
+                echo "Dynamic sandbox container identity changed during hotpatch." >&2
+                return 1
+              fi
+              if [ "$(hotpatch_target_fingerprint)" != \
+                "$hotpatch_target_fingerprint_before" ] || \
+                [ "$(hotpatch_home_fingerprint)" != \
+                "$hotpatch_home_fingerprint_before" ]; then
+                echo "Dynamic sandbox container or user files changed during hotpatch." >&2
+                return 1
+              fi
+              snapshot_hotpatch_peer_processes > \
+                "${hotpatch_host_dir}/peer-processes.after"
+              if ! cmp -s \
+                "${hotpatch_host_dir}/peer-processes.before" \
+                "${hotpatch_host_dir}/peer-processes.after"; then
+                echo "A non-app supervisor process changed during hotpatch." >&2
+                diff -u \
+                  "${hotpatch_host_dir}/peer-processes.before" \
+                  "${hotpatch_host_dir}/peer-processes.after" >&2 || true
+                return 1
+              fi
+
+              echo "Dynamic sandbox hotpatch passed identity, user-file, sudo, helper, health, and root-glob checks."
+              echo "Rollback files retained at ${hotpatch_host_dir}."
+            }
+
             rollback() {
               status=$?
               trap - EXIT
               set +e
+              # Quiesce the newly deployed task producers before restoring
+              # the old dynamic-sandbox application and privilege boundary.
+              if [ "$changed" = true ] && [ -f docker-compose.yml ]; then
+                if [ -f docker-compose.deploy.yml ]; then
+                  compose stop worker >/dev/null 2>&1 || true
+                  compose stop backend >/dev/null 2>&1 || true
+                else
+                  docker compose -p ai-manus -f docker-compose.yml \
+                    stop worker >/dev/null 2>&1 || true
+                  docker compose -p ai-manus -f docker-compose.yml \
+                    stop backend >/dev/null 2>&1 || true
+                fi
+              fi
+              if [ "$hotpatch_restore_required" = true ]; then
+                echo "Deployment failed; restoring the dynamic sandbox hotpatch." >&2
+                if ! restore_dynamic_sandbox_hotpatch; then
+                  echo "CRITICAL: dynamic sandbox hotpatch rollback failed." >&2
+                fi
+              fi
+              if ! cleanup_hotpatch_source_container; then
+                echo "Hotpatch source-container cleanup failed during rollback." >&2
+              fi
+              if ! cleanup_registry_login; then
+                echo "Temporary registry credential cleanup failed during rollback." >&2
+              fi
               if [ "$changed" = true ]; then
                 echo "Deployment failed; restoring both previous compose files." >&2
                 if [ -f docker-compose.yml ]; then
@@ -403,21 +2046,100 @@ jobs:
                   rm -f docker-compose.deploy.yml
                 fi
 
+                # A previous override may itself use transient Compose
+                # interpolation. Permit only the initial parse; once its
+                # backend is running, durably bind any worker gateway line to
+                # that restored container before the worker can restart.
+                RUNTIME_GATEWAY_CONTAINER=deployment-pending-backend
+                export RUNTIME_GATEWAY_CONTAINER
                 if [ -f docker-compose.yml ] && restore_compose config -q; then
-                  for service in mongodb redis mockserver backend frontend; do
+                  rollback_worker_gateway_ready=true
+                  rollback_has_backend=false
+                  rollback_has_worker=false
+                  if restore_compose config --services | grep -qx backend; then
+                    rollback_has_backend=true
+                  fi
+                  if restore_compose config --services | grep -qx worker; then
+                    rollback_has_worker=true
+                  fi
+                  for service in mockserver backend frontend; do
                     if restore_compose config --services | grep -qx "$service"; then
-                      restore_compose up -d "$service" || true
+                      restore_compose up -d --no-deps "$service" || true
                     fi
                   done
+                  for service in mongodb redis; do
+                    if restore_compose config --services | grep -qx "$service"; then
+                      before_id=""
+                      if [ "$service" = mongodb ]; then
+                        before_id="$mongodb_id_before"
+                      else
+                        before_id="$redis_id_before"
+                      fi
+                      if [ -n "$before_id" ] && \
+                        [ "$(docker inspect --format '{{.State.Running}}' \
+                          "$before_id" 2>/dev/null || true)" != true ]; then
+                        echo "CRITICAL: preserved ${service} container is no longer running." >&2
+                      elif [ -z "$before_id" ]; then
+                        restore_compose up -d "$service" || true
+                      fi
+                    fi
+                  done
+                  if [ "$rollback_has_worker" = true ]; then
+                    restored_runtime_gateway=""
+                    if [ "$rollback_has_backend" = true ]; then
+                      restored_runtime_gateway="$(
+                        restore_compose ps -q backend 2>/dev/null || true
+                      )"
+                    fi
+                    if [ -z "$restored_runtime_gateway" ] || \
+                      [ "$(docker inspect --format '{{.State.Running}}' \
+                        "$restored_runtime_gateway" 2>/dev/null || true)" != true ]; then
+                      echo "CRITICAL: restored backend has no stable runtime gateway ID." >&2
+                      rollback_worker_gateway_ready=false
+                    elif [ -f docker-compose.deploy.yml ] && \
+                      grep -q 'RUNTIME_GATEWAY_CONTAINER' \
+                        docker-compose.deploy.yml; then
+                      if ! bind_worker_gateway_override \
+                        docker-compose.deploy.yml \
+                        "$restored_runtime_gateway"; then
+                        echo "CRITICAL: could not durably rebind the restored worker gateway." >&2
+                        rollback_worker_gateway_ready=false
+                      fi
+                    fi
+                  fi
+                  unset RUNTIME_GATEWAY_CONTAINER
+                  if [ "$rollback_has_worker" = true ] && \
+                    [ "$rollback_worker_gateway_ready" = true ]; then
+                    if ! restore_compose config -q; then
+                      echo "CRITICAL: restored Compose still needs transient gateway state." >&2
+                      rollback_worker_gateway_ready=false
+                    else
+                      restored_configured_gateway="$(
+                        restore_compose config --format json | python3 -c \
+                          'import json, sys; print(json.load(sys.stdin)["services"]["worker"]["environment"].get("RUNTIME_GATEWAY_CONTAINER", ""))'
+                      )"
+                      if [ -n "$restored_configured_gateway" ] && \
+                        [ "$restored_configured_gateway" != \
+                          "$restored_runtime_gateway" ]; then
+                        echo "CRITICAL: restored worker gateway targets the wrong backend." >&2
+                        rollback_worker_gateway_ready=false
+                      fi
+                    fi
+                  fi
                   task_backend="$(sed -n 's/^[[:space:]]*TASK_BACKEND=//p' .env 2>/dev/null | tail -n 1 || true)"
-                  if restore_compose config --services | grep -qx worker; then
-                    if [ "${task_backend:-local}" = "celery" ]; then
-                      restore_compose up -d worker || true
+                  if [ "$rollback_has_worker" = true ]; then
+                    if [ "${task_backend:-local}" = "celery" ] && \
+                      [ "$rollback_worker_gateway_ready" = true ]; then
+                      restore_compose up -d --no-deps worker || true
                     else
                       restore_compose stop worker >/dev/null 2>&1 || true
+                      if [ "${task_backend:-local}" = "celery" ]; then
+                        echo "CRITICAL: restored worker remains stopped because its gateway is unsafe." >&2
+                      fi
                     fi
                   fi
                 else
+                  unset RUNTIME_GATEWAY_CONTAINER
                   echo "Previous compose configuration is unavailable or invalid; automatic service rollback was skipped." >&2
                 fi
               fi
@@ -439,36 +2161,45 @@ jobs:
             cat > "$incoming_override" <<EOF
             services:
               frontend:
-                image: ${REGISTRY}/${OWNER}/ai-manus-frontend:${IMAGE_TAG}
+                image: ${FRONTEND_IMAGE}
                 environment:
                   - BACKEND_URL=http://backend:8000
 
               backend:
-                image: ${REGISTRY}/${OWNER}/ai-manus-backend:${IMAGE_TAG}
+                image: ${BACKEND_IMAGE}
                 depends_on:
                   - mongodb
                   - redis
                   - mockserver
                 volumes:
                   - /var/run/docker.sock:/var/run/docker.sock:ro
+                sysctls:
+                  - net.ipv4.ip_forward=0
+                  - net.ipv4.conf.all.forwarding=0
+                  - net.ipv4.conf.default.forwarding=0
+                  - net.ipv6.conf.all.forwarding=0
+                  - net.ipv6.conf.default.forwarding=0
                 environment:
                   - MONGODB_URI=mongodb://mongodb:27017
                   - REDIS_HOST=redis
                   - REDIS_PORT=6379
                   - SANDBOX_NETWORK=manus-network
                   - CLAW_NETWORK=manus-network
+                  - RUNTIME_NETWORK_ISOLATION=true
+                  - RUNTIME_DEPLOYMENT_ID=ai-manus
+                  - CLAW_PUBLISH_HOST_PORTS=false
                   - MANUS_API_BASE_URL=http://backend:8000
-                  - SANDBOX_IMAGE=${REGISTRY}/${OWNER}/ai-manus-sandbox:${IMAGE_TAG}
-                  - CLAW_IMAGE=${REGISTRY}/${OWNER}/ai-manus-claw:${IMAGE_TAG}
+                  - SANDBOX_IMAGE=${SANDBOX_IMAGE}
+                  - CLAW_IMAGE=${CLAW_IMAGE}
 
               sandbox:
-                image: ${REGISTRY}/${OWNER}/ai-manus-sandbox:${IMAGE_TAG}
+                image: ${SANDBOX_IMAGE}
 
               claw:
-                image: ${REGISTRY}/${OWNER}/ai-manus-claw:${IMAGE_TAG}
+                image: ${CLAW_IMAGE}
 
               mockserver:
-                image: ${REGISTRY}/${OWNER}/ai-manus-mockserver:${IMAGE_TAG}
+                image: ${MOCKSERVER_IMAGE}
                 restart: unless-stopped
                 environment:
                   - MOCK_DATA_FILE=default.yaml
@@ -477,22 +2208,36 @@ jobs:
                   - manus-network
 
               worker:
-                image: ${REGISTRY}/${OWNER}/ai-manus-backend:${IMAGE_TAG}
+                image: ${BACKEND_IMAGE}
                 command: ["./start_worker.sh"]
                 restart: unless-stopped
+                stop_grace_period: 30s
                 depends_on:
                   - mongodb
                   - redis
                 volumes:
                   - /var/run/docker.sock:/var/run/docker.sock:ro
+                sysctls:
+                  - net.ipv4.ip_forward=0
+                  - net.ipv4.conf.all.forwarding=0
+                  - net.ipv4.conf.default.forwarding=0
+                  - net.ipv6.conf.all.forwarding=0
+                  - net.ipv6.conf.default.forwarding=0
                 env_file:
                   - .env
                 environment:
-                  - SANDBOX_IMAGE=${REGISTRY}/${OWNER}/ai-manus-sandbox:${IMAGE_TAG}
-                  - CLAW_IMAGE=${REGISTRY}/${OWNER}/ai-manus-claw:${IMAGE_TAG}
+                  - SANDBOX_IMAGE=${SANDBOX_IMAGE}
+                  - CLAW_IMAGE=${CLAW_IMAGE}
+                  - MONGODB_URI=mongodb://mongodb:27017
+                  - REDIS_HOST=redis
+                  - REDIS_PORT=6379
                   - MANUS_API_BASE_URL=http://backend:8000
                   - SANDBOX_NETWORK=manus-network
                   - CLAW_NETWORK=manus-network
+                  - RUNTIME_NETWORK_ISOLATION=true
+                  - RUNTIME_DEPLOYMENT_ID=ai-manus
+                  - CLAW_PUBLISH_HOST_PORTS=false
+                  - RUNTIME_GATEWAY_CONTAINER=deployment-pending-backend
                 networks:
                   - manus-network
                   - manus-data-network
@@ -517,13 +2262,23 @@ jobs:
             incoming_override=""
             compose config -q
 
+            registry_docker_config="$(mktemp -d /tmp/ai-manus-registry.XXXXXX)"
+            chmod 700 "$registry_docker_config"
+            export DOCKER_CONFIG="$registry_docker_config"
             echo "$GHCR_TOKEN" | docker login "$REGISTRY" -u "$GHCR_USER" --password-stdin
             # Never leave an old worker consuming jobs while the backend image
             # and Compose topology are being replaced. The EXIT trap restores
             # its previous state if any later deployment step fails.
             compose stop worker >/dev/null 2>&1 || true
             compose pull frontend backend sandbox claw mockserver
-            compose up -d backend mongodb redis mockserver
+            if [ -n "$mongodb_id_before" ] && [ -n "$redis_id_before" ]; then
+              # The test server already has stateful services. Recreate only
+              # application containers and keep both datastore IDs untouched.
+              compose up -d --no-deps mockserver
+              compose up -d --no-deps backend
+            else
+              compose up -d mongodb redis mockserver backend
+            fi
             for i in $(seq 1 60); do
               if compose exec -T backend \
                 python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)" >/dev/null 2>&1; then
@@ -535,7 +2290,25 @@ jobs:
               fi
               sleep 2
             done
-            compose up -d frontend
+            runtime_gateway_container="$(compose ps -q backend)"
+            if [ -z "$runtime_gateway_container" ] || \
+              [ "$(docker inspect --format '{{.State.Running}}' \
+                "$runtime_gateway_container" 2>/dev/null || true)" != true ]; then
+              echo "Cannot bind the worker runtime gateway to the running backend." >&2
+              exit 1
+            fi
+            bind_worker_gateway_override \
+              docker-compose.deploy.yml "$runtime_gateway_container"
+            compose config -q
+            configured_worker_gateway="$(
+              compose config --format json | python3 -c \
+                'import json, sys; print(json.load(sys.stdin)["services"]["worker"]["environment"].get("RUNTIME_GATEWAY_CONTAINER", ""))'
+            )"
+            if [ "$configured_worker_gateway" != "$runtime_gateway_container" ]; then
+              echo "Worker runtime gateway does not match the exact backend container." >&2
+              exit 1
+            fi
+            compose up -d --no-deps frontend
             for i in $(seq 1 30); do
               if compose exec -T backend python -c "import urllib.request; [urllib.request.urlopen(url, timeout=2).read(1) for url in ('http://frontend/', 'http://frontend/api/v1/config/frontend')]" >/dev/null 2>&1; then
                 break
@@ -547,8 +2320,49 @@ jobs:
               sleep 2
             done
             task_backend="$(sed -n 's/^[[:space:]]*TASK_BACKEND=//p' .env 2>/dev/null | tail -n 1 || true)"
+            # Quiesce every backend task producer before attributing and
+            # freezing legacy sandbox descendants. Backend shutdown closes
+            # handles but does not delete the provisioned runtime.
+            compose stop worker >/dev/null 2>&1 || true
+            hotpatch_pre_quiesce_id=""
+            if [ "${HOTPATCH_ENABLED:-false}" = true ] && \
+              docker container inspect "$HOTPATCH_TARGET" >/dev/null 2>&1; then
+              hotpatch_pre_quiesce_id="$(
+                docker inspect --format '{{.Id}}' "$HOTPATCH_TARGET"
+              )"
+            fi
+            compose stop backend
+            if [ -n "$(compose ps -q backend)" ]; then
+              echo "Backend did not stop before dynamic sandbox attribution." >&2
+              exit 1
+            fi
+            if [ -n "$hotpatch_pre_quiesce_id" ]; then
+              if [ "$(docker inspect --format '{{.Id}}' \
+                "$HOTPATCH_TARGET" 2>/dev/null || true)" != \
+                "$hotpatch_pre_quiesce_id" ] || \
+                [ "$(docker inspect --format '{{.State.Running}}' \
+                "$HOTPATCH_TARGET" 2>/dev/null || true)" != true ]; then
+                echo "Backend quiescence changed the dynamic sandbox identity." >&2
+                exit 1
+              fi
+            fi
+            compose up --no-start sandbox claw
+            run_dynamic_sandbox_hotpatch
+
+            compose up -d --no-deps backend
+            for i in $(seq 1 60); do
+              if compose exec -T backend \
+                python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)" >/dev/null 2>&1; then
+                break
+              fi
+              if [ "$i" -eq 60 ]; then
+                compose logs --tail=120 backend
+                exit 1
+              fi
+              sleep 2
+            done
             if [ "${task_backend:-local}" = "celery" ]; then
-              compose up -d worker
+              compose up -d --no-deps worker
               worker_id="$(compose ps -q worker)"
               if [ -z "$worker_id" ]; then
                 echo "Worker container was not created." >&2
@@ -576,6 +2390,50 @@ jobs:
             else
               compose stop worker >/dev/null 2>&1 || true
             fi
-            compose up --no-start sandbox claw
+
+            verify_expected_container frontend frontend true
+            verify_expected_container backend backend true
+            verify_expected_container mockserver mockserver true
+            verify_expected_container sandbox sandbox false
+            verify_expected_container claw claw false
+            if [ "${task_backend:-local}" = celery ]; then
+              verify_expected_container worker backend true
+              worker_runtime_gateway="$(
+                docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \
+                  "$worker_id" | \
+                  sed -n 's/^RUNTIME_GATEWAY_CONTAINER=//p' | tail -n 1
+              )"
+              if [ "$worker_runtime_gateway" != "$runtime_gateway_container" ]; then
+                echo "Running worker is not bound to the exact backend gateway container." >&2
+                exit 1
+              fi
+            fi
+            if [ "$(compose ps -q backend)" != "$runtime_gateway_container" ]; then
+              echo "Backend container identity changed after worker gateway binding." >&2
+              exit 1
+            fi
+
+            if [ -n "$mongodb_id_before" ] && \
+              [ "$(compose ps -q mongodb)" != "$mongodb_id_before" ]; then
+              echo "MongoDB container identity changed during application deployment." >&2
+              exit 1
+            fi
+            if [ -n "$redis_id_before" ] && \
+              [ "$(compose ps -q redis)" != "$redis_id_before" ]; then
+              echo "Redis container identity changed during application deployment." >&2
+              exit 1
+            fi
+
+            smoke_frontend_url \
+              "http://127.0.0.1:${FRONTEND_HOST_PORT}" \
+              "server-local"
+            smoke_frontend_url \
+              "http://${PUBLIC_HOST}:${FRONTEND_HOST_PORT}" \
+              "public-root"
+
+            # Keep rollback armed until every image fingerprint and both the
+            # host-local and public entry points have passed.
+            cleanup_registry_login
+            hotpatch_restore_required=false
             trap - EXIT
             rm -f "$previous_compose" "$previous_override"

@@ -17,12 +17,78 @@ class SessionRepository(Protocol):
         sandbox_id: Optional[str],
         task_id: Optional[str],
         sandbox_provider: Optional[str] = None,
+        task_sandbox_id: Optional[str] = None,
     ) -> None:
         """Update runtime IDs only when the session still exists.
 
         Unlike ``save``, this operation must never recreate a concurrently
         deleted session.
         """
+        ...
+
+    async def compare_and_set_runtime_ownership(
+        self,
+        session_id: str,
+        expected_sandbox_id: Optional[str],
+        expected_task_id: Optional[str],
+        expected_task_sandbox_id: Optional[str],
+        expected_sandbox_provider: Optional[str],
+        sandbox_id: Optional[str],
+        task_id: Optional[str],
+        sandbox_provider: Optional[str] = None,
+        task_sandbox_id: Optional[str] = None,
+    ) -> bool:
+        """Replace ownership only if the full durable projection matches."""
+        ...
+
+    async def claim_runtime_destroy(
+        self,
+        session_id: str,
+        expected_sandbox_id: Optional[str],
+        expected_task_id: Optional[str],
+        expected_task_sandbox_id: Optional[str],
+        expected_sandbox_provider: Optional[str],
+    ) -> bool:
+        """Fence provider deletion for one exact runtime/task projection."""
+        ...
+
+    async def publish_runtime_destroy_claim(
+        self,
+        session_id: str,
+        expected_task_id: Optional[str],
+        expected_task_sandbox_id: Optional[str],
+        expected_sandbox_provider: Optional[str],
+        sandbox_id: str,
+        sandbox_provider: str,
+    ) -> bool:
+        """Publish an absent runtime pointer directly as non-adoptable."""
+        ...
+
+    async def finish_runtime_destroy(
+        self,
+        session_id: str,
+        expected_sandbox_id: Optional[str],
+        expected_task_id: Optional[str],
+        expected_task_sandbox_id: Optional[str],
+        expected_sandbox_provider: Optional[str],
+        sandbox_id: Optional[str],
+        task_id: Optional[str],
+        sandbox_provider: Optional[str],
+        task_sandbox_id: Optional[str],
+    ) -> bool:
+        """Clear an exact claimed runtime projection after provider deletion."""
+        ...
+
+    async def claim_session_delete(
+        self, session_id: str, user_id: str
+    ) -> bool:
+        """Durably fence a session against new work before cleanup."""
+        ...
+
+    async def delete_claimed(
+        self, session_id: str, user_id: str
+    ) -> bool:
+        """Delete only a session carrying the durable deletion claim."""
         ...
     
     async def find_by_id(self, session_id: str) -> Optional[Session]:
@@ -66,6 +132,14 @@ class SessionRepository(Protocol):
     async def add_file(self, session_id: str, file_info: FileInfo) -> None:
         """Add a file to a session"""
         ...
+
+    async def upsert_file_by_path(
+        self,
+        session_id: str,
+        file_info: FileInfo,
+    ) -> Optional[FileInfo]:
+        """Atomically replace by path and return the previous reference."""
+        ...
     
     async def remove_file(self, session_id: str, file_id: str) -> None:
         """Remove a file from a session"""
@@ -73,6 +147,10 @@ class SessionRepository(Protocol):
 
     async def get_file_by_path(self, session_id: str, file_path: str) -> Optional[FileInfo]:
         """Get file by path from a session"""
+        ...
+
+    async def count_file_references(self, file_id: str) -> int:
+        """Count live session or durable-outbox references to a stored file."""
         ...
 
     async def update_status(self, session_id: str, status: SessionStatus) -> None:

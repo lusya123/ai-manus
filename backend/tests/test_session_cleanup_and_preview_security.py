@@ -214,6 +214,85 @@ async def test_delete_session_does_not_destroy_sandbox_before_cancel_ack():
     assert repository.session is session
 
 
+async def test_delete_session_claims_before_cleanup_and_deletes_conditionally():
+    trace = []
+    session = Session(
+        id="session-claimed-delete",
+        user_id="user-1",
+        agent_id="agent-1",
+        task_id="task-1",
+        sandbox_id="sandbox-1",
+    )
+
+    class Repository:
+        def __init__(self):
+            self.session = session
+
+        async def find_by_id_and_user_id(self, session_id, user_id):
+            return self.session
+
+        async def claim_session_delete(self, session_id, user_id):
+            trace.append("claim-session")
+            self.session.deleting = True
+            return True
+
+        async def delete_claimed(self, session_id, user_id):
+            trace.append("delete-claimed")
+            assert self.session.deleting is True
+            self.session = None
+            return True
+
+    class AgentRepository:
+        async def find_by_id(self, agent_id):
+            return None
+
+        async def delete(self, agent_id):
+            trace.append("agent-delete")
+
+    class Task:
+        async def cancel(self):
+            trace.append("cancel")
+
+        async def wait_for_done(self, timeout_seconds):
+            trace.append("wait")
+            return True
+
+    class TaskClass:
+        @classmethod
+        async def get(cls, task_id):
+            return Task()
+
+    class Provisioner:
+        async def destroy_locked(self, current):
+            assert current.deleting is True
+            trace.append("destroy")
+            current.sandbox_id = None
+            current.task_id = None
+
+    repository = Repository()
+    service = AgentService(
+        agent_repository=AgentRepository(),
+        session_repository=repository,
+        sandbox_cls=SimpleNamespace(),
+        task_cls=TaskClass,
+        file_storage=SimpleNamespace(),
+        mcp_repository=SimpleNamespace(),
+        sandbox_provisioner=Provisioner(),
+    )
+
+    await service.delete_session("session-claimed-delete", "user-1")
+
+    assert trace == [
+        "claim-session",
+        "cancel",
+        "wait",
+        "destroy",
+        "agent-delete",
+        "delete-claimed",
+    ]
+    assert repository.session is None
+
+
 def _request(
     method: str,
     headers: dict[str, str] | None = None,

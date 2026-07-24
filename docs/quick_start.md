@@ -51,6 +51,12 @@ services:
       - sandbox
       - claw
     restart: unless-stopped
+    sysctls:
+      net.ipv4.ip_forward: "0"
+      net.ipv4.conf.all.forwarding: "0"
+      net.ipv4.conf.default.forwarding: "0"
+      net.ipv6.conf.all.forwarding: "0"
+      net.ipv6.conf.default.forwarding: "0"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       #- ./mcp.json:/etc/mcp.json # Mount MCP servers directory
@@ -75,6 +81,9 @@ services:
       - SANDBOX_PIDS_LIMIT=512
       - CLAW_IMAGE=simpleyyt/manus-claw
       - CLAW_NETWORK=manus-network
+      - RUNTIME_NETWORK_ISOLATION=true
+      - RUNTIME_DEPLOYMENT_ID=${RUNTIME_DEPLOYMENT_ID:-ai-manus}
+      - CLAW_PUBLISH_HOST_PORTS=false
 
   sandbox:
     image: simpleyyt/manus-sandbox
@@ -190,6 +199,16 @@ SANDBOX_NETWORK=manus-network
 SANDBOX_MEMORY_LIMIT=2g
 SANDBOX_CPU_LIMIT=2.0
 SANDBOX_PIDS_LIMIT=512
+# Dynamic Docker runtimes use an internal control bridge plus a one-container
+# egress bridge. Each live runtime therefore consumes two /28 subnets.
+RUNTIME_NETWORK_ISOLATION=true
+#RUNTIME_GATEWAY_CONTAINER=
+#RUNTIME_NETWORK_ADDRESS_POOL=10.240.0.0/12
+#RUNTIME_NETWORK_SUBNET_PREFIX=28
+#RUNTIME_NETWORK_GC_INTERVAL_SECONDS=60
+#RUNTIME_NETWORK_GC_GRACE_SECONDS=300
+# This blocks cross-runtime/datastore access, not Docker-host, RFC1918,
+# link-local, or cloud-metadata egress; use a host firewall/proxy for that.
 #SANDBOX_CHROME_ARGS=
 #SANDBOX_HTTPS_PROXY=
 #SANDBOX_HTTP_PROXY=
@@ -409,6 +428,7 @@ LOG_LEVEL=INFO
 4. 除非已经按更大容量规划 MongoDB、Nginx 和存储，否则保留默认的请求体、单文件和每用户配额。
 5. `TASK_BACKEND=local` 必须与 `BACKEND_REPLICA_COUNT=1` 配套。增加第二个 backend 进程/副本前先切换到 Celery，并让所有 backend/worker 共享 Redis、MongoDB、JWT、模型 keyring 和沙箱配置。
 6. 使用 AgentBay 时，把每个 signed gateway link 都当作 secret。清理失败会保留 provider session ID 供重试；provider 未确认删除前不要手工删数据库记录。
+7. 动态 Docker 运行时采用独立控制网和出口网，能隔离其它运行时及 MongoDB/Redis，并会回收 TTL AutoRemove 遗留网桥；这不等于限制宿主机/VPC 出口。如需阻断 Docker host、RFC1918、link-local 或云 metadata，必须另配宿主机防火墙或目标过滤代理。
 
 refresh token 单次使用且每次刷新都会替换，logout 会撤销其 family。Sub2API 重定向还要求一次性随机 `state` 和验证通过的 fragment handoff。key 轮换与旧凭证迁移命令见[配置说明](configuration.md)。
 

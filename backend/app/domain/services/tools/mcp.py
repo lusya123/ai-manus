@@ -342,10 +342,17 @@ class MCPClientManager:
             logger.info("MCP 客户端管理器已清理")
             
         except Exception as e:
+            summary = safe_exception_summary(e)
             logger.error(
                 "清理 MCP 客户端管理器失败: %s",
-                safe_exception_summary(e),
+                summary,
             )
+            # Preserve manager state and tell the runner cleanup bundle that
+            # the handle outcome is not yet known.  Provider messages may
+            # contain credentials, so propagate only stable exception metadata.
+            raise RuntimeError(
+                f"MCP client cleanup incomplete: {summary}"
+            ) from None
 
 
 class MCPToolkit(BaseToolkit):

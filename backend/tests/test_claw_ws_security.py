@@ -82,6 +82,9 @@ def _ws_service():
         get_pending_content=Mock(return_value=None),
         get_pending_thinking_content=Mock(return_value=None),
         send_message=AsyncMock(),
+        validate_claw_for_chat=AsyncMock(
+            return_value=SimpleNamespace(http_base_url="http://resolved-claw")
+        ),
         claw_repository=SimpleNamespace(
             append_message=AsyncMock(),
             get_by_user_id=AsyncMock(return_value=None),
@@ -275,6 +278,102 @@ async def test_claw_websocket_closes_when_short_lived_token_expires():
 
 
 @pytest.mark.asyncio
+async def test_claw_websocket_reconnect_reconciles_completed_turn_to_idle():
+    active = _active_user()
+    auth_service = SimpleNamespace(
+        verify_token=AsyncMock(return_value=active),
+        token_service=SimpleNamespace(
+            verify_token=Mock(
+                return_value={"type": "access", "exp": time.time() + 0.05}
+            )
+        ),
+    )
+    service = _ws_service()
+    service.is_processing = Mock(return_value=False)
+    websocket = _ScriptedWebSocket(
+        [{"type": "auth", "token": "reconnect-token"}],
+        block_when_empty=True,
+    )
+
+    with (
+        patch(
+            "app.interfaces.api.claw_routes.get_settings",
+            return_value=SimpleNamespace(auth_provider="password"),
+        ),
+        patch(
+            "app.interfaces.dependencies.get_auth_service",
+            return_value=auth_service,
+        ),
+        patch(
+            "app.interfaces.api.claw_routes.get_claw_service",
+            return_value=service,
+        ),
+        patch(
+            "app.interfaces.api.claw_routes.get_file_service",
+            return_value=SimpleNamespace(),
+        ),
+    ):
+        await asyncio.wait_for(claw_ws(websocket), timeout=1)  # type: ignore[arg-type]
+
+    assert websocket.sent[:2] == [
+        {"type": "auth_ack"},
+        {"type": "done", "stop_reason": "idle"},
+    ]
+    assert websocket.closed == (4002, "Authentication expired")
+
+
+@pytest.mark.asyncio
+async def test_claw_websocket_reconnect_uses_terminal_latch_after_missed_fanout():
+    active = _active_user()
+    auth_service = SimpleNamespace(
+        verify_token=AsyncMock(return_value=active),
+        token_service=SimpleNamespace(
+            verify_token=Mock(
+                return_value={"type": "access", "exp": time.time() + 0.05}
+            )
+        ),
+    )
+    service = _ws_service()
+    service.get_pending_content = Mock(return_value="final answer")
+    service.get_terminal_event = Mock(return_value={
+        "type": "done",
+        "stop_reason": "end_turn",
+    })
+    service.is_processing = Mock(return_value=True)
+    websocket = _ScriptedWebSocket(
+        [{"type": "auth", "token": "reconnect-token"}],
+        block_when_empty=True,
+    )
+
+    with (
+        patch(
+            "app.interfaces.api.claw_routes.get_settings",
+            return_value=SimpleNamespace(auth_provider="password"),
+        ),
+        patch(
+            "app.interfaces.dependencies.get_auth_service",
+            return_value=auth_service,
+        ),
+        patch(
+            "app.interfaces.api.claw_routes.get_claw_service",
+            return_value=service,
+        ),
+        patch(
+            "app.interfaces.api.claw_routes.get_file_service",
+            return_value=SimpleNamespace(),
+        ),
+    ):
+        await asyncio.wait_for(claw_ws(websocket), timeout=1)  # type: ignore[arg-type]
+
+    assert websocket.sent[:3] == [
+        {"type": "auth_ack"},
+        {"type": "catchup", "content": "final answer"},
+        {"type": "done", "stop_reason": "end_turn"},
+    ]
+    assert websocket.closed == (4002, "Authentication expired")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "chat_frame, expected_error",
     [
@@ -401,6 +500,91 @@ async def test_claw_websocket_rejects_large_attachment_before_reading_it():
     stream.read.assert_not_called()
     service.send_message.assert_not_awaited()
     assert "per-file size limit" in websocket.sent[-1]["error"]
+
+
+@pytest.mark.asyncio
+async def test_claw_attachment_uses_owner_resolved_runtime_address():
+    active = _active_user()
+    auth_service = SimpleNamespace(
+        verify_token=AsyncMock(return_value=active),
+        token_service=SimpleNamespace(
+            verify_token=Mock(
+                return_value={"type": "access", "exp": time.time() + 60}
+            )
+        ),
+    )
+    file_service = SimpleNamespace(
+        download_file=AsyncMock(
+            return_value=(
+                io.BytesIO(b"data"),
+                SimpleNamespace(
+                    content_type="text/plain",
+                    filename="note.txt",
+                    size=4,
+                ),
+            )
+        )
+    )
+    service = _ws_service()
+    service.claw_repository.get_by_user_id.return_value = SimpleNamespace(
+        http_base_url="http://stale-claw"
+    )
+    websocket = _ScriptedWebSocket(
+        [
+            {"type": "auth", "token": "primary-token"},
+            {"type": "chat", "message": "inspect", "file_ids": ["file-1"]},
+        ]
+    )
+    posted_urls: list[str] = []
+    settings = _limited_ws_settings()
+    settings.claw_chat_max_message_bytes = 1024
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"path": "/home/ubuntu/note.txt"}
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, **kwargs):
+            posted_urls.append(url)
+            return Response()
+
+    with (
+        patch(
+            "app.interfaces.api.claw_routes.get_settings",
+            return_value=settings,
+        ),
+        patch(
+            "app.interfaces.dependencies.get_auth_service",
+            return_value=auth_service,
+        ),
+        patch(
+            "app.interfaces.api.claw_routes.get_claw_service",
+            return_value=service,
+        ),
+        patch(
+            "app.interfaces.api.claw_routes.get_file_service",
+            return_value=file_service,
+        ),
+        patch(
+            "app.interfaces.api.claw_routes.httpx.AsyncClient",
+            return_value=Client(),
+        ),
+    ):
+        await asyncio.wait_for(claw_ws(websocket), timeout=1)  # type: ignore[arg-type]
+
+    service.validate_claw_for_chat.assert_awaited_once_with("user-1")
+    service.claw_repository.get_by_user_id.assert_not_awaited()
+    assert posted_urls == ["http://resolved-claw/workspace"]
+    service.send_message.assert_awaited_once()
 
 
 @pytest.mark.asyncio

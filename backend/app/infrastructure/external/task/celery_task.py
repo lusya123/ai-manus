@@ -460,6 +460,27 @@ class CeleryTask(Task):
         """Task ID."""
         return self._id
 
+    def refresh_runner_params(self, params: Dict[str, Any]) -> None:
+        """Fill legacy metadata without moving this task to another runtime."""
+        previous_params = self._params or {}
+        for field in ("session_id", "agent_id", "user_id", "sandbox_id"):
+            previous = previous_params.get(field)
+            incoming = params.get(field)
+            if previous is not None and previous != incoming:
+                raise RuntimeError(
+                    f"Task {self._id} cannot change bound {field}"
+                )
+        previous_generation = previous_params.get("task_sandbox_id")
+        incoming_generation = params.get("task_sandbox_id")
+        if (
+            previous_generation is not None
+            and previous_generation != incoming_generation
+        ):
+            raise RuntimeError(
+                f"Task {self._id} cannot change sandbox generation"
+            )
+        self._params = dict(params)
+
     @property
     def input_stream(self) -> MessageQueue:
         """Input stream."""

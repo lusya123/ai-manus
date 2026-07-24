@@ -4,7 +4,19 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       target: build-stage  # Use build stage image instead of production image
-    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0"]  # Start in development mode and listen on all network interfaces
+    # The anonymous node_modules volume can outlive an image rebuild. Refresh it
+    # whenever package-lock.json changes so Vite never starts with stale/missing
+    # dependencies and serves only its import-error overlay.
+    command:
+      - /bin/sh
+      - -c
+      - |
+        lock_hash="$$(sha256sum package-lock.json | cut -d ' ' -f 1)"
+        if [ "$$(cat node_modules/.manus-package-lock.sha256 2>/dev/null)" != "$$lock_hash" ]; then
+          npm ci
+          printf '%s\n' "$$lock_hash" > node_modules/.manus-package-lock.sha256
+        fi
+        exec npm run dev -- --host 0.0.0.0
     volumes:
       - ./frontend:/app  # Mount source code directory
       - /app/node_modules  # Avoid overwriting container's node_modules
@@ -29,7 +41,9 @@ services:
         "/app/.venv/bin/python", "-m",
         "debugpy", "--listen", "0.0.0.0:5678", "-m", # Enable debug
         "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--ws-max-size", "131072",
-        "--timeout-graceful-shutdown","0"
+        # Give cancellation acknowledgements, artifact compensation and DB
+        # shutdown the same bounded window exercised by real deployments.
+        "--timeout-graceful-shutdown", "30"
       ]
     volumes:
       - ./backend:/app  # Mount source code directory
@@ -54,17 +68,35 @@ services:
         condition: service_started
         required: true
     restart: unless-stopped
+    sysctls:
+      net.ipv4.ip_forward: "0"
+      net.ipv4.conf.all.forwarding: "0"
+      net.ipv4.conf.default.forwarding: "0"
+      net.ipv6.conf.all.forwarding: "0"
+      net.ipv6.conf.default.forwarding: "0"
+    stop_grace_period: 60s
     networks:
       - manus-network
       - manus-data-network
     env_file:
       - .env
     environment:
+      # The development topology may use a descriptive value in a personal
+      # .env. Security validation accepts only this explicit bounded enum.
+      - DEPLOYMENT_ENVIRONMENT=development
       - SANDBOX_PROVIDER=docker # Fixed development sandbox; never inherit billable AgentBay mode
       - SANDBOX_ADDRESS=sandbox # Use single container as sandbox
-      - SANDBOX_NETWORK=manus-network-dev
+      # These are container-network ports, not the configurable host mappings.
+      # Pin them so a developer .env with e.g. SANDBOX_API_PORT=18080 cannot
+      # make the backend wait on a port that the fixed sandbox never exposes.
+      - SANDBOX_API_PORT=8080
+      - SANDBOX_CDP_PORT=9222
+      - SANDBOX_VNC_PORT=5901
+      - SANDBOX_NETWORK=${DEV_SANDBOX_NETWORK:-manus-network-dev}
       - CLAW_ADDRESS=claw       # Use single fixed claw container in development
-      - CLAW_NETWORK=manus-network-dev
+      - CLAW_NETWORK=${DEV_CLAW_NETWORK:-manus-network-dev}
+      - RUNTIME_NETWORK_ISOLATION=true
+      - RUNTIME_DEPLOYMENT_ID=${RUNTIME_DEPLOYMENT_ID:-ai-manus-dev}
       - MONGODB_URI=mongodb://mongodb:27017
       - REDIS_HOST=redis
       - REDIS_PORT=6379
@@ -123,6 +155,7 @@ services:
     build:
       context: ./mockserver
       dockerfile: Dockerfile
+    command: ["./dev.sh"]
     volumes:
       - ./mockserver:/app  # Mount source code directory
       - /app/__pycache__  # Avoid overwriting cache files
@@ -157,17 +190,17 @@ services:
 
 volumes:
   mongodb_data:
-    name: manus-mongodb-data-dev
+    name: ${DEV_RESOURCE_PREFIX:-manus}-mongodb-data-dev
   redis_data:
-    name: manus-redis-data-dev
+    name: ${DEV_RESOURCE_PREFIX:-manus}-redis-data-dev
 
 networks:
   # User-controlled development runtimes and the backend communicate here.
   manus-network:
-    name: manus-network-dev
+    name: ${DEV_RESOURCE_PREFIX:-manus}-network-dev
     driver: bridge
   # MongoDB and Redis are intentionally unreachable from sandbox/Claw.
   manus-data-network:
-    name: manus-data-network-dev
+    name: ${DEV_RESOURCE_PREFIX:-manus}-data-network-dev
     driver: bridge
     internal: true

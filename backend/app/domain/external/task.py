@@ -3,6 +3,13 @@ from abc import ABC, abstractmethod
 from app.domain.external.message_queue import MessageQueue
 
 
+class RunnerCleanupCapacityError(RuntimeError):
+    """Transient backpressure before any per-runner handles are allocated."""
+
+    transient = True
+    retryable = True
+
+
 class TaskRunner(ABC):
     """Abstract base class defining the interface for task runners.
     

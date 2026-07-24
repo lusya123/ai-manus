@@ -1,4 +1,5 @@
 import os
+import ipaddress
 from urllib.parse import urlsplit
 import json
 import logging
@@ -20,6 +21,18 @@ INSECURE_JWT_SECRETS = {
 # Providers installed and supported by the per-session BYOK gateway. Keep this
 # as one backend-owned contract so the UI cannot advertise unsupported values.
 SUPPORTED_BYOK_PROVIDERS = ("openai", "anthropic", "deepseek", "ollama")
+
+# MongoDB rejects documents larger than 16 MiB.  Claw chat messages are
+# embedded in the same aggregate as lifecycle metadata, so history must leave
+# meaningful headroom for the rest of that document and BSON array overhead.
+CLAW_HISTORY_DEFAULT_MAX_BYTES = 8 * 1024 * 1024
+CLAW_HISTORY_SAFE_MAX_BYTES = 12 * 1024 * 1024
+# Session documents also embed canonical file metadata, so their event
+# projection needs more headroom than the Claw-only lifecycle aggregate.
+# Complete durable turn replay lives in the separate turn-output collection;
+# this embedded history is intentionally only a recent, bounded projection.
+SESSION_HISTORY_DEFAULT_MAX_BYTES = 6 * 1024 * 1024
+SESSION_HISTORY_SAFE_MAX_BYTES = 6 * 1024 * 1024
 
 
 def is_secure_jwt_secret(secret: str | None) -> bool:
@@ -135,6 +148,7 @@ class Settings(BaseSettings):
     redis_db: int = 0
     redis_password: str | None = None
     redis_socket_connect_timeout: float = 5.0
+    redis_socket_timeout: float = Field(default=5.0, gt=0)
     redis_health_check_interval: int = 30
     redis_max_connections: int = 100
     redis_retry_attempts: int = 3
@@ -158,6 +172,24 @@ class Settings(BaseSettings):
     sandbox_memory_limit: str | None = "2g"
     sandbox_cpu_limit: float | None = Field(default=2.0, gt=0)
     sandbox_pids_limit: int | None = Field(default=512, ge=32)
+    # Managed Docker sandbox/Claw containers are hostile execution domains.
+    # Give every runtime an internal control bridge plus a one-container egress
+    # bridge; only trusted backend/worker clients join the control bridge.
+    # Dynamic Docker runtimes require this durable provider-visible intent.
+    # Disabling it is accepted only when every enabled runtime is fixed-host
+    # (or the sandbox provider is non-Docker).
+    runtime_network_isolation: bool = True
+    runtime_gateway_container: str | None = None
+    # Stable scope for all dynamic Docker runtime names and labels.  Every
+    # replica in one deployment must use the same value; deployments sharing a
+    # Docker daemon must use different values.
+    runtime_deployment_id: str = "ai-manus"
+    # Explicit small subnets avoid exhausting Docker's much coarser default
+    # user-defined bridge pools. Each live runtime consumes two subnets.
+    runtime_network_address_pool: str = "10.240.0.0/12"
+    runtime_network_subnet_prefix: int = Field(default=28, ge=24, le=29)
+    runtime_network_gc_interval_seconds: int = Field(default=60, ge=10, le=3600)
+    runtime_network_gc_grace_seconds: int = Field(default=300, ge=60, le=86400)
 
     # Alibaba Cloud Wuying AgentBay (SANDBOX_PROVIDER=agentbay)
     agentbay_api_key: str | None = None
@@ -315,14 +347,37 @@ class Settings(BaseSettings):
     # fail-safe window after a crashed replica.
     claw_chat_turn_lease_seconds: int = 300
     claw_chat_max_message_bytes: int = 64 * 1024
+    # Bound both the in-memory stream and the assistant message persisted in
+    # the embedded Claw history document.
+    claw_chat_max_response_bytes: int = Field(default=256 * 1024, ge=1)
+    # A read timeout is not a whole-turn deadline: an upstream can otherwise
+    # keep a response alive forever with periodic keepalives.
+    claw_chat_max_duration_seconds: float = Field(default=300.0, gt=0)
+    # Enforce raw SSE limits before decoding/JSON parsing.  The stream limit
+    # includes framing and non-text events in addition to visible model text.
+    claw_chat_max_upstream_event_bytes: int = Field(
+        default=512 * 1024, ge=1
+    )
+    claw_chat_max_upstream_stream_bytes: int = Field(
+        default=2 * 1024 * 1024, ge=1
+    )
+    # Per-WebSocket subscriber memory budget.  Slow subscribers retain the
+    # latest turn only and always receive that turn's terminal event.
+    claw_event_queue_max_bytes: int = Field(default=512 * 1024, ge=1024)
     claw_chat_max_attachments: int = 10
     claw_chat_max_attachment_bytes: int = 25 * 1024 * 1024
     claw_chat_max_total_attachment_bytes: int = 50 * 1024 * 1024
     claw_upload_max_bytes: int = 25 * 1024 * 1024
-    # Atomic Mongo $push retains only this many recent chat records.  Together
-    # with the chat input limits this keeps the Claw document below MongoDB's
-    # 16 MiB document ceiling.
-    claw_history_max_messages: int = 128
+    # One atomic Mongo update retains the newest records satisfying both the
+    # count and aggregate BSON-byte budgets.  The byte ceiling deliberately
+    # stays below MongoDB's 16 MiB document limit to leave room for lifecycle
+    # fields and array/document overhead.
+    claw_history_max_messages: int = Field(default=128, ge=1, le=128)
+    claw_history_max_bytes: int = Field(
+        default=CLAW_HISTORY_DEFAULT_MAX_BYTES,
+        ge=1,
+        le=CLAW_HISTORY_SAFE_MAX_BYTES,
+    )
     # Total HTTP body cap enforced before FastAPI parses multipart uploads.
     # The extra MiB above the default per-file cap covers multipart metadata.
     multipart_upload_max_body_bytes: int = 26 * 1024 * 1024
@@ -346,10 +401,21 @@ class Settings(BaseSettings):
     # Terminal submissions retain their idempotency key for this window. Active
     # submissions have no TTL and therefore cannot disappear mid-execution.
     chat_turn_terminal_retention_days: int = 30
-    # Session history uses an atomic $push/$slice cap to stay below MongoDB's
-    # 16 MiB document ceiling even under concurrent writers.
-    session_history_max_events: int = 512
-    session_event_max_bytes: int = 256 * 1024
+    # One atomic Mongo update retains the newest events satisfying both count
+    # and aggregate BSON-byte budgets. Session.files shares this document, so
+    # the safe maximum deliberately reserves at least half of MongoDB's 16 MiB
+    # ceiling for canonical file metadata and the remaining session fields.
+    session_history_max_events: int = Field(default=512, ge=1, le=512)
+    session_event_max_bytes: int = Field(
+        default=256 * 1024,
+        ge=1024,
+        le=1024 * 1024,
+    )
+    session_history_max_bytes: int = Field(
+        default=SESSION_HISTORY_DEFAULT_MAX_BYTES,
+        ge=1,
+        le=SESSION_HISTORY_SAFE_MAX_BYTES,
+    )
 
     # Task backend configuration: "local" (in-process asyncio, default)
     # or "celery" (distributed Celery workers; requires running `app.worker`)
@@ -375,6 +441,51 @@ class Settings(BaseSettings):
         
     def validate(self):
         """Validate configuration settings"""
+        largest_claw_history_record = max(
+            int(self.claw_chat_max_message_bytes),
+            int(self.claw_chat_max_response_bytes),
+            int(self.claw_chat_max_upstream_event_bytes),
+            int(self.claw_chat_max_upstream_stream_bytes),
+        )
+        if self.claw_history_max_bytes < largest_claw_history_record + 4096:
+            raise ValueError(
+                "CLAW_HISTORY_MAX_BYTES must exceed every permitted Claw "
+                "message/response record by at least 4096 bytes"
+            )
+        if self.session_history_max_bytes < self.session_event_max_bytes + 4096:
+            raise ValueError(
+                "SESSION_HISTORY_MAX_BYTES must exceed "
+                "SESSION_EVENT_MAX_BYTES by at least 4096 bytes"
+            )
+        try:
+            runtime_pool = ipaddress.ip_network(
+                self.runtime_network_address_pool,
+                strict=True,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "RUNTIME_NETWORK_ADDRESS_POOL must be a canonical IPv4 CIDR"
+            ) from exc
+        if runtime_pool.version != 4:
+            raise ValueError("RUNTIME_NETWORK_ADDRESS_POOL must be IPv4")
+        if self.runtime_network_subnet_prefix <= runtime_pool.prefixlen:
+            raise ValueError(
+                "RUNTIME_NETWORK_SUBNET_PREFIX must be larger than the "
+                "address-pool prefix"
+            )
+        if self.runtime_network_gc_grace_seconds < (
+            self.runtime_network_gc_interval_seconds * 2
+        ):
+            raise ValueError(
+                "RUNTIME_NETWORK_GC_GRACE_SECONDS must be at least twice "
+                "RUNTIME_NETWORK_GC_INTERVAL_SECONDS"
+            )
+        if not self.runtime_deployment_id.strip() or len(
+            self.runtime_deployment_id
+        ) > 128:
+            raise ValueError(
+                "RUNTIME_DEPLOYMENT_ID must contain 1 to 128 characters"
+            )
         task_backend = (self.task_backend or "").strip().lower()
         if task_backend not in {"local", "celery"}:
             raise ValueError("TASK_BACKEND must be either 'local' or 'celery'")
@@ -393,6 +504,19 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"Unknown SANDBOX_PROVIDER '{sandbox_provider}' "
                 "(expected 'docker' or 'agentbay')"
+            )
+        dynamic_docker_sandbox = (
+            sandbox_provider == "docker" and not self.sandbox_address
+        )
+        dynamic_docker_claw = self.claw_enabled and not self.claw_address
+        if (
+            not self.runtime_network_isolation
+            and (dynamic_docker_sandbox or dynamic_docker_claw)
+        ):
+            raise ValueError(
+                "RUNTIME_NETWORK_ISOLATION=false is unsupported for dynamic "
+                "Docker Sandbox or Claw runtimes; use fixed runtime addresses "
+                "or enable isolated runtime networks"
             )
         if sandbox_provider == "agentbay":
             required_agentbay = {

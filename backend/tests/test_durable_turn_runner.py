@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -25,6 +26,7 @@ SESSION_ID = "session-1"
 USER_ID = "user-1"
 AGENT_ID = "agent-1"
 TASK_ID = "task-1"
+SANDBOX_ID = "sandbox-1"
 TURN_ID = "11111111-1111-4111-8111-111111111111"
 
 
@@ -158,7 +160,14 @@ class FakeSessionRepository:
         self.statuses = []
 
     async def find_by_id_and_user_id(self, session_id, user_id):
-        return SimpleNamespace(agent_id=AGENT_ID, task_id=TASK_ID)
+        return SimpleNamespace(
+            agent_id=AGENT_ID,
+            task_id=TASK_ID,
+            deleting=False,
+            sandbox_destroying=False,
+            sandbox_id=SANDBOX_ID,
+            task_sandbox_id=SANDBOX_ID,
+        )
 
     async def add_event_once(self, session_id, event):
         if all(existing.id != event.id for existing in self.events):
@@ -257,6 +266,7 @@ def _build_runner(
     runner._session_id = SESSION_ID
     runner._agent_id = AGENT_ID
     runner._user_id = USER_ID
+    runner._sandbox_id = SANDBOX_ID
     runner._worker_id = "worker-1"
     runner._claim_seconds = 60
     runner._claim_renew_seconds = 3_600
@@ -308,6 +318,87 @@ def test_turn_submission_mapping_and_retry_keep_waiting_resume_decision():
     legacy_payload = original.model_dump(exclude={"resumes_waiting"})
     legacy = TurnSubmissionDocument.model_construct(**legacy_payload).to_domain()
     assert legacy.resumes_waiting is False
+
+
+@pytest.mark.asyncio
+async def test_mongo_claim_response_loss_reconciles_exact_owner(monkeypatch):
+    owner = "worker-1:1-0"
+    running = FakeTurnRepository().turn
+    running.state = TurnSubmissionState.RUNNING
+    running.claim_owner = owner
+    running.claim_until = datetime.now(UTC) + timedelta(minutes=1)
+    running.attempt = 1
+
+    class ResponseLossCollection:
+        async def find_one_and_update(self, *args, **kwargs):
+            raise ConnectionError("claim response lost after commit")
+
+        async def find_one(self, query):
+            return running.model_dump()
+
+    repository = MongoTurnSubmissionRepository(
+        max_active_per_session=1,
+        max_active_per_user=1,
+        max_payload_bytes=1024,
+        terminal_retention_days=1,
+    )
+    collection = ResponseLossCollection()
+    monkeypatch.setattr(repository, "_turn_collection", lambda: collection)
+
+    claim = await repository.claim_for_execution(
+        SESSION_ID,
+        TURN_ID,
+        task_id=TASK_ID,
+        owner=owner,
+        claim_until=running.claim_until,
+    )
+
+    assert claim.decision == TurnClaimDecision.EXECUTE
+    assert claim.turn.state == TurnSubmissionState.RUNNING
+    assert claim.turn.claim_owner == owner
+
+
+@pytest.mark.asyncio
+async def test_mongo_terminal_response_loss_confirms_terminal_postcondition(
+    monkeypatch,
+):
+    terminal = FakeTurnRepository().turn
+    terminal.state = TurnSubmissionState.CANCELLED
+    terminal.claim_owner = None
+    terminal.claim_until = None
+    terminal.terminal_error = "Execution was cancelled"
+    terminal.expires_at = datetime.now(UTC) + timedelta(days=1)
+
+    class ResponseLossCollection:
+        async def find_one_and_update(self, *args, **kwargs):
+            raise ConnectionError("terminal response lost after commit")
+
+        async def find_one(self, query):
+            return terminal.model_dump()
+
+    repository = MongoTurnSubmissionRepository(
+        max_active_per_session=1,
+        max_active_per_user=1,
+        max_payload_bytes=1024,
+        terminal_retention_days=1,
+    )
+    collection = ResponseLossCollection()
+    repaired = []
+
+    async def repair(turn):
+        repaired.append(turn.state)
+
+    monkeypatch.setattr(repository, "_turn_collection", lambda: collection)
+    monkeypatch.setattr(repository, "_repair_terminal_postconditions", repair)
+
+    assert await repository.mark_terminal(
+        SESSION_ID,
+        TURN_ID,
+        owner="worker-1:1-0",
+        state=TurnSubmissionState.CANCELLED,
+        error="Execution was cancelled",
+    )
+    assert repaired == [TurnSubmissionState.CANCELLED]
 
 
 @pytest.mark.asyncio
@@ -416,6 +507,301 @@ async def test_cancelled_execution_persists_cancelled_before_ack():
 
 
 @pytest.mark.asyncio
+async def test_cancel_event_failure_cannot_block_terminal_cas_and_ack():
+    class TransientTerminalRepository(FakeTurnRepository):
+        def __init__(self):
+            super().__init__()
+            self.mark_calls = 0
+
+        async def mark_terminal(self, *args, **kwargs):
+            self.mark_calls += 1
+            if self.mark_calls == 1:
+                raise ConnectionError("terminal CAS temporarily unavailable")
+            return await super().mark_terminal(*args, **kwargs)
+
+    class FailingEventSessionRepository(FakeSessionRepository):
+        async def add_event_once(self, session_id, event):
+            raise ConnectionError("session event projection unavailable")
+
+    repository = TransientTerminalRepository()
+    flow_started = asyncio.Event()
+
+    async def blocking_flow(message, resumes_waiting=None):
+        flow_started.set()
+        await asyncio.Event().wait()
+        yield DoneEvent()
+
+    runner, task, _ = _build_runner(repository, run_flow=blocking_flow)
+    runner._session_repository = FailingEventSessionRepository()
+    execution = asyncio.create_task(
+        runner._process_durable_entry(task, "1-0", _input_json())
+    )
+    await asyncio.wait_for(flow_started.wait(), timeout=1)
+    execution.cancel("cancel_requested")
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(execution, timeout=1)
+
+    assert repository.mark_calls == 2
+    assert repository.turn.state == TurnSubmissionState.CANCELLED
+    assert repository.turn.terminal_event_id is None
+    assert repository.terminal_calls == [TurnSubmissionState.CANCELLED]
+    assert [event.id for event in repository.outbox] == [
+        f"{TURN_ID}:cancelled"
+    ]
+    assert task.input_stream.acked == [
+        (runner._INPUT_CONSUMER_GROUP, "1-0")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_terminal_ack_loss_duplicate_only_retries_ack():
+    repository = FakeTurnRepository()
+    input_stream = FakeInputStream(fail_ack_once=True)
+    flow_started = asyncio.Event()
+    flow_invocations = 0
+
+    async def blocking_flow(message, resumes_waiting=None):
+        nonlocal flow_invocations
+        flow_invocations += 1
+        flow_started.set()
+        await asyncio.Event().wait()
+        yield DoneEvent()
+
+    runner, task, flow_calls = _build_runner(
+        repository,
+        input_stream=input_stream,
+        run_flow=blocking_flow,
+    )
+    execution = asyncio.create_task(
+        runner._process_durable_entry(task, "1-0", _input_json())
+    )
+    await asyncio.wait_for(flow_started.wait(), timeout=1)
+    execution.cancel("cancel_requested")
+
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+    assert repository.turn.state == TurnSubmissionState.CANCELLED
+    assert input_stream.ack_attempts == 1
+    assert input_stream.acked == []
+
+    assert await runner._process_durable_entry(task, "1-0", _input_json())
+    assert repository.terminal_calls == [TurnSubmissionState.CANCELLED]
+    assert input_stream.ack_attempts == 2
+    assert input_stream.acked == [
+        (runner._INPUT_CONSUMER_GROUP, "1-0")
+    ]
+    assert flow_invocations == 1
+    assert runner._sandbox.ensure_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_claim_cancel_waits_for_ack_before_propagating():
+    class TerminalReplyRepository(FakeTurnRepository):
+        def __init__(self):
+            super().__init__(state=TurnSubmissionState.COMPLETED)
+            self.claim_replied = asyncio.Event()
+            self.release_reply = asyncio.Event()
+
+        async def claim_for_execution(self, *args, **kwargs):
+            result = await super().claim_for_execution(*args, **kwargs)
+            self.claim_replied.set()
+            await self.release_reply.wait()
+            return result
+
+    class BlockingAckInput(FakeInputStream):
+        def __init__(self):
+            super().__init__()
+            self.ack_started = asyncio.Event()
+            self.release_ack = asyncio.Event()
+
+        async def ack(self, group, transport_id):
+            self.ack_started.set()
+            await self.release_ack.wait()
+            return await super().ack(group, transport_id)
+
+    repository = TerminalReplyRepository()
+    input_stream = BlockingAckInput()
+    runner, task, flow_calls = _build_runner(
+        repository, input_stream=input_stream
+    )
+    execution = asyncio.create_task(
+        runner._process_durable_entry(task, "1-0", _input_json())
+    )
+    await asyncio.wait_for(repository.claim_replied.wait(), timeout=1)
+    execution.cancel("cancel_requested")
+    repository.release_reply.set()
+    await asyncio.wait_for(input_stream.ack_started.wait(), timeout=1)
+
+    execution.cancel("cancel_requested")
+    await asyncio.sleep(0)
+    assert not execution.done()
+    input_stream.release_ack.set()
+
+    with pytest.raises(asyncio.CancelledError) as cancellation:
+        await execution
+    assert cancellation.value.args == ("cancel_requested",)
+    assert input_stream.acked == [
+        (runner._INPUT_CONSUMER_GROUP, "1-0")
+    ]
+    assert flow_calls["count"] == 0
+    assert runner._sandbox.ensure_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancel_during_committed_claim_waits_then_terminalizes():
+    class CommitBeforeReplyRepository(FakeTurnRepository):
+        def __init__(self):
+            super().__init__()
+            self.claim_committed = asyncio.Event()
+            self.release_reply = asyncio.Event()
+
+        async def claim_for_execution(
+            self, session_id, submission_id, *, task_id, owner, claim_until
+        ):
+            result = await super().claim_for_execution(
+                session_id,
+                submission_id,
+                task_id=task_id,
+                owner=owner,
+                claim_until=claim_until,
+            )
+            self.claim_committed.set()
+            await self.release_reply.wait()
+            return result
+
+    repository = CommitBeforeReplyRepository()
+    runner, task, flow_calls = _build_runner(repository)
+    execution = asyncio.create_task(
+        runner._process_durable_entry(task, "1-0", _input_json())
+    )
+    await asyncio.wait_for(repository.claim_committed.wait(), timeout=1)
+
+    execution.cancel("cancel_requested")
+    await asyncio.sleep(0)
+    execution.cancel("cancel_requested")
+    await asyncio.sleep(0)
+
+    assert not execution.done()
+    repository.release_reply.set()
+    with pytest.raises(asyncio.CancelledError) as cancellation:
+        await execution
+
+    assert cancellation.value.args == ("cancel_requested",)
+    assert repository.turn.state == TurnSubmissionState.CANCELLED
+    assert repository.terminal_calls == [TurnSubmissionState.CANCELLED]
+    assert task.input_stream.acked
+    assert runner._sandbox.ensure_calls == 0
+    assert flow_calls["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_claim_during_status_projection_terminalizes_owner():
+    class BlockingTerminalRepository(FakeTurnRepository):
+        def __init__(self):
+            super().__init__()
+            self.terminal_started = asyncio.Event()
+            self.release_terminal = asyncio.Event()
+
+        async def mark_terminal(self, *args, **kwargs):
+            self.terminal_started.set()
+            await self.release_terminal.wait()
+            return await super().mark_terminal(*args, **kwargs)
+
+    repository = BlockingTerminalRepository()
+    runner, task, flow_calls = _build_runner(repository)
+    projection_started = asyncio.Event()
+    projection_calls = 0
+
+    async def blocking_first_projection(*, idle_status="completed"):
+        nonlocal projection_calls
+        projection_calls += 1
+        if projection_calls == 1:
+            projection_started.set()
+            await asyncio.Event().wait()
+
+    runner._sync_durable_session_status = blocking_first_projection
+    execution = asyncio.create_task(
+        runner._process_durable_entry(task, "1-0", _input_json())
+    )
+    await asyncio.wait_for(projection_started.wait(), timeout=1)
+    assert repository.turn.state == TurnSubmissionState.RUNNING
+
+    execution.cancel("cancel_requested")
+    await asyncio.wait_for(repository.terminal_started.wait(), timeout=1)
+    execution.cancel("cancel_requested")
+    await asyncio.sleep(0)
+
+    assert not execution.done()
+    assert repository.turn.state == TurnSubmissionState.RUNNING
+    repository.release_terminal.set()
+    with pytest.raises(asyncio.CancelledError) as cancellation:
+        await execution
+
+    assert cancellation.value.args == ("cancel_requested",)
+    assert repository.turn.state == TurnSubmissionState.CANCELLED
+    assert repository.terminal_calls == [TurnSubmissionState.CANCELLED]
+    assert task.input_stream.acked
+    assert runner._sandbox.ensure_calls == 0
+    assert flow_calls["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_post_claim_session_recheck_settles_changed_lifecycle_without_runtime():
+    class BlockingTerminalRepository(FakeTurnRepository):
+        def __init__(self):
+            super().__init__()
+            self.terminal_started = asyncio.Event()
+            self.release_terminal = asyncio.Event()
+
+        async def mark_terminal(self, *args, **kwargs):
+            self.terminal_started.set()
+            await self.release_terminal.wait()
+            return await super().mark_terminal(*args, **kwargs)
+
+    repository = BlockingTerminalRepository()
+    runner, task, flow_calls = _build_runner(repository)
+    reads = 0
+
+    async def lifecycle_changes_after_claim(session_id, user_id):
+        nonlocal reads
+        reads += 1
+        return SimpleNamespace(
+            agent_id=AGENT_ID,
+            task_id=TASK_ID,
+            deleting=reads > 1,
+            sandbox_destroying=False,
+            sandbox_id=SANDBOX_ID,
+            task_sandbox_id=SANDBOX_ID,
+        )
+
+    runner._session_repository.find_by_id_and_user_id = (
+        lifecycle_changes_after_claim
+    )
+
+    execution = asyncio.create_task(
+        runner._process_durable_entry(task, "1-0", _input_json())
+    )
+    await asyncio.wait_for(repository.terminal_started.wait(), timeout=1)
+    execution.cancel("cancel_requested")
+    await asyncio.sleep(0)
+
+    assert not execution.done()
+    assert repository.turn.state == TurnSubmissionState.RUNNING
+    repository.release_terminal.set()
+    with pytest.raises(asyncio.CancelledError) as cancellation:
+        await execution
+
+    assert cancellation.value.args == ("session_lifecycle_changed",)
+    assert reads == 2
+    assert repository.turn.state == TurnSubmissionState.CANCELLED
+    assert repository.terminal_calls == [TurnSubmissionState.CANCELLED]
+    assert task.input_stream.acked
+    assert runner._sandbox.ensure_calls == 0
+    assert flow_calls["count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_control_claim_loss_leaves_running_turn_unacked_for_expiry():
     repository = FakeTurnRepository()
     flow_started = asyncio.Event()
@@ -450,6 +836,10 @@ async def test_stale_worker_only_acks_transport_rebound_to_replacement_task():
         return SimpleNamespace(
             agent_id=AGENT_ID,
             task_id="replacement-task",
+            deleting=False,
+            sandbox_destroying=False,
+            sandbox_id=SANDBOX_ID,
+            task_sandbox_id=SANDBOX_ID,
         )
 
     runner._session_repository.find_by_id_and_user_id = replacement_session

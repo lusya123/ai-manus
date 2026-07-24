@@ -7,7 +7,7 @@ import {
 import type { ApiClientRequestConfig } from './client';
 import { getStoredToken } from './auth';
 
-export type ClawStatus = 'creating' | 'running' | 'stopped' | 'error';
+export type ClawStatus = 'creating' | 'running' | 'destroying' | 'stopped' | 'error';
 
 export interface Claw {
   id: string;

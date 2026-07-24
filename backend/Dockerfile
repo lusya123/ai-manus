@@ -9,8 +9,9 @@ RUN apt-get update && apt-get install -y curl
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y nodejs
 
-# Install uv
-RUN pip install uv
+# Match CI and Sandbox so lockfile installation remains reproducible across
+# local builds, release builds, and rollback rebuilds.
+RUN pip install uv==0.7.12
 
 # Install the exact dependency graph reviewed in source control.
 COPY pyproject.toml uv.lock ./

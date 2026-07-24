@@ -27,6 +27,7 @@ class RedisClient:
                 password=self._settings.redis_password,
                 decode_responses=True,
                 socket_connect_timeout=self._settings.redis_socket_connect_timeout,
+                socket_timeout=self._settings.redis_socket_timeout,
                 socket_keepalive=True,
                 health_check_interval=self._settings.redis_health_check_interval,
                 max_connections=self._settings.redis_max_connections,

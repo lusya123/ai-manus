@@ -3,7 +3,7 @@ Unit tests for the AgentBay sandbox provider.
 
 These tests mock the AgentBay SDK objects — no network or credentials needed.
 """
-import io
+import httpx
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -360,6 +360,119 @@ class TestHttpMethodsUseGatewayUrl:
         url = sb.client.post.call_args.args[0]
         assert url == "https://gw.example/api/api/v1/shell/exec"
 
+    async def test_file_find_has_a_short_operation_timeout(self):
+        session = _fake_session()
+        sb = AgentBaySandbox(
+            session,
+            "https://gw.example/api",
+            "wss://gw",
+            "wss://gw",
+        )
+
+        response = MagicMock()
+        response.json.return_value = {
+            "success": True,
+            "message": "ok",
+            "data": {"files": []},
+        }
+        sb.client.post = AsyncMock(return_value=response)
+
+        result = await sb.file_find("/home/ubuntu", "**/*.md")
+
+        assert result.success is True
+        assert sb.client.post.call_args.kwargs["timeout"] == 15.0
+
+    @pytest.mark.parametrize(
+        ("path", "glob_pattern"),
+        [
+            ("/", "**/PLAN.md"),
+            ("/", "home/*.md"),
+            ("/", "**"),
+            ("//", "**/PLAN.md"),
+            ("////", "home/*.md"),
+            ("/proc", "**/*.txt"),
+            ("//proc", "**/*.txt"),
+            ("////proc//self", "**/*.txt"),
+            ("../../..", "*.md"),
+            ("../../../proc", "*.md"),
+            ("foo/../../proc", "*.md"),
+            ("/home/ubuntu", "../*.md"),
+            ("/home/ubuntu", "/etc/*"),
+        ],
+    )
+    async def test_file_find_rejects_dangerous_globs_before_http(
+        self,
+        path,
+        glob_pattern,
+    ):
+        session = _fake_session()
+        sb = AgentBaySandbox(
+            session,
+            "https://gw.example/api",
+            "wss://gw",
+            "wss://gw",
+        )
+        sb.client.post = AsyncMock()
+
+        with pytest.raises(ValueError):
+            await sb.file_find(path, glob_pattern)
+
+        sb.client.post.assert_not_awaited()
+
+    async def test_file_find_allows_root_level_non_recursive_lookup(self):
+        session = _fake_session()
+        sb = AgentBaySandbox(
+            session,
+            "https://gw.example/api",
+            "wss://gw",
+            "wss://gw",
+        )
+        response = MagicMock()
+        response.json.return_value = {
+            "success": True,
+            "message": "ok",
+            "data": {"files": []},
+        }
+        sb.client.post = AsyncMock(return_value=response)
+
+        result = await sb.file_find("/", "*.md")
+
+        assert result.success is True
+        sb.client.post.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        ("path", "expected_path"),
+        [
+            ("//", "/"),
+            ("//home/ubuntu", "/home/ubuntu"),
+            ("////home///ubuntu//", "/home/ubuntu"),
+        ],
+    )
+    async def test_file_find_canonicalizes_absolute_path_before_http(
+        self,
+        path,
+        expected_path,
+    ):
+        session = _fake_session()
+        sb = AgentBaySandbox(
+            session,
+            "https://gw.example/api",
+            "wss://gw",
+            "wss://gw",
+        )
+        response = MagicMock()
+        response.json.return_value = {
+            "success": True,
+            "message": "ok",
+            "data": {"files": []},
+        }
+        sb.client.post = AsyncMock(return_value=response)
+
+        result = await sb.file_find(path, "*.md")
+
+        assert result.success is True
+        assert sb.client.post.call_args.kwargs["json"]["path"] == expected_path
+
     async def test_signed_gateway_query_is_preserved_after_appended_api_path(self):
         session = _fake_session()
         sb = AgentBaySandbox(
@@ -384,15 +497,128 @@ class TestHttpMethodsUseGatewayUrl:
     async def test_file_download_gets_from_gateway(self):
         session = _fake_session()
         sb = AgentBaySandbox(session, "https://gw.example/api", "wss://gw", "wss://gw")
+        await sb.client.aclose()
+        requested_urls = []
 
-        response = MagicMock()
-        response.content = b"file-bytes"
-        response.raise_for_status = MagicMock()
-        sb.client.get = AsyncMock(return_value=response)
+        def handle_request(request):
+            requested_urls.append(str(request.url))
+            return httpx.Response(200, content=b"file-bytes")
 
-        stream = await sb.file_download("/tmp/x.txt")
-        assert isinstance(stream, io.BytesIO)
-        assert stream.read() == b"file-bytes"
+        sb.client = httpx.AsyncClient(transport=httpx.MockTransport(handle_request))
+        try:
+            stream = await sb.file_download("/tmp/x.txt")
+            assert stream.read() == b"file-bytes"
+            stream.close()
+            assert requested_urls == [
+                "https://gw.example/api/api/v1/file/download?path=%2Ftmp%2Fx.txt"
+            ]
+        finally:
+            await sb.aclose()
+
+    async def test_file_download_preserves_signed_gateway_query(self):
+        session = _fake_session()
+        sb = AgentBaySandbox(
+            session,
+            "https://gw.example/session?signature=signed-value&expires=123",
+            "wss://gw",
+            "wss://gw",
+        )
+        await sb.client.aclose()
+        requested_urls = []
+
+        def handle_request(request):
+            requested_urls.append(str(request.url))
+            return httpx.Response(200, content=b"file-bytes")
+
+        sb.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handle_request)
+        )
+        try:
+            stream = await sb.file_download("/tmp/x.txt")
+            stream.close()
+        finally:
+            await sb.aclose()
+
+        assert requested_urls == [
+            "https://gw.example/session/api/v1/file/download"
+            "?signature=signed-value&expires=123&path=%2Ftmp%2Fx.txt"
+        ]
+
+    async def test_file_download_rejects_declared_oversize_before_buffering(
+        self,
+        monkeypatch,
+    ):
+        from app.core.config import get_settings
+
+        monkeypatch.setenv("FILE_UPLOAD_MAX_BYTES", "4")
+        get_settings.cache_clear()
+        session = _fake_session()
+        sb = AgentBaySandbox(session, "https://gw.example/api", "wss://gw", "wss://gw")
+        await sb.client.aclose()
+        sb.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    headers={"content-length": "5"},
+                    content=b"12345",
+                )
+            )
+        )
+        try:
+            with pytest.raises(ValueError, match="download limit"):
+                await sb.file_download("/tmp/large.bin")
+        finally:
+            await sb.aclose()
+            get_settings.cache_clear()
+
+    async def test_file_download_rejects_streamed_oversize_without_length(
+        self,
+        monkeypatch,
+    ):
+        from app.core.config import get_settings
+
+        monkeypatch.setenv("FILE_UPLOAD_MAX_BYTES", "4")
+        get_settings.cache_clear()
+        sb = AgentBaySandbox(
+            _fake_session(),
+            "https://gw.example/api",
+            "wss://gw",
+            "wss://gw",
+        )
+        await sb.client.aclose()
+        sb.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, content=b"12345")
+            )
+        )
+        try:
+            with pytest.raises(ValueError, match="download limit"):
+                await sb.file_download("/tmp/large.bin")
+        finally:
+            await sb.aclose()
+            get_settings.cache_clear()
+
+    async def test_file_download_rolls_large_result_to_spooled_disk(self):
+        sb = AgentBaySandbox(
+            _fake_session(),
+            "https://gw.example/api",
+            "wss://gw",
+            "wss://gw",
+        )
+        sb._FILE_DOWNLOAD_SPOOL_BYTES = 2
+        await sb.client.aclose()
+        sb.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, content=b"12345")
+            )
+        )
+        try:
+            stream = await sb.file_download("/tmp/file.bin")
+            assert stream.read() == b"12345"
+            assert stream._rolled is True
+            stream.close()
+        finally:
+            await sb.aclose()
 
 
 class TestProviderSwitch:

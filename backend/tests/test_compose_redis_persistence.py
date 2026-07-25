@@ -407,6 +407,26 @@ def test_fork_deployment_fails_closed_and_bounds_hotpatch_state():
     )
     deploy_script = ssh_step["with"]["script"]
 
+    assert "require_docker() {" in deploy_script
+    assert "timeout 5s docker info --format" in deploy_script
+    docker_readiness_calls = [
+        index
+        for index in range(len(deploy_script))
+        if deploy_script.startswith("\nrequire_docker\n", index)
+    ]
+    assert len(docker_readiness_calls) == 2
+    assert docker_readiness_calls[0] < deploy_script.index(
+        'previous_compose="$(mktemp)"'
+    )
+    assert (
+        deploy_script.index(
+            'docker compose -p ai-manus -f "$incoming_compose" '
+            '-f "$incoming_override" config -q'
+        )
+        < docker_readiness_calls[1]
+        < deploy_script.index("changed=true")
+    )
+
     retained_guard = (
         'docker container inspect "$HOTPATCH_TARGET" >/dev/null 2>&1 && '
         "\\\n  "
@@ -425,6 +445,24 @@ def test_fork_deployment_fails_closed_and_bounds_hotpatch_state():
     assert 'export DOCKER_CONFIG="$registry_docker_config"' in deploy_script
     assert deploy_script.count("cleanup_registry_login") >= 3
     assert 'docker logout "$REGISTRY"' in deploy_script
+    assert (
+        'mongodb_id_before="$(restore_compose ps -q mongodb 2>/dev/null || true)"'
+        not in deploy_script
+    )
+    assert (
+        'redis_id_before="$(restore_compose ps -q redis 2>/dev/null || true)"'
+        not in deploy_script
+    )
+    assert 'if ! mongodb_id_before="$(restore_compose ps -q mongodb)"; then' in (
+        deploy_script
+    )
+    assert 'if ! redis_id_before="$(restore_compose ps -q redis)"; then' in (
+        deploy_script
+    )
+    assert (
+        "the existing Compose deployment has no running MongoDB or Redis container"
+        in deploy_script
+    )
 
 
 def test_public_compose_example_requires_host_injected_secrets():

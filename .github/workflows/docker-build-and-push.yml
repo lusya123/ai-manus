@@ -402,6 +402,37 @@ jobs:
             set -eu
             cd "$DEPLOY_PATH"
 
+            require_docker() {
+              if ! command -v docker >/dev/null 2>&1; then
+                echo "Docker CLI is unavailable; refusing deployment." >&2
+                return 1
+              fi
+              if ! docker compose version >/dev/null 2>&1; then
+                echo "Docker Compose v2 is unavailable; refusing deployment." >&2
+                return 1
+              fi
+
+              docker_ready_attempt=1
+              docker_ready_last_error=""
+              while [ "$docker_ready_attempt" -le 12 ]; do
+                if docker_ready_last_error="$(
+                  timeout 5s docker info --format '{{.ServerVersion}}' 2>&1
+                )"; then
+                  return 0
+                fi
+                if [ "$docker_ready_attempt" -lt 12 ]; then
+                  sleep 5
+                fi
+                docker_ready_attempt=$((docker_ready_attempt + 1))
+              done
+
+              echo "Docker daemon remained unavailable after bounded retries; no deployment mutation was performed." >&2
+              printf '%s\n' "$docker_ready_last_error" >&2
+              return 1
+            }
+
+            require_docker
+
             previous_compose="$(mktemp)"
             previous_override="$(mktemp)"
             incoming_compose="$(mktemp .docker-compose.yml.new.XXXXXX)"
@@ -541,14 +572,27 @@ jobs:
             PY
             }
 
-            if [ "$had_previous_compose" = true ] && \
-              restore_compose config -q >/dev/null 2>&1; then
-              mongodb_id_before="$(restore_compose ps -q mongodb 2>/dev/null || true)"
-              redis_id_before="$(restore_compose ps -q redis 2>/dev/null || true)"
+            if [ "$had_previous_compose" = true ]; then
+              if ! restore_compose config -q; then
+                echo "Existing Compose configuration is invalid; refusing deployment before stateful-service inspection." >&2
+                exit 1
+              fi
+              if ! mongodb_id_before="$(restore_compose ps -q mongodb)"; then
+                echo "Could not query the existing MongoDB container through Docker; refusing deployment." >&2
+                exit 1
+              fi
+              if ! redis_id_before="$(restore_compose ps -q redis)"; then
+                echo "Could not query the existing Redis container through Docker; refusing deployment." >&2
+                exit 1
+              fi
+              if [ -z "$mongodb_id_before" ] || [ -z "$redis_id_before" ]; then
+                echo "Docker is reachable, but the existing Compose deployment has no running MongoDB or Redis container; refusing deployment." >&2
+                exit 1
+              fi
             fi
             if [ "${HOTPATCH_ENABLED:-false}" = true ] && \
               { [ -z "$mongodb_id_before" ] || [ -z "$redis_id_before" ]; }; then
-              echo "Refusing deployment without the existing MongoDB and Redis fingerprints." >&2
+              echo "The authorized hotpatch requires existing MongoDB and Redis container fingerprints; refusing deployment." >&2
               exit 1
             fi
 
@@ -2255,6 +2299,7 @@ jobs:
             chmod 600 "$incoming_override"
 
             docker compose -p ai-manus -f "$incoming_compose" -f "$incoming_override" config -q
+            require_docker
             changed=true
             mv -f "$incoming_compose" docker-compose.yml
             incoming_compose=""

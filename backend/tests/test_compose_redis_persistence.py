@@ -347,11 +347,29 @@ def test_fork_deployment_uses_approved_sha_and_immutable_image_digests():
     workflow = yaml.safe_load(
         (PROJECT_ROOT / ".github/workflows/docker-build-and-push.yml").read_text()
     )
+    publish_preflight = workflow["jobs"]["publish-preflight"]
     preflight = workflow["jobs"]["deploy-preflight"]
     publish = workflow["jobs"]["publish-fork-images"]
     deploy = workflow["jobs"]["deploy-fork"]
 
+    assert "environment" not in publish_preflight
+    authorization_step = next(
+        step
+        for step in publish_preflight["steps"]
+        if step.get("id") == "authorization"
+    )
+    assert authorization_step["env"]["EXPECTED_SHA"] == (
+        "${{ inputs.expected_sha }}"
+    )
+    assert '"$EXPECTED_SHA" != "$GITHUB_SHA"' in authorization_step["run"]
+    assert publish["needs"] == "publish-preflight"
+    assert publish["if"] == (
+        "needs.publish-preflight.outputs.enabled == 'true'"
+    )
+    assert publish["permissions"]["packages"] == "write"
+
     assert preflight["environment"] == "fork-production"
+    assert preflight["needs"] == "publish-fork-images"
     approval_step = next(
         step for step in preflight["steps"] if step.get("id") == "secrets"
     )
@@ -372,6 +390,9 @@ def test_fork_deployment_uses_approved_sha_and_immutable_image_digests():
     )
     assert "sha256:[0-9a-f]{64}" in digest_step["run"]
 
+    assert deploy["needs"] == "deploy-preflight"
+    assert "inputs.deploy_fork == true" in deploy["if"]
+    assert "needs.deploy-preflight.outputs.enabled == 'true'" in deploy["if"]
     prepare_step = next(step for step in deploy["steps"] if step.get("id") == "deploy")
     assert "ai-manus-${component}@${digest}" in prepare_step["run"]
     ssh_step = next(step for step in deploy["steps"] if step.get("uses") == SSH_ACTION)

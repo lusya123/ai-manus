@@ -1,4 +1,4 @@
-name: Build and Push Docker Images to Docker Hub
+name: Build, Test, and Publish Docker Images
 
 on:
   push:
@@ -16,14 +16,19 @@ on:
       - custom
   workflow_dispatch:
     inputs:
+      publish_fork_images:
+        description: Publish immutable fork images to GHCR without deploying
+        required: true
+        type: boolean
+        default: false
       deploy_fork:
-        description: Publish fork images and deploy them to the configured server
+        description: Deploy published fork images after all deployment gates pass
         required: true
         type: boolean
         default: false
       expected_sha:
-        description: Exact 40-character commit SHA authorized for deployment
-        required: false
+        description: Exact 40-character commit SHA authorized for publication
+        required: true
         type: string
 
 permissions:
@@ -210,60 +215,56 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Fork-only deployment is deliberately explicit and opt-in. A tag push runs
-  # the complete test/build pipeline but never contacts a server. Deployment
-  # requires a separate workflow_dispatch, an exact ref, an exact SHA and the
-  # repository-level ENABLE_FORK_DEPLOY gate.
-  deploy-preflight:
+  # Fork-only GHCR publication and server deployment are separate, explicit
+  # operations. A publish-only dispatch never reads server secrets or enters
+  # the fork-production environment. Deployment additionally requires the
+  # repository-level gate and an environment-approved immutable SHA.
+  publish-preflight:
     runs-on: ubuntu-latest
     needs: build-and-push
-    environment: fork-production
     if: >-
       (
         github.event_name == 'workflow_dispatch' &&
-        inputs.deploy_fork == true &&
         (
-          github.ref == 'refs/heads/main' ||
-          github.ref == 'refs/heads/custom' ||
-          github.ref == 'refs/tags/deploy-test-20260721-artifact-fix-01'
-        ) &&
-        inputs.expected_sha == github.sha &&
-        vars.ENABLE_FORK_DEPLOY == 'true'
+          inputs.publish_fork_images == true ||
+          inputs.deploy_fork == true
+        )
       )
     outputs:
-      enabled: ${{ steps.secrets.outputs.enabled }}
+      enabled: ${{ steps.authorization.outputs.enabled }}
     steps:
-      - name: Verify deployment secrets
-        id: secrets
+      - name: Authorize immutable GHCR publication
+        id: authorization
         env:
-          SERVER_HOST: ${{ secrets.SERVER_HOST }}
-          SERVER_USER: ${{ secrets.SERVER_USER }}
-          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
-          APPROVED_SHA: ${{ vars.FORK_DEPLOY_APPROVED_SHA }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          REQUESTED_REF: ${{ github.ref }}
         shell: bash
         run: |
-          if [[ ! "$APPROVED_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$APPROVED_SHA" != "$GITHUB_SHA" ]]; then
-            echo "::error::FORK_DEPLOY_APPROVED_SHA does not authorize this immutable commit."
+          if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$EXPECTED_SHA" != "$GITHUB_SHA" ]]; then
+            echo "::error::expected_sha does not authorize this immutable commit."
             exit 1
           fi
-          if [[ -n "$SERVER_HOST" && -n "$SERVER_USER" && -n "$SERVER_PASSWORD" ]]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::error::Fork deployment was authorized, but one or more SERVER_* secrets are missing."
-            exit 1
-          fi
+          case "$REQUESTED_REF" in
+            refs/heads/main|refs/heads/custom|refs/tags/deploy-test-20260721-artifact-fix-01)
+              ;;
+            *)
+              echo "::error::GHCR publication is not allowed from ${REQUESTED_REF}."
+              exit 1
+              ;;
+          esac
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
 
   publish-fork-images:
     runs-on: ubuntu-latest
-    needs: deploy-preflight
-    if: needs.deploy-preflight.outputs.enabled == 'true'
+    needs: publish-preflight
+    if: needs.publish-preflight.outputs.enabled == 'true'
     permissions:
       contents: read
       packages: write
     strategy:
       fail-fast: false
       matrix:
-        # mockserver is fork-deployment-only; the upstream Docker Hub matrix
+        # mockserver is fork-publication-only; the upstream Docker Hub matrix
         # intentionally remains unchanged above.
         component: [frontend, backend, sandbox, claw, mockserver]
     env:
@@ -325,11 +326,55 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  deploy-preflight:
+    runs-on: ubuntu-latest
+    needs: publish-fork-images
+    environment: fork-production
+    if: >-
+      (
+        github.event_name == 'workflow_dispatch' &&
+        inputs.deploy_fork == true &&
+        (
+          github.ref == 'refs/heads/main' ||
+          github.ref == 'refs/heads/custom' ||
+          github.ref == 'refs/tags/deploy-test-20260721-artifact-fix-01'
+        ) &&
+        inputs.expected_sha == github.sha &&
+        vars.ENABLE_FORK_DEPLOY == 'true'
+      )
+    outputs:
+      enabled: ${{ steps.secrets.outputs.enabled }}
+    steps:
+      - name: Verify deployment secrets
+        id: secrets
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          APPROVED_SHA: ${{ vars.FORK_DEPLOY_APPROVED_SHA }}
+        shell: bash
+        run: |
+          if [[ ! "$APPROVED_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$APPROVED_SHA" != "$GITHUB_SHA" ]]; then
+            echo "::error::FORK_DEPLOY_APPROVED_SHA does not authorize this immutable commit."
+            exit 1
+          fi
+          if [[ -n "$SERVER_HOST" && -n "$SERVER_USER" && -n "$SERVER_PASSWORD" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Fork deployment was authorized, but one or more SERVER_* secrets are missing."
+            exit 1
+          fi
+
   deploy-fork:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    needs: publish-fork-images
-    if: needs.publish-fork-images.result == 'success'
+    needs: deploy-preflight
+    if: >-
+      (
+        github.event_name == 'workflow_dispatch' &&
+        inputs.deploy_fork == true &&
+        needs.deploy-preflight.outputs.enabled == 'true'
+      )
     concurrency:
       group: fork-production-${{ github.repository }}
       cancel-in-progress: false

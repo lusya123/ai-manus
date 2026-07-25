@@ -402,6 +402,16 @@ jobs:
             set -eu
             cd "$DEPLOY_PATH"
 
+            if ! command -v flock >/dev/null 2>&1; then
+              echo "flock is unavailable; refusing an unlocked deployment." >&2
+              exit 1
+            fi
+            exec 9>"$DEPLOY_PATH/.fork-deploy.lock"
+            if ! flock -n 9; then
+              echo "Another AI Manus deployment holds the server-side lock." >&2
+              exit 1
+            fi
+
             require_docker() {
               if ! command -v docker >/dev/null 2>&1; then
                 echo "Docker CLI is unavailable; refusing deployment." >&2
@@ -409,6 +419,10 @@ jobs:
               fi
               if ! docker compose version >/dev/null 2>&1; then
                 echo "Docker Compose v2 is unavailable; refusing deployment." >&2
+                return 1
+              fi
+              if ! command -v timeout >/dev/null 2>&1; then
+                echo "timeout is unavailable; refusing an unbounded Docker readiness check." >&2
                 return 1
               fi
 
@@ -456,6 +470,7 @@ jobs:
             hotpatch_target_fingerprint_before=""
             hotpatch_old_app_pid=""
             hotpatch_peer_pids=""
+            project_container_ids_before=""
             mongodb_id_before=""
             redis_id_before=""
             registry_docker_config=""
@@ -499,6 +514,43 @@ jobs:
                 docker compose -p ai-manus -f docker-compose.yml -f docker-compose.deploy.yml "$@"
               else
                 docker compose -p ai-manus -f docker-compose.yml "$@"
+              fi
+            }
+
+            compose_project_container_ids() {
+              docker ps -aq \
+                --filter label=com.docker.compose.project=ai-manus
+            }
+
+            verify_stateful_pre_mutation() {
+              if ! current_project_ids="$(compose_project_container_ids)"; then
+                echo "Could not re-query the Compose project before mutation; refusing deployment." >&2
+                return 1
+              fi
+              if [ "$had_previous_compose" != true ]; then
+                if [ -n "$current_project_ids" ]; then
+                  echo "Compose containers appeared after bootstrap preflight; refusing deployment." >&2
+                  return 1
+                fi
+                return 0
+              fi
+              if [ -n "$mongodb_id_before" ] && [ -n "$redis_id_before" ]; then
+                if ! current_mongodb_id="$(restore_compose ps -q mongodb)"; then
+                  echo "Could not re-query MongoDB before mutation; refusing deployment." >&2
+                  return 1
+                fi
+                if ! current_redis_id="$(restore_compose ps -q redis)"; then
+                  echo "Could not re-query Redis before mutation; refusing deployment." >&2
+                  return 1
+                fi
+                if [ "$current_mongodb_id" != "$mongodb_id_before" ] || \
+                  [ "$current_redis_id" != "$redis_id_before" ]; then
+                  echo "MongoDB or Redis changed after preflight; refusing deployment." >&2
+                  return 1
+                fi
+              elif [ -n "$current_project_ids" ]; then
+                echo "Compose containers appeared after bootstrap preflight; refusing deployment." >&2
+                return 1
               fi
             }
 
@@ -572,6 +624,10 @@ jobs:
             PY
             }
 
+            if ! project_container_ids_before="$(compose_project_container_ids)"; then
+              echo "Could not query the existing Compose project through Docker; refusing deployment." >&2
+              exit 1
+            fi
             if [ "$had_previous_compose" = true ]; then
               if ! restore_compose config -q; then
                 echo "Existing Compose configuration is invalid; refusing deployment before stateful-service inspection." >&2
@@ -585,10 +641,11 @@ jobs:
                 echo "Could not query the existing Redis container through Docker; refusing deployment." >&2
                 exit 1
               fi
-              if [ -z "$mongodb_id_before" ] || [ -z "$redis_id_before" ]; then
-                echo "Docker is reachable, but the existing Compose deployment has no running MongoDB or Redis container; refusing deployment." >&2
-                exit 1
-              fi
+            fi
+            if [ -n "$project_container_ids_before" ] && \
+              { [ -z "$mongodb_id_before" ] || [ -z "$redis_id_before" ]; }; then
+              echo "Docker is reachable, but the existing Compose project cannot prove both MongoDB and Redis are running from the current configuration; refusing deployment." >&2
+              exit 1
             fi
             if [ "${HOTPATCH_ENABLED:-false}" = true ] && \
               { [ -z "$mongodb_id_before" ] || [ -z "$redis_id_before" ]; }; then
@@ -2300,6 +2357,7 @@ jobs:
 
             docker compose -p ai-manus -f "$incoming_compose" -f "$incoming_override" config -q
             require_docker
+            verify_stateful_pre_mutation
             changed=true
             mv -f "$incoming_compose" docker-compose.yml
             incoming_compose=""

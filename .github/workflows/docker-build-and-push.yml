@@ -26,8 +26,39 @@ on:
         required: true
         type: boolean
         default: false
+      server_maintenance:
+        description: Run a separately gated server audit or datastore recovery
+        required: true
+        type: choice
+        default: none
+        options:
+          - none
+          - audit
+          - recover-datastores
+      confirm_server_host:
+        description: Exact server host expected for maintenance
+        required: false
+        type: string
+      expected_mongodb_id:
+        description: Audited 64-character MongoDB container ID required for recovery
+        required: false
+        type: string
+      expected_redis_id:
+        description: Audited 64-character Redis container ID required for recovery
+        required: false
+        type: string
+      expected_mongodb_volume:
+        description: Audited MongoDB data volume required for recovery
+        required: false
+        type: string
+        default: manus-mongodb-data
+      expected_redis_volume:
+        description: Audited Redis data volume required for recovery
+        required: false
+        type: string
+        default: manus-redis-data
       expected_sha:
-        description: Exact 40-character commit SHA authorized for publication
+        description: Exact 40-character commit SHA authorized for this operation
         required: true
         type: string
 
@@ -42,6 +73,9 @@ env:
 jobs:
   frontend-smoke:
     runs-on: ubuntu-latest
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      inputs.server_maintenance == 'none'
 
     steps:
       - name: Checkout code
@@ -96,6 +130,9 @@ jobs:
 
   backend-unit-security:
     runs-on: ubuntu-latest
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      inputs.server_maintenance == 'none'
     env:
       DEPLOYMENT_ENVIRONMENT: test
       AUTH_PROVIDER: none
@@ -132,6 +169,9 @@ jobs:
 
   sandbox-unit:
     runs-on: ubuntu-latest
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      inputs.server_maintenance == 'none'
 
     steps:
       - name: Checkout code
@@ -160,6 +200,612 @@ jobs:
           tests/test_proxy.py
           tests/test_file_service_unit.py
           tests/test_shell_service_unit.py
+
+  server-maintenance-preflight:
+    runs-on: ubuntu-latest
+    environment: fork-production
+    if: >-
+      (
+        github.event_name == 'workflow_dispatch' &&
+        inputs.server_maintenance != 'none'
+      )
+    outputs:
+      enabled: ${{ steps.authorization.outputs.enabled }}
+      operation: ${{ steps.authorization.outputs.operation }}
+    steps:
+      - name: Authorize exact server maintenance
+        id: authorization
+        env:
+          OPERATION: ${{ inputs.server_maintenance }}
+          PUBLISH_FORK_IMAGES: ${{ inputs.publish_fork_images }}
+          DEPLOY_FORK: ${{ inputs.deploy_fork }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          REQUESTED_REF: ${{ github.ref }}
+          CONFIRM_SERVER_HOST: ${{ inputs.confirm_server_host }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_HOST_FINGERPRINT: ${{ secrets.SERVER_HOST_FINGERPRINT }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          RECOVERY_APPROVED_SHA: ${{ vars.FORK_DATASTORE_RECOVERY_APPROVED_SHA }}
+        shell: bash
+        run: |
+          if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$EXPECTED_SHA" != "$GITHUB_SHA" ]]; then
+            echo "::error::expected_sha does not authorize this immutable commit."
+            exit 1
+          fi
+          if [[ "$REQUESTED_REF" != refs/heads/custom ]]; then
+            echo "::error::Server maintenance is allowed only from the custom branch."
+            exit 1
+          fi
+          case "$OPERATION" in
+            audit|recover-datastores)
+              ;;
+            *)
+              echo "::error::Unsupported server maintenance operation."
+              exit 1
+              ;;
+          esac
+          if [[ "$PUBLISH_FORK_IMAGES" != false || "$DEPLOY_FORK" != false ]]; then
+            echo "::error::Server maintenance cannot be combined with image publication or deployment."
+            exit 1
+          fi
+          if [[ -z "$SERVER_HOST" || -z "$SERVER_HOST_FINGERPRINT" || -z "$SERVER_USER" || -z "$SERVER_PASSWORD" ]]; then
+            echo "::error::Server maintenance secrets are incomplete."
+            exit 1
+          fi
+          if [[ "$CONFIRM_SERVER_HOST" != "$SERVER_HOST" ]] || [[ "$SERVER_HOST" != 43.156.115.199 ]]; then
+            echo "::error::Server maintenance host confirmation does not match the exact test server."
+            exit 1
+          fi
+          if [[ "$OPERATION" == recover-datastores ]]; then
+            if [[ ! "$RECOVERY_APPROVED_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$RECOVERY_APPROVED_SHA" != "$GITHUB_SHA" ]]; then
+              echo "::error::FORK_DATASTORE_RECOVERY_APPROVED_SHA does not authorize this recovery."
+              exit 1
+            fi
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          echo "operation=${OPERATION}" >> "$GITHUB_OUTPUT"
+
+  server-maintenance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    needs: server-maintenance-preflight
+    if: needs.server-maintenance-preflight.outputs.enabled == 'true'
+    concurrency:
+      group: fork-production-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    environment: fork-production
+    steps:
+      - name: Audit or recover exact datastore containers
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
+        env:
+          OPERATION: ${{ needs.server-maintenance-preflight.outputs.operation }}
+          PUBLIC_HOST: ${{ secrets.SERVER_HOST }}
+          DEPLOY_PATH: ${{ vars.FORK_DEPLOY_PATH || '/home/ubuntu/ai-manus' }}
+          EXPECTED_MONGODB_ID: ${{ inputs.expected_mongodb_id }}
+          EXPECTED_REDIS_ID: ${{ inputs.expected_redis_id }}
+          EXPECTED_MONGODB_VOLUME: ${{ inputs.expected_mongodb_volume }}
+          EXPECTED_REDIS_VOLUME: ${{ inputs.expected_redis_volume }}
+          MAINTENANCE_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          fingerprint: ${{ secrets.SERVER_HOST_FINGERPRINT }}
+          command_timeout: 80m
+          envs: OPERATION,PUBLIC_HOST,DEPLOY_PATH,EXPECTED_MONGODB_ID,EXPECTED_REDIS_ID,EXPECTED_MONGODB_VOLUME,EXPECTED_REDIS_VOLUME,MAINTENANCE_RUN_ID
+          script: |
+            set -eu
+            umask 077
+
+            fail() {
+              echo "$1" >&2
+              exit 1
+            }
+
+            require_command() {
+              command -v "$1" >/dev/null 2>&1 ||
+                fail "Required command is unavailable: $1"
+            }
+
+            require_command docker
+            require_command date
+            require_command flock
+            require_command timeout
+            require_command python3
+            require_command sha256sum
+            require_command sync
+            require_command tar
+            require_command tee
+            require_command sudo
+            sudo -n true ||
+              fail "Passwordless sudo is required for datastore inspection."
+
+            [ "$PUBLIC_HOST" = 43.156.115.199 ] ||
+              fail "Refusing maintenance outside the exact test server."
+            case "$DEPLOY_PATH" in
+              /*) ;;
+              *) fail "DEPLOY_PATH must be absolute." ;;
+            esac
+            [ -d "$DEPLOY_PATH" ] ||
+              fail "Deployment directory does not exist."
+            cd "$DEPLOY_PATH"
+
+            exec 9>"$DEPLOY_PATH/.fork-deploy.lock"
+            flock -n 9 ||
+              fail "Another deployment or maintenance operation holds the server lock."
+            timeout 10s docker info >/dev/null 2>&1 ||
+              fail "Docker daemon is unavailable."
+            maintenance_started_epoch="$(date +%s)"
+
+            project_service_ids() {
+              service="$1"
+              timeout 10s docker ps -aq --no-trunc \
+                --filter label=com.docker.compose.project=ai-manus \
+                --filter "label=com.docker.compose.service=${service}"
+            }
+
+            require_one_id() {
+              service="$1"
+              ids="$(project_service_ids "$service")"
+              count="$(printf '%s\n' "$ids" | sed '/^$/d' | wc -l | tr -d ' ')"
+              [ "$count" = 1 ] ||
+                fail "Expected exactly one ${service} container; found ${count}."
+              printf '%s\n' "$ids"
+            }
+
+            volume_at_destination() {
+              container_id="$1"
+              destination="$2"
+              timeout 10s docker inspect --format \
+                "{{range .Mounts}}{{if eq .Destination \"${destination}\"}}{{println .Name}}{{end}}{{end}}" \
+                "$container_id" |
+                sed '/^$/d'
+            }
+
+            print_container_audit() {
+              service="$1"
+              container_id="$2"
+              timeout 10s docker inspect --format \
+                'AUDIT service={{index .Config.Labels "com.docker.compose.service"}} id={{.Id}} name={{.Name}} status={{.State.Status}} running={{.State.Running}} image={{.Config.Image}} created={{.Created}} restart={{.HostConfig.RestartPolicy.Name}}' \
+                "$container_id"
+              timeout 10s docker inspect --format \
+                'AUDIT mounts={{range .Mounts}}{{.Type}}|{{.Name}}|{{.Destination}}|rw={{.RW}};{{end}}' \
+                "$container_id"
+            }
+
+            volume_size_bytes() {
+              volume_name="$1"
+              mountpoint="$(
+                timeout 10s docker volume inspect --format '{{.Mountpoint}}' "$volume_name"
+              )"
+              du_output="$(sudo -n du -sb "$mountpoint")"
+              printf '%s\n' "$du_output" | awk '{print $1}'
+            }
+
+            container_state_fingerprint() {
+              timeout 10s docker inspect --format \
+                '{{.Id}}|{{.State.Status}}|{{.State.Running}}|{{.State.StartedAt}}|{{.State.FinishedAt}}|{{.RestartCount}}' \
+                "$1"
+            }
+
+            container_running_fingerprint() {
+              timeout 10s docker inspect --format \
+                '{{.Id}}|{{.State.Status}}|{{.State.Running}}|{{.State.Restarting}}|{{.State.StartedAt}}|{{.RestartCount}}' \
+                "$1"
+            }
+
+            stopped_state_matches() {
+              container_id="$1"
+              expected_fingerprint="$2"
+              [ "$(timeout 10s docker inspect --format '{{.State.Status}}' "$container_id")" = exited ] &&
+                [ "$(container_state_fingerprint "$container_id")" = "$expected_fingerprint" ]
+            }
+
+            volume_consumer_ids() {
+              volume_name="$1"
+              timeout 10s docker ps -aq --no-trunc --filter "volume=${volume_name}"
+            }
+
+            volume_has_exclusive_consumer() {
+              volume_name="$1"
+              expected_container_id="$2"
+              consumer_ids="$(volume_consumer_ids "$volume_name")"
+              consumer_count="$(
+                printf '%s\n' "$consumer_ids" |
+                  sed '/^$/d' |
+                  wc -l |
+                  tr -d ' '
+              )"
+              [ "$consumer_count" = 1 ] &&
+                [ "$consumer_ids" = "$expected_container_id" ]
+            }
+
+            count_nonempty_lines() {
+              printf '%s\n' "$1" |
+                sed '/^$/d' |
+                wc -l |
+                tr -d ' '
+            }
+
+            mongodb_id="$(require_one_id mongodb)"
+            redis_id="$(require_one_id redis)"
+            mongodb_volume="$(volume_at_destination "$mongodb_id" /data/db)"
+            redis_volume="$(volume_at_destination "$redis_id" /data)"
+            [ -n "$mongodb_volume" ] &&
+              [ "$(printf '%s\n' "$mongodb_volume" | wc -l | tr -d ' ')" = 1 ] ||
+              fail "MongoDB does not have exactly one /data/db volume."
+            [ -n "$redis_volume" ] &&
+              [ "$(printf '%s\n' "$redis_volume" | wc -l | tr -d ' ')" = 1 ] ||
+              fail "Redis does not have exactly one /data volume."
+            timeout 10s docker volume inspect "$mongodb_volume" >/dev/null
+            timeout 10s docker volume inspect "$redis_volume" >/dev/null
+
+            print_container_audit mongodb "$mongodb_id"
+            print_container_audit redis "$redis_id"
+            mongodb_bytes="$(volume_size_bytes "$mongodb_volume")"
+            redis_bytes="$(volume_size_bytes "$redis_volume")"
+            mongodb_volume_consumers="$(volume_consumer_ids "$mongodb_volume")"
+            redis_volume_consumers="$(volume_consumer_ids "$redis_volume")"
+            project_container_ids="$(
+              timeout 10s docker ps -aq \
+                --filter label=com.docker.compose.project=ai-manus
+            )"
+            dynamic_sandbox_ids="$(
+              timeout 10s docker ps -aq --filter label=ai-manus.kind=sandbox
+            )"
+            dynamic_claw_ids="$(
+              timeout 10s docker ps -aq --filter label=ai-manus.kind=claw
+            )"
+            all_container_ids="$(timeout 10s docker ps -aq)"
+            running_container_ids="$(timeout 10s docker ps -q)"
+            deploy_filesystem="$(df -h "$DEPLOY_PATH")"
+            echo "AUDIT mongodb_volume=${mongodb_volume} bytes=${mongodb_bytes}"
+            echo "AUDIT redis_volume=${redis_volume} bytes=${redis_bytes}"
+            echo "AUDIT mongodb_volume_consumer_count=$(count_nonempty_lines "$mongodb_volume_consumers") exclusive_target=$(
+              if [ "$mongodb_volume_consumers" = "$mongodb_id" ]; then
+                echo true
+              else
+                echo false
+              fi
+            )"
+            echo "AUDIT redis_volume_consumer_count=$(count_nonempty_lines "$redis_volume_consumers") exclusive_target=$(
+              if [ "$redis_volume_consumers" = "$redis_id" ]; then
+                echo true
+              else
+                echo false
+              fi
+            )"
+            echo "AUDIT project_container_count=$(count_nonempty_lines "$project_container_ids")"
+            echo "AUDIT dynamic_sandbox_count=$(count_nonempty_lines "$dynamic_sandbox_ids")"
+            echo "AUDIT dynamic_claw_count=$(count_nonempty_lines "$dynamic_claw_ids")"
+            echo "AUDIT retained_hotpatch_target_present=$(
+              if timeout 10s docker container inspect ai-manus-sandbox-ab145dc2 >/dev/null 2>&1; then
+                echo true
+              else
+                echo false
+              fi
+            )"
+            printf '%s\n' "$deploy_filesystem" | tail -n 1 | sed 's/^/AUDIT deploy_filesystem=/'
+            echo "AUDIT docker_containers_total=$(count_nonempty_lines "$all_container_ids") running=$(count_nonempty_lines "$running_container_ids")"
+            echo "AUDIT inotify_instances=$(cat /proc/sys/fs/inotify/max_user_instances) watches=$(cat /proc/sys/fs/inotify/max_user_watches)"
+
+            python3 - <<'PY'
+            from pathlib import Path
+            from urllib.parse import urlsplit
+
+            values = {}
+            path = Path(".env")
+            if path.is_file():
+                for raw_line in path.read_text(encoding="utf-8").splitlines():
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    values[key.strip()] = value.strip().strip('"').strip("'")
+
+            api_base = values.get("API_BASE", "")
+            print("AUDIT auth_provider=" + values.get("AUTH_PROVIDER", ""))
+            print("AUDIT task_backend=" + values.get("TASK_BACKEND", "local"))
+            print("AUDIT sandbox_provider=" + values.get("SANDBOX_PROVIDER", ""))
+            print("AUDIT search_provider=" + values.get("SEARCH_PROVIDER", ""))
+            print("AUDIT model_name=" + values.get("MODEL_NAME", ""))
+            print("AUDIT api_base_host=" + (urlsplit(api_base).hostname or ""))
+            print("AUDIT api_base_is_mock=" + str("mockserver" in api_base.lower()).lower())
+            print(
+                "AUDIT model_key_present="
+                + str(bool(values.get("API_KEY") or values.get("ANTHROPIC_API_KEY"))).lower()
+            )
+            PY
+
+            if [ "$OPERATION" = audit ]; then
+              echo "AUDIT_COMPLETE mongodb_id=${mongodb_id} redis_id=${redis_id}"
+              exit 0
+            fi
+            [ "$OPERATION" = recover-datastores ] ||
+              fail "Unsupported maintenance operation."
+
+            case "$EXPECTED_MONGODB_ID" in
+              ''|*[!0-9a-f]*) fail "Expected MongoDB ID is invalid." ;;
+            esac
+            case "$EXPECTED_REDIS_ID" in
+              ''|*[!0-9a-f]*) fail "Expected Redis ID is invalid." ;;
+            esac
+            [ "${#EXPECTED_MONGODB_ID}" = 64 ] ||
+              fail "Expected MongoDB ID must contain 64 hexadecimal characters."
+            [ "${#EXPECTED_REDIS_ID}" = 64 ] ||
+              fail "Expected Redis ID must contain 64 hexadecimal characters."
+            [ "$mongodb_id" = "$EXPECTED_MONGODB_ID" ] ||
+              fail "MongoDB container identity changed after audit."
+            [ "$redis_id" = "$EXPECTED_REDIS_ID" ] ||
+              fail "Redis container identity changed after audit."
+            [ "$mongodb_volume" = "$EXPECTED_MONGODB_VOLUME" ] ||
+              fail "MongoDB volume identity changed after audit."
+            [ "$redis_volume" = "$EXPECTED_REDIS_VOLUME" ] ||
+              fail "Redis volume identity changed after audit."
+            volume_has_exclusive_consumer "$mongodb_volume" "$mongodb_id" ||
+              fail "MongoDB volume is mounted by an unexpected container."
+            volume_has_exclusive_consumer "$redis_volume" "$redis_id" ||
+              fail "Redis volume is mounted by an unexpected container."
+            [ "$(timeout 10s docker inspect --format '{{.State.Status}}' "$mongodb_id")" = exited ] ||
+              fail "MongoDB must be stopped in exited state before offline backup."
+            [ "$(timeout 10s docker inspect --format '{{.State.Status}}' "$redis_id")" = exited ] ||
+              fail "Redis must be stopped in exited state before offline backup."
+            mongodb_stopped_fingerprint="$(container_state_fingerprint "$mongodb_id")"
+            redis_stopped_fingerprint="$(container_state_fingerprint "$redis_id")"
+            mongodb_restart_count_before="$(
+              timeout 10s docker inspect --format '{{.RestartCount}}' "$mongodb_id"
+            )"
+            redis_restart_count_before="$(
+              timeout 10s docker inspect --format '{{.RestartCount}}' "$redis_id"
+            )"
+            mongodb_mountpoint="$(
+              timeout 10s docker volume inspect --format '{{.Mountpoint}}' "$mongodb_volume"
+            )"
+            redis_mountpoint="$(
+              timeout 10s docker volume inspect --format '{{.Mountpoint}}' "$redis_volume"
+            )"
+            backup_dir="$DEPLOY_PATH/recovery-backups"
+            [ ! -L "$backup_dir" ] ||
+              fail "Recovery backup directory must not be a symlink."
+            mkdir -p "$backup_dir"
+            chmod 700 "$backup_dir"
+            available_bytes="$(
+              df -PB1 "$backup_dir" | awk 'NR==2 {print $4}'
+            )"
+            required_bytes=$((mongodb_bytes + redis_bytes + 536870912))
+            [ "$available_bytes" -gt "$required_bytes" ] ||
+              fail "Insufficient free space for offline datastore backups."
+
+            backup_volume() {
+              service="$1"
+              container_id="$2"
+              expected_fingerprint="$3"
+              volume_name="$4"
+              mountpoint="$5"
+              partial="$backup_dir/${service}-${MAINTENANCE_RUN_ID}.tar.partial"
+              final="$backup_dir/${service}-${MAINTENANCE_RUN_ID}.tar"
+              manifest_partial="${final}.sha256.partial"
+              manifest="${final}.sha256"
+              [ ! -e "$partial" ] && [ ! -L "$partial" ] &&
+                [ ! -e "$final" ] && [ ! -L "$final" ] &&
+                [ ! -e "$manifest_partial" ] && [ ! -L "$manifest_partial" ] &&
+                [ ! -e "$manifest" ] && [ ! -L "$manifest" ] ||
+                fail "Refusing to overwrite an existing datastore backup."
+              stopped_state_matches "$container_id" "$expected_fingerprint" ||
+                fail "${service} state changed before its offline backup."
+              volume_has_exclusive_consumer "$volume_name" "$container_id" ||
+                fail "${service} volume gained an unexpected consumer before backup."
+              if ! sudo -n tar \
+                  --numeric-owner \
+                  --xattrs \
+                  --acls \
+                  --sparse \
+                  -C "$mountpoint" \
+                  -cf "$partial" .; then
+                sudo -n rm -f -- "$partial"
+                fail "Offline ${service} backup failed."
+              fi
+              if ! sudo -n tar -tf "$partial" >/dev/null; then
+                sudo -n rm -f -- "$partial"
+                fail "Offline ${service} backup verification failed."
+              fi
+              if ! stopped_state_matches "$container_id" "$expected_fingerprint"; then
+                sudo -n rm -f -- "$partial"
+                fail "${service} started or changed during its offline backup."
+              fi
+              if ! volume_has_exclusive_consumer "$volume_name" "$container_id"; then
+                sudo -n rm -f -- "$partial"
+                fail "${service} volume gained an unexpected consumer during backup."
+              fi
+              digest="$(sudo -n sha256sum "$partial" | awk '{print $1}')"
+              size="$(sudo -n stat -c '%s' "$partial")"
+              final_basename="${final##*/}"
+              if ! printf '%s  %s\n' "$digest" "$final_basename" |
+                  sudo -n tee "$manifest_partial" >/dev/null; then
+                sudo -n rm -f -- "$partial" "$manifest_partial"
+                fail "Could not write the ${service} backup checksum manifest."
+              fi
+              sudo -n chmod 600 "$partial" "$manifest_partial"
+              sudo -n sync -f "$partial"
+              sudo -n sync -f "$manifest_partial"
+              sudo -n mv "$partial" "$final"
+              sudo -n mv "$manifest_partial" "$manifest"
+              sudo -n sync -f "$backup_dir"
+              (
+                cd "$backup_dir"
+                sudo -n sha256sum -c "${manifest##*/}" >/dev/null
+              ) || fail "Persisted ${service} backup checksum verification failed."
+              echo "BACKUP service=${service} path=${final} manifest=${manifest} bytes=${size} sha256=${digest}"
+            }
+
+            backup_volume \
+              mongodb \
+              "$mongodb_id" \
+              "$mongodb_stopped_fingerprint" \
+              "$mongodb_volume" \
+              "$mongodb_mountpoint"
+            backup_volume \
+              redis \
+              "$redis_id" \
+              "$redis_stopped_fingerprint" \
+              "$redis_volume" \
+              "$redis_mountpoint"
+            stopped_state_matches "$mongodb_id" "$mongodb_stopped_fingerprint" ||
+              fail "MongoDB state changed after offline backups."
+            stopped_state_matches "$redis_id" "$redis_stopped_fingerprint" ||
+              fail "Redis state changed after offline backups."
+            volume_has_exclusive_consumer "$mongodb_volume" "$mongodb_id" ||
+              fail "MongoDB volume gained an unexpected consumer after backups."
+            volume_has_exclusive_consumer "$redis_volume" "$redis_id" ||
+              fail "Redis volume gained an unexpected consumer after backups."
+
+            mongodb_start_attempted=false
+            redis_start_attempted=false
+            restore_stopped_state() {
+              exit_status="$1"
+              trap - EXIT HUP INT TERM
+              rollback_failed=false
+              if [ "$redis_start_attempted" = true ]; then
+                if ! timeout 150s docker stop --time 120 "$redis_id" >/dev/null; then
+                  echo "ROLLBACK_FAILED service=redis action=stop" >&2
+                  rollback_failed=true
+                fi
+              fi
+              if [ "$mongodb_start_attempted" = true ]; then
+                if ! timeout 150s docker stop --time 120 "$mongodb_id" >/dev/null; then
+                  echo "ROLLBACK_FAILED service=mongodb action=stop" >&2
+                  rollback_failed=true
+                fi
+              fi
+              if [ "$redis_start_attempted" = true ] &&
+                  [ "$(timeout 10s docker inspect --format '{{.State.Status}}' "$redis_id" 2>/dev/null || true)" != exited ]; then
+                echo "ROLLBACK_FAILED service=redis final_state_not_exited" >&2
+                rollback_failed=true
+              fi
+              if [ "$mongodb_start_attempted" = true ] &&
+                  [ "$(timeout 10s docker inspect --format '{{.State.Status}}' "$mongodb_id" 2>/dev/null || true)" != exited ]; then
+                echo "ROLLBACK_FAILED service=mongodb final_state_not_exited" >&2
+                rollback_failed=true
+              fi
+              if [ "$rollback_failed" = true ]; then
+                echo "Datastore recovery rollback did not restore the verified stopped state." >&2
+                exit 1
+              fi
+              [ "$exit_status" -ne 0 ] || exit_status=1
+              exit "$exit_status"
+            }
+            trap 'restore_stopped_state $?' EXIT
+            trap 'restore_stopped_state 129' HUP
+            trap 'restore_stopped_state 130' INT
+            trap 'restore_stopped_state 143' TERM
+
+            recovery_elapsed_seconds=$(($(date +%s) - maintenance_started_epoch))
+            [ "$recovery_elapsed_seconds" -lt 2100 ] ||
+              fail "Offline backup consumed the recovery time budget; refusing to start datastores."
+            mongodb_start_attempted=true
+            timeout 30s docker start "$mongodb_id" >/dev/null
+            redis_start_attempted=true
+            timeout 30s docker start "$redis_id" >/dev/null
+
+            mongodb_healthy=false
+            redis_healthy=false
+            for attempt in $(seq 1 90); do
+              mongodb_healthy=false
+              redis_healthy=false
+              if timeout 5s docker exec "$mongodb_id" mongosh --quiet --eval \
+                'quit(db.adminCommand({ping: 1}).ok === 1 ? 0 : 1)' \
+                >/dev/null 2>&1; then
+                mongodb_healthy=true
+              fi
+              if [ "$(timeout 5s docker exec "$redis_id" redis-cli --raw PING 2>/dev/null || true)" = PONG ]; then
+                redis_healthy=true
+              fi
+              if [ "$mongodb_healthy" = true ] && [ "$redis_healthy" = true ]; then
+                break
+              fi
+              sleep 2
+            done
+            [ "$mongodb_healthy" = true ] ||
+              fail "MongoDB did not become healthy; restoring the stopped state."
+            [ "$redis_healthy" = true ] ||
+              fail "Redis did not become healthy; restoring the stopped state."
+            [ "$(timeout 10s docker inspect --format '{{.RestartCount}}' "$mongodb_id")" = "$mongodb_restart_count_before" ] ||
+              fail "MongoDB restarted while recovering."
+            [ "$(timeout 10s docker inspect --format '{{.RestartCount}}' "$redis_id")" = "$redis_restart_count_before" ] ||
+              fail "Redis restarted while recovering."
+            mongodb_running_fingerprint="$(container_running_fingerprint "$mongodb_id")"
+            redis_running_fingerprint="$(container_running_fingerprint "$redis_id")"
+
+            for stability_attempt in $(seq 1 30); do
+              [ "$(container_running_fingerprint "$mongodb_id")" = "$mongodb_running_fingerprint" ] ||
+                fail "MongoDB runtime changed during the stability window."
+              [ "$(container_running_fingerprint "$redis_id")" = "$redis_running_fingerprint" ] ||
+                fail "Redis runtime changed during the stability window."
+              timeout 5s docker exec "$mongodb_id" mongosh --quiet --eval \
+                'quit(db.adminCommand({ping: 1}).ok === 1 ? 0 : 1)' \
+                >/dev/null 2>&1 ||
+                fail "MongoDB failed during the stability window."
+              [ "$(timeout 5s docker exec "$redis_id" redis-cli --raw PING 2>/dev/null || true)" = PONG ] ||
+                fail "Redis failed during the stability window."
+              volume_has_exclusive_consumer "$mongodb_volume" "$mongodb_id" ||
+                fail "MongoDB volume lost exclusivity during the stability window."
+              volume_has_exclusive_consumer "$redis_volume" "$redis_id" ||
+                fail "Redis volume lost exclusivity during the stability window."
+              if [ "$stability_attempt" -lt 30 ]; then
+                sleep 2
+              fi
+            done
+            [ "$(require_one_id mongodb)" = "$mongodb_id" ] ||
+              fail "MongoDB identity changed during recovery."
+            [ "$(require_one_id redis)" = "$redis_id" ] ||
+              fail "Redis identity changed during recovery."
+            [ "$(volume_at_destination "$mongodb_id" /data/db)" = "$mongodb_volume" ] ||
+              fail "MongoDB volume changed during recovery."
+            [ "$(volume_at_destination "$redis_id" /data)" = "$redis_volume" ] ||
+              fail "Redis volume changed during recovery."
+            volume_has_exclusive_consumer "$mongodb_volume" "$mongodb_id" ||
+              fail "MongoDB volume gained an unexpected consumer during recovery."
+            volume_has_exclusive_consumer "$redis_volume" "$redis_id" ||
+              fail "Redis volume gained an unexpected consumer during recovery."
+
+            [ "$(timeout 10s docker inspect --format '{{.State.Status}}' "$mongodb_id")" = running ] ||
+              fail "MongoDB stopped after its initial health check."
+            [ "$(timeout 10s docker inspect --format '{{.State.Status}}' "$redis_id")" = running ] ||
+              fail "Redis stopped after its initial health check."
+            mongo_summary="$(
+              timeout 10s docker exec "$mongodb_id" mongosh --quiet --eval \
+                'const r=db.adminCommand({listDatabases:1,nameOnly:true}); print("RECOVERY mongo_database_count="+r.databases.length)'
+            )" || fail "MongoDB final validation failed."
+            redis_ping="$(
+              timeout 10s docker exec "$redis_id" redis-cli --raw PING
+            )" || fail "Redis final PING failed."
+            [ "$redis_ping" = PONG ] ||
+              fail "Redis final PING did not return PONG."
+            redis_dbsize="$(
+              timeout 10s docker exec "$redis_id" redis-cli --raw DBSIZE
+            )" || fail "Redis final DBSIZE failed."
+            case "$redis_dbsize" in
+              ''|*[!0-9]*) fail "Redis final DBSIZE was not numeric." ;;
+            esac
+            [ "$(timeout 10s docker inspect --format '{{.State.Status}}' "$mongodb_id")" = running ] ||
+              fail "MongoDB did not remain running through final validation."
+            [ "$(timeout 10s docker inspect --format '{{.State.Status}}' "$redis_id")" = running ] ||
+              fail "Redis did not remain running through final validation."
+            [ "$(container_running_fingerprint "$mongodb_id")" = "$mongodb_running_fingerprint" ] ||
+              fail "MongoDB runtime changed after final validation."
+            [ "$(container_running_fingerprint "$redis_id")" = "$redis_running_fingerprint" ] ||
+              fail "Redis runtime changed after final validation."
+            volume_has_exclusive_consumer "$mongodb_volume" "$mongodb_id" ||
+              fail "MongoDB volume was no longer exclusive after final validation."
+            volume_has_exclusive_consumer "$redis_volume" "$redis_id" ||
+              fail "Redis volume was no longer exclusive after final validation."
+            echo "$mongo_summary"
+            echo "RECOVERY redis_dbsize=${redis_dbsize}"
+            trap - EXIT HUP INT TERM
+            echo "RECOVERY_COMPLETE mongodb_id=${mongodb_id} redis_id=${redis_id}"
 
   build-and-push:
     runs-on: ubuntu-latest
@@ -349,6 +995,7 @@ jobs:
         id: secrets
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_HOST_FINGERPRINT: ${{ secrets.SERVER_HOST_FINGERPRINT }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
           SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
           APPROVED_SHA: ${{ vars.FORK_DEPLOY_APPROVED_SHA }}
@@ -358,7 +1005,7 @@ jobs:
             echo "::error::FORK_DEPLOY_APPROVED_SHA does not authorize this immutable commit."
             exit 1
           fi
-          if [[ -n "$SERVER_HOST" && -n "$SERVER_USER" && -n "$SERVER_PASSWORD" ]]; then
+          if [[ -n "$SERVER_HOST" && -n "$SERVER_HOST_FINGERPRINT" && -n "$SERVER_USER" && -n "$SERVER_PASSWORD" ]]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
             echo "::error::Fork deployment was authorized, but one or more SERVER_* secrets are missing."
@@ -441,6 +1088,7 @@ jobs:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           password: ${{ secrets.SERVER_PASSWORD }}
+          fingerprint: ${{ secrets.SERVER_HOST_FINGERPRINT }}
           command_timeout: 30m
           envs: REGISTRY,OWNER,IMAGE_TAG,FRONTEND_IMAGE,BACKEND_IMAGE,SANDBOX_IMAGE,CLAW_IMAGE,MOCKSERVER_IMAGE,DEPLOY_PATH,FRONTEND_HOST_PORT,GHCR_TOKEN,GHCR_USER,COMPOSE_B64,DEPLOY_REF,EXPECTED_SHA,PUBLIC_HOST,CORE_RESOURCE_PREFIX,HOTPATCH_ENABLED,HOTPATCH_TARGET
           script: |

@@ -324,6 +324,136 @@ def test_multiarch_build_registers_emulation_before_buildx():
     assert build_step["with"]["platforms"] == "linux/amd64,linux/arm64"
 
 
+def test_server_datastore_maintenance_is_exact_gated_and_backed_up():
+    workflow = yaml.safe_load(
+        (PROJECT_ROOT / ".github/workflows/docker-build-and-push.yml").read_text()
+    )
+    jobs = workflow["jobs"]
+    preflight = jobs["server-maintenance-preflight"]
+    maintenance = jobs["server-maintenance"]
+
+    for job_name in ("frontend-smoke", "backend-unit-security", "sandbox-unit"):
+        assert "inputs.server_maintenance == 'none'" in jobs[job_name]["if"]
+
+    assert preflight["environment"] == "fork-production"
+    authorization = next(
+        step
+        for step in preflight["steps"]
+        if step.get("id") == "authorization"
+    )
+    assert authorization["env"]["RECOVERY_APPROVED_SHA"] == (
+        "${{ vars.FORK_DATASTORE_RECOVERY_APPROVED_SHA }}"
+    )
+    assert authorization["env"]["SERVER_HOST_FINGERPRINT"] == (
+        "${{ secrets.SERVER_HOST_FINGERPRINT }}"
+    )
+    assert '"$RECOVERY_APPROVED_SHA" != "$GITHUB_SHA"' in authorization["run"]
+    assert "recover-datastores" in authorization["run"]
+    assert "43.156.115.199" in authorization["run"]
+    assert "cannot be combined with image publication or deployment" in (
+        authorization["run"]
+    )
+
+    assert maintenance["needs"] == "server-maintenance-preflight"
+    assert maintenance["environment"] == "fork-production"
+    assert maintenance["concurrency"]["group"] == (
+        "fork-production-${{ github.repository }}"
+    )
+    ssh_step = next(
+        step for step in maintenance["steps"] if step.get("uses") == SSH_ACTION
+    )
+    assert ssh_step["with"]["fingerprint"] == (
+        "${{ secrets.SERVER_HOST_FINGERPRINT }}"
+    )
+    script = ssh_step["with"]["script"]
+    assert "docker ps -aq --no-trunc" in script
+    assert "com.docker.compose.service=${service}" in script
+    assert 'docker volume inspect --format \'{{.Mountpoint}}\'' in script
+    assert "sudo -n tar" in script
+    assert "sha256sum" in script
+    assert 'docker start "$mongodb_id"' in script
+    assert 'docker start "$redis_id"' in script
+    assert 'docker stop --time 120 "$mongodb_id"' in script
+    assert 'docker stop --time 120 "$redis_id"' in script
+    assert "container_state_fingerprint" in script
+    assert "container_running_fingerprint" in script
+    assert 'docker ps -aq --no-trunc --filter "volume=${volume_name}"' in script
+    assert "volume_has_exclusive_consumer" in script
+    assert "volume gained an unexpected consumer during backup" in script
+    assert "volume was no longer exclusive after final validation" in script
+    assert "started or changed during its offline backup" in script
+    assert "backup checksum manifest" in script
+    assert 'sudo -n sync -f "$backup_dir"' in script
+    assert "ROLLBACK_FAILED service=mongodb final_state_not_exited" in script
+    assert "ROLLBACK_FAILED service=redis final_state_not_exited" in script
+    assert "Redis final PING did not return PONG" in script
+    assert "Redis final DBSIZE was not numeric" in script
+    assert "for stability_attempt in $(seq 1 30); do" in script
+    assert "runtime changed during the stability window" in script
+    assert "restarted while recovering" in script
+    assert 'timeout 5s docker exec "$mongodb_id"' in script
+    assert 'timeout 5s docker exec "$redis_id"' in script
+    assert 'timeout 30s docker start "$mongodb_id"' in script
+    assert "recovery_elapsed_seconds" in script
+    assert "consumed the recovery time budget" in script
+    assert maintenance["timeout-minutes"] == 90
+    assert ssh_step["with"]["command_timeout"] == "80m"
+    post_start = script.split('timeout 30s docker start "$mongodb_id"', 1)[1]
+    for line in post_start.splitlines():
+        if any(
+            command in line
+            for command in (
+                "docker exec ",
+                "docker inspect ",
+                "docker ps ",
+                "docker start ",
+                "docker stop ",
+            )
+        ):
+            assert "timeout " in line
+    assert script.index("mongodb_start_attempted=true") < script.index(
+        'docker start "$mongodb_id"'
+    )
+    assert script.index("redis_start_attempted=true") < script.index(
+        'docker start "$redis_id"'
+    )
+    health_loop = script.split("for attempt in $(seq 1 90); do", 1)[1].split(
+        "done", 1
+    )[0]
+    assert health_loop.index("mongodb_healthy=false") < health_loop.index(
+        'docker exec "$mongodb_id"'
+    )
+    assert health_loop.index("redis_healthy=false") < health_loop.index(
+        'docker exec "$redis_id"'
+    )
+    assert 'echo "RECOVERY redis_dbsize=$(' not in script
+    assert "MongoDB container identity changed after audit" in script
+    assert "Redis container identity changed after audit" in script
+    for forbidden in (
+        "docker rm",
+        "docker container rm",
+        "docker compose up",
+        "docker volume rm",
+    ):
+        assert forbidden not in script
+
+    deploy_preflight = jobs["deploy-preflight"]
+    deploy_secret_step = next(
+        step for step in deploy_preflight["steps"] if step.get("id") == "secrets"
+    )
+    assert deploy_secret_step["env"]["SERVER_HOST_FINGERPRINT"] == (
+        "${{ secrets.SERVER_HOST_FINGERPRINT }}"
+    )
+    deploy_ssh_step = next(
+        step
+        for step in jobs["deploy-fork"]["steps"]
+        if step.get("uses") == SSH_ACTION
+    )
+    assert deploy_ssh_step["with"]["fingerprint"] == (
+        "${{ secrets.SERVER_HOST_FINGERPRINT }}"
+    )
+
+
 def test_workflow_actions_are_pinned_to_immutable_commits():
     workflow = yaml.safe_load(
         (PROJECT_ROOT / ".github/workflows/docker-build-and-push.yml").read_text()

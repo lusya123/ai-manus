@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -409,6 +410,9 @@ def test_fork_deployment_fails_closed_and_bounds_hotpatch_state():
 
     assert "require_docker() {" in deploy_script
     assert "timeout 5s docker info --format" in deploy_script
+    assert "command -v timeout" in deploy_script
+    assert 'exec 9>"$DEPLOY_PATH/.fork-deploy.lock"' in deploy_script
+    assert "flock -n 9" in deploy_script
     docker_readiness_calls = [
         index
         for index in range(len(deploy_script))
@@ -424,6 +428,7 @@ def test_fork_deployment_fails_closed_and_bounds_hotpatch_state():
             '-f "$incoming_override" config -q'
         )
         < docker_readiness_calls[1]
+        < deploy_script.index("\nverify_stateful_pre_mutation\n")
         < deploy_script.index("changed=true")
     )
 
@@ -460,9 +465,335 @@ def test_fork_deployment_fails_closed_and_bounds_hotpatch_state():
         deploy_script
     )
     assert (
-        "the existing Compose deployment has no running MongoDB or Redis container"
+        "docker ps -aq \\\n    --filter label=com.docker.compose.project=ai-manus"
         in deploy_script
     )
+    assert (
+        "the existing Compose project cannot prove both MongoDB and Redis "
+        "are running from the current configuration"
+        in deploy_script
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "has_compose",
+        "project_ids",
+        "mongodb_id",
+        "redis_id",
+        "hotpatch_enabled",
+        "docker_ready",
+        "ps_fails",
+        "expected_success",
+        "expected_message",
+    ),
+    [
+        (False, "", "", "", False, True, False, True, "project="),
+        (
+            False,
+            "stale-container",
+            "",
+            "",
+            False,
+            True,
+            False,
+            False,
+            "cannot prove both MongoDB and Redis",
+        ),
+        (True, "", "", "", False, True, False, True, "project="),
+        (
+            True,
+            "backend-id\nmongodb-id\nredis-id",
+            "mongodb-id",
+            "redis-id",
+            False,
+            True,
+            False,
+            True,
+            "mongodb=mongodb-id redis=redis-id",
+        ),
+        (
+            True,
+            "backend-id\nmongodb-id",
+            "mongodb-id",
+            "",
+            False,
+            True,
+            False,
+            False,
+            "cannot prove both MongoDB and Redis",
+        ),
+        (
+            True,
+            "mongodb-id\nredis-id",
+            "",
+            "",
+            False,
+            True,
+            False,
+            False,
+            "cannot prove both MongoDB and Redis",
+        ),
+        (
+            True,
+            "",
+            "",
+            "",
+            True,
+            True,
+            False,
+            False,
+            "hotpatch requires existing MongoDB and Redis",
+        ),
+        (
+            True,
+            "",
+            "",
+            "",
+            False,
+            True,
+            True,
+            False,
+            "Could not query the existing Compose project",
+        ),
+        (
+            False,
+            "",
+            "",
+            "",
+            False,
+            False,
+            False,
+            False,
+            "Docker daemon remained unavailable",
+        ),
+    ],
+)
+def test_fork_deployment_datastore_preflight_distinguishes_bootstrap_from_partial_state(
+    tmp_path,
+    has_compose: bool,
+    project_ids: str,
+    mongodb_id: str,
+    redis_id: str,
+    hotpatch_enabled: bool,
+    docker_ready: bool,
+    ps_fails: bool,
+    expected_success: bool,
+    expected_message: str,
+):
+    workflow = yaml.safe_load(
+        (PROJECT_ROOT / ".github/workflows/docker-build-and-push.yml").read_text()
+    )
+    ssh_step = next(
+        step
+        for step in workflow["jobs"]["deploy-fork"]["steps"]
+        if step.get("uses") == SSH_ACTION
+    )
+    deploy_script = ssh_step["with"]["script"]
+    preflight_script = deploy_script.split("\nverify_expected_container() {", 1)[0]
+    preflight_script += (
+        "\nprintf 'mongodb=%s redis=%s project=%s\\n' "
+        '"$mongodb_id_before" "$redis_id_before" "$project_container_ids_before"\n'
+    )
+
+    deploy_path = tmp_path / "deploy"
+    deploy_path.mkdir()
+    preflight_script = preflight_script.replace(
+        "/home/ubuntu/ai-manus",
+        f'"{deploy_path}"',
+    )
+    if has_compose:
+        (deploy_path / "docker-compose.yml").write_text(
+            "services:\n"
+            "  mongodb:\n"
+            "    image: mongo:7.0\n"
+            "  redis:\n"
+            "    image: redis:7.0\n"
+        )
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  'compose version') exit 0 ;;\n"
+        "  'info --format {{.ServerVersion}}')\n"
+        "    if [ \"${DOCKER_READY}\" = 1 ]; then\n"
+        "      printf '28.2.2\\n'\n"
+        "      exit 0\n"
+        "    fi\n"
+        "    printf 'daemon unavailable\\n' >&2\n"
+        "    exit 1\n"
+        "    ;;\n"
+        "  'container inspect '* ) exit 1 ;;\n"
+        "  'ps -aq --filter label=com.docker.compose.project=ai-manus')\n"
+        "    if [ \"${PS_FAILS}\" = 1 ]; then\n"
+        "      printf 'daemon query failed\\n' >&2\n"
+        "      exit 1\n"
+        "    fi\n"
+        "    printf '%s\\n' \"${PROJECT_IDS}\"\n"
+        "    ;;\n"
+        "  *' config -q') exit 0 ;;\n"
+        "  *' ps -q mongodb') printf '%s\\n' \"${MONGODB_ID}\" ;;\n"
+        "  *' ps -q redis') printf '%s\\n' \"${REDIS_ID}\" ;;\n"
+        "  *) printf 'unexpected docker command: %s\\n' \"$*\" >&2; exit 97 ;;\n"
+        "esac\n"
+    )
+    fake_docker.chmod(0o755)
+    fake_timeout = fake_bin / "timeout"
+    fake_timeout.write_text("#!/bin/sh\nshift\nexec \"$@\"\n")
+    fake_timeout.chmod(0o755)
+    fake_sleep = fake_bin / "sleep"
+    fake_sleep.write_text("#!/bin/sh\nexit 0\n")
+    fake_sleep.chmod(0o755)
+    fake_flock = fake_bin / "flock"
+    fake_flock.write_text("#!/bin/sh\nexit 0\n")
+    fake_flock.chmod(0o755)
+
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "DEPLOY_PATH": str(deploy_path),
+        "HOTPATCH_ENABLED": "true" if hotpatch_enabled else "false",
+        "HOTPATCH_TARGET": "ai-manus-sandbox-ab145dc2",
+        "DEPLOY_REF": "refs/tags/deploy-test-20260721-artifact-fix-01",
+        "PUBLIC_HOST": "43.156.115.199",
+        "FRONTEND_HOST_PORT": "18081",
+        "DOCKER_READY": "1" if docker_ready else "0",
+        "PS_FAILS": "1" if ps_fails else "0",
+        "PROJECT_IDS": project_ids,
+        "MONGODB_ID": mongodb_id,
+        "REDIS_ID": redis_id,
+    }
+    result = subprocess.run(
+        ["/bin/sh"],
+        input=preflight_script,
+        cwd=deploy_path,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    combined_output = result.stdout + result.stderr
+    assert (result.returncode == 0) is expected_success
+    assert expected_message in combined_output
+
+
+@pytest.mark.parametrize(
+    (
+        "had_previous_compose",
+        "mongodb_id_before",
+        "redis_id_before",
+        "current_project_ids",
+        "current_mongodb_id",
+        "current_redis_id",
+        "expected_success",
+        "expected_message",
+    ),
+    [
+        (False, "", "", "", "", "", True, ""),
+        (
+            False,
+            "",
+            "",
+            "new-container",
+            "",
+            "",
+            False,
+            "appeared after bootstrap preflight",
+        ),
+        (True, "", "", "", "", "", True, ""),
+        (
+            True,
+            "",
+            "",
+            "new-container",
+            "",
+            "",
+            False,
+            "appeared after bootstrap preflight",
+        ),
+        (
+            True,
+            "mongodb-id",
+            "redis-id",
+            "backend-id\nmongodb-id\nredis-id",
+            "mongodb-id",
+            "redis-id",
+            True,
+            "",
+        ),
+        (
+            True,
+            "mongodb-id",
+            "redis-id",
+            "backend-id\nmongodb-new\nredis-id",
+            "mongodb-new",
+            "redis-id",
+            False,
+            "changed after preflight",
+        ),
+    ],
+)
+def test_fork_deployment_revalidates_datastore_fingerprints_before_mutation(
+    had_previous_compose: bool,
+    mongodb_id_before: str,
+    redis_id_before: str,
+    current_project_ids: str,
+    current_mongodb_id: str,
+    current_redis_id: str,
+    expected_success: bool,
+    expected_message: str,
+):
+    workflow = yaml.safe_load(
+        (PROJECT_ROOT / ".github/workflows/docker-build-and-push.yml").read_text()
+    )
+    ssh_step = next(
+        step
+        for step in workflow["jobs"]["deploy-fork"]["steps"]
+        if step.get("uses") == SSH_ACTION
+    )
+    deploy_script = ssh_step["with"]["script"]
+    function_body = deploy_script.split(
+        "verify_stateful_pre_mutation() {", 1
+    )[1].split("\n}\n\nrestore_file() {", 1)[0]
+    verification_script = (
+        "set -eu\n"
+        "compose_project_container_ids() {\n"
+        "  printf '%s\\n' \"${CURRENT_PROJECT_IDS}\"\n"
+        "}\n"
+        "restore_compose() {\n"
+        "  case \"$*\" in\n"
+        "    'ps -q mongodb') printf '%s\\n' \"${CURRENT_MONGODB_ID}\" ;;\n"
+        "    'ps -q redis') printf '%s\\n' \"${CURRENT_REDIS_ID}\" ;;\n"
+        "    *) exit 97 ;;\n"
+        "  esac\n"
+        "}\n"
+        f"had_previous_compose={'true' if had_previous_compose else 'false'}\n"
+        f"mongodb_id_before={mongodb_id_before!r}\n"
+        f"redis_id_before={redis_id_before!r}\n"
+        "verify_stateful_pre_mutation() {"
+        f"{function_body}\n"
+        "}\n"
+        "verify_stateful_pre_mutation\n"
+    )
+    result = subprocess.run(
+        ["/bin/sh"],
+        input=verification_script,
+        env={
+            **os.environ,
+            "CURRENT_PROJECT_IDS": current_project_ids,
+            "CURRENT_MONGODB_ID": current_mongodb_id,
+            "CURRENT_REDIS_ID": current_redis_id,
+        },
+        text=True,
+        capture_output=True,
+    )
+
+    combined_output = result.stdout + result.stderr
+    assert (result.returncode == 0) is expected_success
+    assert expected_message in combined_output
 
 
 def test_public_compose_example_requires_host_injected_secrets():

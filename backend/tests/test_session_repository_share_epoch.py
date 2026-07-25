@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from app.domain.models.event import MessageEvent
 from app.domain.models.file import FileInfo
 from app.domain.models.session import Session

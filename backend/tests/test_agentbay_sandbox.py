@@ -3,6 +3,8 @@ Unit tests for the AgentBay sandbox provider.
 
 These tests mock the AgentBay SDK objects — no network or credentials needed.
 """
+import asyncio
+
 import httpx
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -12,6 +14,7 @@ from app.infrastructure.external.sandbox.agentbay_sandbox import AgentBaySandbox
 from app.infrastructure.external.sandbox.docker_sandbox import DockerSandbox
 from app.domain.external.sandbox import (
     SandboxProvisioningError,
+    SandboxShellProcessScope,
     SandboxUnavailableError,
 )
 
@@ -97,12 +100,14 @@ class TestConstruction:
         # No Docker container is managed
         assert sb._managed_container is False
         assert sb._container_name is None
+        assert sb.shell_process_scope is SandboxShellProcessScope.EXCLUSIVE
 
     def test_inherits_full_api_surface(self):
         sb = AgentBaySandbox(_fake_session(), "https://gw", "wss://gw", "wss://gw")
         for method in (
             "ensure_sandbox", "exec_command", "view_shell", "wait_for_process",
-            "write_to_process", "kill_process", "file_write", "file_read",
+            "write_to_process", "kill_process", "kill_all_shell_processes",
+            "file_write", "file_read",
             "file_exists", "file_delete", "file_list", "file_replace",
             "file_search", "file_find", "file_upload", "file_download",
             "get_browser", "destroy",
@@ -168,6 +173,44 @@ class TestCreate:
         params = agent_bay.create.call_args.args[0]
         assert params.image_id == "img-test-image"
         assert params.idle_release_timeout == 30 * 60  # SANDBOX_TTL_MINUTES default
+
+    async def test_connect_api_does_not_resolve_cdp_or_vnc_links(self):
+        session = _fake_session("session-api-only")
+
+        sb = await AgentBaySandbox.connect_api(session)
+
+        assert sb.id == "session-api-only"
+        assert sb.base_url == "https://gw.example/30150"
+        assert sb.cdp_url == ""
+        assert sb.vnc_url == ""
+        session.get_link.assert_awaited_once_with("https", 30150)
+        await sb.aclose()
+
+    async def test_connect_api_link_resolution_has_a_total_deadline(
+        self,
+        monkeypatch,
+    ):
+        session = _fake_session("session-link-timeout")
+        started = asyncio.Event()
+
+        async def get_link(_protocol, _port):
+            started.set()
+            await asyncio.Event().wait()
+
+        session.get_link = AsyncMock(side_effect=get_link)
+        monkeypatch.setattr(
+            AgentBaySandbox,
+            "_GATEWAY_LINK_TIMEOUT_SECONDS",
+            0.01,
+        )
+
+        with pytest.raises(
+            SandboxUnavailableError,
+            match="API gateway link resolution timed out",
+        ):
+            await AgentBaySandbox.connect_api(session)
+
+        assert started.is_set()
 
     async def test_create_failure_raises(self):
         agent_bay = _fake_agent_bay(create_success=False)

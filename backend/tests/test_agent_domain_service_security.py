@@ -21,8 +21,13 @@ from app.domain.models.turn_submission import (
 )
 from app.domain.services.agent_domain_service import AgentDomainService
 from app.application.services.agent_service import AgentService
+from app.application.errors.exceptions import (
+    ConflictError,
+    ServiceUnavailableError,
+)
 from app.domain.external.sandbox import (
     SandboxProvisioningError,
+    SharedSandboxShellCleanupError,
     SandboxUnavailableError,
 )
 from app.infrastructure.external.sandbox.passthrough_provisioner import (
@@ -221,6 +226,77 @@ async def test_owned_attachment_uses_storage_canonical_metadata():
     assert "spoofed.exe" not in accepted.input_json
     assert "private-capability" not in accepted.input_json
     assert len(turn_repository.candidates) == 1
+
+
+async def test_attachment_only_submission_is_durable_and_idempotent():
+    class OwnerScopedStorage:
+        def __init__(self):
+            self.calls = 0
+
+        async def get_file_info(self, file_id, user_id):
+            self.calls += 1
+            assert (file_id, user_id) == ("owned-file", "owner")
+            return FileInfo(
+                file_id="owned-file",
+                filename="canonical.pdf",
+                content_type="application/pdf",
+                size=42,
+                user_id="owner",
+            )
+
+    storage = OwnerScopedStorage()
+    service, _, turn_repository = _attachment_acceptance_service(storage)
+    submission_id = "44444444-4444-4444-8444-444444444444"
+
+    first = await service.accept_chat_submission(
+        session_id="session-attachment",
+        user_id="owner",
+        submission_id=submission_id,
+        message="",
+        attachments=[FileInfo(file_id="owned-file", filename="spoofed.exe")],
+    )
+    retried = await service.accept_chat_submission(
+        session_id="session-attachment",
+        user_id="owner",
+        submission_id=submission_id,
+        message="",
+        attachments=[FileInfo(file_id="owned-file", filename="changed.txt")],
+    )
+
+    input_event = TypeAdapter(AgentEvent).validate_json(first.input_json)
+    assert isinstance(input_event, MessageEvent)
+    assert input_event.id == submission_id
+    assert input_event.turn_id == submission_id
+    assert input_event.message == ""
+    assert input_event.attachments == [
+        FileInfo(
+            file_id="owned-file",
+            filename="canonical.pdf",
+            content_type="application/pdf",
+            size=42,
+        )
+    ]
+    assert retried.input_json == first.input_json
+    assert retried.request_hash == first.request_hash
+    assert storage.calls == 1
+    assert len(turn_repository.candidates) == 2
+
+
+async def test_empty_reconnect_payload_is_not_a_durable_submission():
+    service, _, turn_repository = _attachment_acceptance_service(
+        SimpleNamespace()
+    )
+
+    with pytest.raises(ValueError, match="message or at least one attachment"):
+        await service.accept_chat_submission(
+            session_id="session-attachment",
+            user_id="owner",
+            submission_id="55555555-5555-4555-8555-555555555555",
+            message="",
+            attachments=[],
+        )
+
+    assert turn_repository.candidates == []
 
 
 async def test_attachment_retry_uses_persisted_turn_when_storage_changes():
@@ -685,6 +761,252 @@ async def test_stopped_task_reconciles_expired_exact_running_turn():
         "session-1",
         SessionStatus.COMPLETED,
     )
+
+
+async def test_stop_propagates_shell_cleanup_failure_and_is_retryable():
+    trace = []
+    session = Session(
+        id="session-stop",
+        user_id="owner",
+        agent_id="agent-1",
+        sandbox_id="owned-sandbox",
+        sandbox_provider="docker",
+        task_id="task-1",
+    )
+
+    class Repository:
+        async def find_by_id(self, session_id):
+            assert session_id == session.id
+            return session.model_copy(deep=True)
+
+        async def update_status(self, session_id, status):
+            trace.append(("status", status))
+            session.status = status
+
+    class Task:
+        async def cancel(self):
+            trace.append("cancel")
+
+        async def wait_for_done(self, timeout_seconds):
+            trace.append("wait")
+            return True
+
+    class TaskClass:
+        @classmethod
+        async def get(cls, task_id):
+            assert task_id == "task-1"
+            return Task()
+
+    class Provisioner:
+        attempts = 0
+
+        async def terminate_shell_processes_locked(self, current):
+            assert current.sandbox_id == "owned-sandbox"
+            self.attempts += 1
+            trace.append(("shell-cleanup", self.attempts))
+            if self.attempts == 1:
+                raise RuntimeError("sandbox cleanup unavailable")
+            return True
+
+    provisioner = Provisioner()
+    service = AgentDomainService(
+        agent_repository=SimpleNamespace(),
+        session_repository=Repository(),
+        sandbox_cls=SimpleNamespace(),
+        task_cls=TaskClass,
+        file_storage=SimpleNamespace(),
+        mcp_repository=SimpleNamespace(),
+        sandbox_provisioner=provisioner,
+    )
+
+    with pytest.raises(RuntimeError, match="cleanup unavailable"):
+        await service.stop_session(session.id)
+
+    assert trace == ["cancel", "wait", ("shell-cleanup", 1)]
+
+    await service.stop_session(session.id)
+
+    assert trace == [
+        "cancel",
+        "wait",
+        ("shell-cleanup", 1),
+        "cancel",
+        "wait",
+        ("shell-cleanup", 2),
+        ("status", SessionStatus.COMPLETED),
+    ]
+
+
+async def test_stop_does_not_claim_shell_cleanup_in_a_shared_sandbox():
+    trace = []
+    session = Session(
+        id="session-shared",
+        user_id="owner",
+        agent_id="agent-1",
+        sandbox_id="dev-sandbox",
+        sandbox_provider="docker",
+        task_id="task-1",
+    )
+
+    class Repository:
+        async def find_by_id(self, session_id):
+            assert session_id == session.id
+            return session.model_copy(deep=True)
+
+        async def update_status(self, _session_id, _status):
+            trace.append("status")
+
+    class Task:
+        async def cancel(self):
+            trace.append("cancel")
+
+        async def wait_for_done(self, _timeout_seconds):
+            trace.append("wait")
+            return True
+
+    class TaskClass:
+        @classmethod
+        async def get(cls, _task_id):
+            return Task()
+
+    class SharedProvisioner:
+        async def terminate_shell_processes_locked(self, current):
+            assert current.sandbox_id == "dev-sandbox"
+            trace.append("shared-cleanup-refused")
+            return False
+
+    service = AgentDomainService(
+        agent_repository=SimpleNamespace(),
+        session_repository=Repository(),
+        sandbox_cls=SimpleNamespace(),
+        task_cls=TaskClass,
+        file_storage=SimpleNamespace(),
+        mcp_repository=SimpleNamespace(),
+        sandbox_provisioner=SharedProvisioner(),
+    )
+
+    with pytest.raises(
+        SharedSandboxShellCleanupError,
+        match="cannot be safely terminated",
+    ):
+        await service.stop_session(session.id)
+
+    assert trace == ["cancel", "wait", "shared-cleanup-refused"]
+
+
+async def test_application_stop_exposes_shared_sandbox_cleanup_conflict():
+    session = Session(
+        id="session-shared",
+        user_id="owner",
+        agent_id="agent-1",
+    )
+
+    class Repository:
+        async def find_by_id_and_user_id(self, session_id, user_id):
+            assert (session_id, user_id) == (session.id, session.user_id)
+            return session
+
+    service = AgentService(
+        agent_repository=SimpleNamespace(),
+        session_repository=Repository(),
+        sandbox_cls=SimpleNamespace(),
+        task_cls=SimpleNamespace(),
+        file_storage=SimpleNamespace(),
+        mcp_repository=SimpleNamespace(),
+    )
+
+    async def stop_session(_session_id):
+        raise SharedSandboxShellCleanupError("shared sandbox")
+
+    service._agent_domain_service.stop_session = stop_session
+
+    with pytest.raises(
+        ConflictError,
+        match="cannot be safely terminated",
+    ) as exc_info:
+        await service.stop_session(session.id, session.user_id)
+
+    assert exc_info.value.status_code == 409
+
+
+async def test_application_stop_exposes_cleanup_uncertainty_as_retryable():
+    session = Session(
+        id="session-cleanup-retry",
+        user_id="owner",
+        agent_id="agent-1",
+    )
+
+    class Repository:
+        async def find_by_id_and_user_id(self, session_id, user_id):
+            assert (session_id, user_id) == (session.id, session.user_id)
+            return session
+
+    service = AgentService(
+        agent_repository=SimpleNamespace(),
+        session_repository=Repository(),
+        sandbox_cls=SimpleNamespace(),
+        task_cls=SimpleNamespace(),
+        file_storage=SimpleNamespace(),
+        mcp_repository=SimpleNamespace(),
+    )
+
+    async def stop_session(_session_id):
+        raise SandboxUnavailableError("cleanup not confirmed")
+
+    service._agent_domain_service.stop_session = stop_session
+
+    with pytest.raises(
+        ServiceUnavailableError,
+        match="please retry stop",
+    ) as exc_info:
+        await service.stop_session(session.id, session.user_id)
+
+    assert exc_info.value.status_code == 503
+
+
+async def test_application_stop_deadline_precedes_frontend_timeout_and_retries():
+    session = Session(
+        id="session-timeout",
+        user_id="owner",
+        agent_id="agent-1",
+    )
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    class Repository:
+        async def find_by_id_and_user_id(self, session_id, user_id):
+            assert (session_id, user_id) == (session.id, session.user_id)
+            return session
+
+    service = AgentService(
+        agent_repository=SimpleNamespace(),
+        session_repository=Repository(),
+        sandbox_cls=SimpleNamespace(),
+        task_cls=SimpleNamespace(),
+        file_storage=SimpleNamespace(),
+        mcp_repository=SimpleNamespace(),
+    )
+    service._STOP_REQUEST_TIMEOUT_SECONDS = 0.01
+
+    async def stop_session(_session_id):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    service._agent_domain_service.stop_session = stop_session
+
+    assert AgentService._STOP_REQUEST_TIMEOUT_SECONDS < 30.0
+    with pytest.raises(
+        ServiceUnavailableError,
+        match="please retry",
+    ) as exc_info:
+        await service.stop_session(session.id, session.user_id)
+
+    assert exc_info.value.status_code == 503
+    assert started.is_set()
+    assert cancelled.is_set()
 
 
 async def test_task_without_runtime_is_replaced_after_crash_recovery():

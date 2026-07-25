@@ -1,3 +1,4 @@
+from enum import Enum
 from typing import Any, Optional, Protocol, BinaryIO
 from app.domain.models.tool_result import ToolResult
 from app.domain.external.browser import Browser
@@ -7,6 +8,25 @@ class SandboxUnavailableError(RuntimeError):
     """A sandbox may still exist, but its provider cannot confirm state now."""
 
 
+class SandboxShellCleanupUnsupportedError(SandboxUnavailableError):
+    """An older runtime lacks the scoped shell-cleanup API.
+
+    Lifecycle provisioners may catch this only after proving exclusive
+    ownership and fall back to deleting that exact sandbox generation.
+    """
+
+    def __init__(self, status_code: int):
+        super().__init__(
+            "Sandbox runtime does not support scoped shell cleanup "
+            f"(HTTP {status_code})"
+        )
+        self.status_code = status_code
+
+
+class SharedSandboxShellCleanupError(RuntimeError):
+    """Broad shell cleanup is unsafe for a shared sandbox topology."""
+
+
 class SandboxProvisioningError(RuntimeError):
     """Provisioning failed and cleanup could not confirm resource deletion."""
 
@@ -14,8 +34,22 @@ class SandboxProvisioningError(RuntimeError):
         super().__init__(message)
         self.sandbox_id = sandbox_id
 
+
+class SandboxShellProcessScope(str, Enum):
+    """How shell processes are isolated behind one sandbox API handle."""
+
+    EXCLUSIVE = "exclusive"
+    SHARED = "shared"
+    UNKNOWN = "unknown"
+
+
 class Sandbox(Protocol):
     """Sandbox service gateway interface"""
+
+    @property
+    def shell_process_scope(self) -> SandboxShellProcessScope:
+        """Whether every shell process belongs to this logical sandbox owner."""
+        ...
 
     async def aclose(self) -> None:
         """Close this client handle without deleting the provider resource.
@@ -103,6 +137,10 @@ class Sandbox(Protocol):
         Returns:
             Termination result
         """
+        ...
+
+    async def kill_all_shell_processes(self) -> ToolResult:
+        """Terminate every shell process in an exclusively-owned sandbox."""
         ...
     
     async def file_write(

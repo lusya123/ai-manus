@@ -22,8 +22,13 @@ from app.domain.external.agentbay_quota import (
     AgentBayQuotaUnavailableError,
     AgentBayReservationPhase,
 )
-from app.domain.external.sandbox import SandboxUnavailableError
+from app.domain.external.sandbox import (
+    SandboxShellCleanupUnsupportedError,
+    SandboxShellProcessScope,
+    SandboxUnavailableError,
+)
 from app.domain.models.session import Session
+from app.domain.models.tool_result import ToolResult
 from app.infrastructure.external.sandbox.agentbay_provisioner import (
     AgentBayProvisioner,
 )
@@ -174,6 +179,14 @@ class FakeAgentBay:
         if cls.connect_failures:
             cls.connect_failures -= 1
             raise SandboxUnavailableError("gateway links unavailable")
+        return SimpleNamespace(id=provider.session_id)
+
+    @classmethod
+    async def connect_api(cls, provider):
+        cls.events.append(f"connect-api:{provider.session_id}")
+        if cls.connect_failures:
+            cls.connect_failures -= 1
+            raise SandboxUnavailableError("API gateway link unavailable")
         return SimpleNamespace(id=provider.session_id)
 
     @classmethod
@@ -949,6 +962,186 @@ async def test_cancellation_before_ledger_mark_recovers_by_operation_label():
 
     assert sandbox.id == "provider-new"
     assert FakeAgentBay.allocate_count == 1
+
+
+async def test_agentbay_shell_cleanup_requires_exact_provisioned_ledger_owner(
+    monkeypatch,
+):
+    events: list[str] = []
+    provisioner, ledger, _ = subject(events)
+    owned = reservation(
+        "stop-operation",
+        phase=AgentBayReservationPhase.PROVISIONED,
+        provider_id="provider-stop",
+    )
+    ledger.cleanup_reservation = owned
+    provider = FakeAgentBay.add_provider("provider-stop")
+    session = make_session(sandbox_id="provider-stop", task_id="task-1")
+
+    class Handle:
+        id = "provider-stop"
+        shell_process_scope = SandboxShellProcessScope.EXCLUSIVE
+
+        async def kill_all_shell_processes(self):
+            events.append("kill-all")
+            return ToolResult(success=True)
+
+        async def aclose(self):
+            events.append("close")
+
+    async def connect_api(cls, exact_provider):
+        assert exact_provider is provider
+        events.append("connect-api:provider-stop")
+        return Handle()
+
+    monkeypatch.setattr(
+        FakeAgentBay,
+        "connect_api",
+        classmethod(connect_api),
+    )
+
+    assert await provisioner.terminate_shell_processes_locked(session) is True
+    assert events == [
+        "ledger-cleanup-get",
+        "lookup:provider-stop",
+        "connect-api:provider-stop",
+        "kill-all",
+        "close",
+    ]
+
+
+async def test_agentbay_old_runtime_falls_back_to_exact_provider_delete(
+    monkeypatch,
+):
+    events: list[str] = []
+    provisioner, ledger, repository = subject(events)
+    owned = reservation(
+        "stop-operation",
+        phase=AgentBayReservationPhase.PROVISIONED,
+        provider_id="provider-stop",
+    )
+    ledger.cleanup_reservation = owned
+    provider = FakeAgentBay.add_provider("provider-stop")
+    session = make_session(sandbox_id="provider-stop", task_id="task-1")
+
+    class Handle:
+        id = "provider-stop"
+        shell_process_scope = SandboxShellProcessScope.EXCLUSIVE
+
+        async def kill_all_shell_processes(self):
+            events.append("kill-all-unsupported")
+            raise SandboxShellCleanupUnsupportedError(404)
+
+        async def aclose(self):
+            events.append("close")
+
+    async def connect_api(cls, exact_provider):
+        assert exact_provider is provider
+        events.append("connect-api:provider-stop")
+        return Handle()
+
+    monkeypatch.setattr(
+        FakeAgentBay,
+        "connect_api",
+        classmethod(connect_api),
+    )
+
+    assert await provisioner.terminate_shell_processes_locked(session) is True
+
+    assert provider.delete_calls == 1
+    assert session.sandbox_id is None
+    assert session.sandbox_provider is None
+    assert session.task_id == "task-1"
+    assert repository.updates[-1] == (
+        "private-session-id",
+        None,
+        "task-1",
+        None,
+    )
+    assert ledger.release_calls == [
+        (
+            "private-session-id",
+            "private-user-id",
+            "stop-operation",
+            "provider-stop",
+        )
+    ]
+    assert events == [
+        "ledger-cleanup-get",
+        "lookup:provider-stop",
+        "connect-api:provider-stop",
+        "kill-all-unsupported",
+        "ledger-cleanup-get",
+        "lookup:provider-stop",
+        "delete:provider-stop",
+        "lookup:provider-stop",
+        "session-save-start",
+        "session-save",
+        "ledger-release",
+        "session-save-start",
+        "session-save",
+        "close",
+    ]
+
+
+async def test_agentbay_shell_cleanup_has_a_total_retryable_deadline(
+    monkeypatch,
+):
+    events: list[str] = []
+    provisioner, ledger, _ = subject(events)
+    ledger.cleanup_reservation = reservation(
+        "stop-operation",
+        phase=AgentBayReservationPhase.PROVISIONED,
+        provider_id="provider-stop",
+    )
+    provider = FakeAgentBay.add_provider("provider-stop")
+    session = make_session(sandbox_id="provider-stop", task_id="task-1")
+    started = asyncio.Event()
+
+    async def connect_api(cls, exact_provider):
+        assert exact_provider is provider
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        FakeAgentBay,
+        "connect_api",
+        classmethod(connect_api),
+    )
+    monkeypatch.setattr(
+        provisioner,
+        "_SHELL_CLEANUP_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    with pytest.raises(
+        SandboxUnavailableError,
+        match="safety deadline",
+    ):
+        await provisioner.terminate_shell_processes_locked(session)
+
+    assert started.is_set()
+    assert provider.delete_calls == 0
+    assert session.sandbox_id == "provider-stop"
+    assert session.task_id == "task-1"
+
+
+async def test_agentbay_shell_cleanup_fails_closed_for_reserved_operation():
+    events: list[str] = []
+    provisioner, ledger, _ = subject(events)
+    ledger.cleanup_reservation = reservation("still-reserved")
+    session = make_session(
+        sandbox_id="unknown-provider",
+        task_id="task-1",
+    )
+
+    with pytest.raises(
+        AgentBayQuotaInconsistentError,
+        match="ownership could not be verified",
+    ):
+        await provisioner.terminate_shell_processes_locked(session)
+
+    assert events == ["ledger-cleanup-get"]
 
 
 async def test_destroy_success_probes_exact_absence_then_clears_then_releases():

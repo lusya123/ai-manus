@@ -457,14 +457,15 @@ async def chat(
         else None
     )
     accepted_submission = None
-    if request.message:
+    has_new_submission = bool(request.message) or bool(attachments)
+    if has_new_submission:
         # Acceptance/409/429/503 happens before SSE response headers. Retrying
         # the same UUID after a lost response is therefore safe and resumable.
         accepted_submission = await agent_service.accept_chat_submission(
             session_id=session_id,
             user_id=current_user.id,
             submission_id=str(request.submission_id),
-            message=request.message,
+            message=request.message or "",
             timestamp=timestamp,
             attachments=attachments,
         )
@@ -612,18 +613,22 @@ async def vnc_websocket(
             # Run two forwarding tasks concurrently
             forward_task1 = asyncio.create_task(forward_to_sandbox())
             forward_task2 = asyncio.create_task(forward_from_sandbox())
-            
-            # Wait for either task to complete (meaning connection has closed)
-            done, pending = await asyncio.wait(
-                [forward_task1, forward_task2],
-                return_when=asyncio.FIRST_COMPLETED
-            )
-
-            logger.info("WebSocket connection closed")
-            
-            # Cancel pending tasks
-            for task in pending:
-                task.cancel()
+            forward_tasks = (forward_task1, forward_task2)
+            try:
+                # Wait for either task to complete (meaning connection closed).
+                await asyncio.wait(
+                    forward_tasks,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                logger.info("WebSocket connection closed")
+            finally:
+                # Parent cancellation must not strand the opposite direction's
+                # socket read. Observe both task outcomes before the upstream
+                # WebSocket context is allowed to close.
+                for task in forward_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*forward_tasks, return_exceptions=True)
     
     except ConnectionError as e:
         summary = safe_exception_summary(e)

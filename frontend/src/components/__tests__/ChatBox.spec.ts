@@ -88,4 +88,46 @@ describe('ChatBox submission', () => {
     await sendButton.trigger('click');
     expect(wrapper.emitted('submit')).toHaveLength(1);
   });
+
+  it('keeps the stop control visible and blocks submission while running', async () => {
+    const wrapper = mount(ChatBox, {
+      props: {
+        modelValue: 'queued follow-up',
+        rows: 1,
+        isRunning: true,
+        attachments: [],
+      },
+      global: { plugins: [i18n] },
+    });
+    const textarea = wrapper.get('textarea');
+    const footerButtons = wrapper.findAll('footer button');
+    const actionButton = footerButtons[footerButtons.length - 1];
+
+    expect(actionButton.attributes('aria-label')).toBeTruthy();
+    await textarea.trigger('keydown', { key: 'Enter' });
+    expect(wrapper.emitted('submit')).toBeUndefined();
+
+    await actionButton.trigger('click');
+    expect(wrapper.emitted('stop')).toHaveLength(1);
+    expect(wrapper.emitted('submit')).toBeUndefined();
+  });
+
+  it('disables repeated stop clicks while a stop request is pending', async () => {
+    const wrapper = mount(ChatBox, {
+      props: {
+        modelValue: '',
+        rows: 1,
+        isRunning: true,
+        isStopping: true,
+        attachments: [],
+      },
+      global: { plugins: [i18n] },
+    });
+    const footerButtons = wrapper.findAll('footer button');
+    const stopButton = footerButtons[footerButtons.length - 1];
+
+    expect(stopButton.attributes('disabled')).toBeDefined();
+    await stopButton.trigger('click');
+    expect(wrapper.emitted('stop')).toBeUndefined();
+  });
 });

@@ -106,13 +106,13 @@ export const chatWithSession = async (
 ): Promise<() => void> => {
   // Create once per logical send. createSSEConnection reuses this frozen body
   // for network/auth retries, so a lost response cannot create a second turn.
-  const logicalSubmissionId = message
-    ? (submissionId ?? createUuid())
-    : undefined;
+  const hasNewSubmission = Boolean(message.trim()) || Boolean(attachments?.length);
+  const logicalSubmissionId = submissionId ?? (hasNewSubmission ? createUuid() : undefined);
   return createSSEConnection<AgentSSEEvent['data']>(
     `/sessions/${sessionId}/chat`,
     {
       method: 'POST',
+      terminalEvents: ['done', 'error', 'wait'],
       body: { 
         message, 
         timestamp: Math.floor(Date.now() / 1000), 

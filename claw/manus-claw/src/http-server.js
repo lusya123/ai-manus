@@ -91,9 +91,10 @@ export class ManusClawHttpServer {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
     if (url.pathname === '/health' && req.method === 'GET') {
-      return sendJSON(res, 200, {
-        status: 'ok',
-        gateway_ready: this.gatewayBridge?.isGatewayReady?.() ?? false,
+      const gatewayReady = this.gatewayBridge?.isGatewayReady?.() ?? false;
+      return sendJSON(res, gatewayReady ? 200 : 503, {
+        status: gatewayReady ? 'ok' : 'starting',
+        gateway_ready: gatewayReady,
       });
     }
 

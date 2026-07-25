@@ -106,7 +106,11 @@
             @toolClick="handleToolClick" />
 
           <!-- Loading indicator -->
-          <LoadingIndicator v-if="isLoading" :text="$t('Thinking')" />
+          <LoadingIndicator v-if="isLoading && !streamStalled" :text="loadingText" />
+          <div v-if="streamStalled" role="alert"
+            class="rounded-xl border border-[var(--border-main)] bg-[var(--background-white-main)] px-4 py-3 text-sm text-[var(--text-secondary)]">
+            {{ t('Live updates stopped while the task may still be running. Refresh this page or stop the task.') }}
+          </div>
         </div>
 
         <div class="flex flex-col bg-[var(--background-gray-main)] sticky bottom-0">
@@ -117,7 +121,8 @@
           <PlanPanel v-if="plan && plan.steps.length > 0" :plan="plan" />
           <ChatBox v-model="inputMessage" v-model:attachments="attachments" :rows="1"
             :selected-model-id="selectedModelId" :model-options="modelOptions" show-model-picker
-            model-picker-disabled @submit="handleSubmit" :isRunning="isLoading" @stop="handleStop" />
+            model-picker-disabled @submit="handleSubmit" :isRunning="isLoading"
+            :isStopping="isStopping" @stop="handleStop" />
         </div>
       </div>
     </div>
@@ -129,7 +134,7 @@
 
 <script setup lang="ts">
 import SimpleBar from '../components/SimpleBar.vue';
-import { ref, onMounted, watch, nextTick, onUnmounted, reactive, toRefs } from 'vue';
+import { computed, ref, onMounted, watch, nextTick, onUnmounted, reactive, toRefs } from 'vue';
 import { useRouter, onBeforeRouteUpdate } from 'vue-router';
 import { useI18n } from 'vue-i18n';
 import ChatBox from '../components/ChatBox.vue';
@@ -137,7 +142,12 @@ import ChatMessage from '../components/ChatMessage.vue';
 import * as agentApi from '../api/agent';
 import { Message, MessageContent, ToolContent, AttachmentsContent, isConsecutiveAssistant } from '../types/message';
 import { PlanEventData, AgentSSEEvent } from '../types/event';
-import { hasTerminalEventForLatestTurn, useAgentEvents } from '../composables/useAgentEvents';
+import {
+  getLatestTurnId,
+  hasTerminalEventForLatestTurn,
+  hasTerminalEventForTurn,
+  useAgentEvents,
+} from '../composables/useAgentEvents';
 import ToolPanel from '../components/ToolPanel.vue'
 import PlanPanel from '../components/PlanPanel.vue';
 import { ArrowDown, FileSearch, Lock, Globe, Link, Check, Monitor } from 'lucide-vue-next';
@@ -160,6 +170,7 @@ import {
 } from '@/api/agentConfig';
 import type { ChatModelOption } from '@/api/agentConfig';
 import type { SessionModelConfig } from '@/types/response';
+import { createUuid } from '@/utils/uuid';
 
 const router = useRouter()
 const { t } = useI18n()
@@ -170,6 +181,9 @@ const { hideFilePanel } = useFilePanel()
 const createInitialState = () => ({
   inputMessage: '',
   isLoading: false,
+  isStopping: false,
+  streamStalled: false,
+  retryAttempt: 0,
   sessionId: undefined as string | undefined,
   messages: [] as Message[],
   toolPanelSize: 0,
@@ -195,6 +209,9 @@ const state = reactive(createInitialState());
 const {
   inputMessage,
   isLoading,
+  isStopping,
+  streamStalled,
+  retryAttempt,
   sessionId,
   messages,
   toolPanelSize,
@@ -219,6 +236,11 @@ const observerRef = ref<HTMLDivElement>();
 const chatContainerRef = ref<HTMLDivElement>();
 const modelOptions = ref<ChatModelOption[]>([]);
 const selectedModelId = ref(SYSTEM_MODEL_ID);
+const loadingText = computed(() => (
+  retryAttempt.value > 0
+    ? `${t('Reconnecting')} (${retryAttempt.value})`
+    : t('Thinking')
+));
 
 const loadModelOptions = async () => {
   modelOptions.value = buildChatModelOptions(await getCachedClientConfig());
@@ -247,6 +269,19 @@ const { handleEvent, resetEventHistory } = useAgentEvents(
 
 let sessionGeneration = 0;
 let activeChatToken: symbol | null = null;
+let chatWatchdogTimer: number | undefined;
+let rearmCurrentChatWatchdog: (() => void) | null = null;
+let componentUnmounted = false;
+
+const CHAT_NO_PROGRESS_TIMEOUT_MS = 120_000;
+const CHAT_MAX_STALLED_RECONNECTS = 3;
+
+const clearChatWatchdog = () => {
+  if (chatWatchdogTimer !== undefined) {
+    window.clearTimeout(chatWatchdogTimer);
+    chatWatchdogTimer = undefined;
+  }
+};
 
 const isCurrentSession = (targetSessionId: string, generation: number) => (
   sessionGeneration === generation && sessionId.value === targetSessionId
@@ -256,6 +291,8 @@ const isCurrentSession = (targetSessionId: string, generation: number) => (
 const resetState = () => {
   sessionGeneration += 1;
   activeChatToken = null;
+  rearmCurrentChatWatchdog = null;
+  clearChatWatchdog();
   // Cancel any existing chat connection
   if (cancelCurrentChat.value) {
     cancelCurrentChat.value();
@@ -278,16 +315,29 @@ watch(messages, async () => {
 
 
 const handleSubmit = () => {
-  chat(inputMessage.value, attachments.value);
+  if (isLoading.value || isStopping.value) return;
+  void chat(inputMessage.value, attachments.value);
 }
 
-const chat = async (message: string = '', files: FileInfo[] = []) => {
+const chat = async (
+  message: string = '',
+  files: FileInfo[] = [],
+  resumedSubmissionId?: string,
+) => {
   const targetSessionId = sessionId.value;
-  if (!targetSessionId) return;
+  if (!targetSessionId || isStopping.value) return;
   const generation = sessionGeneration;
   const chatToken = Symbol(targetSessionId);
+  const hasNewSubmission = Boolean(message.trim()) || files.length > 0;
+  const submissionId = resumedSubmissionId ?? (hasNewSubmission ? createUuid() : undefined);
+  const attachmentPayload = files.map((file: FileInfo) => ({
+    file_id: file.file_id,
+    filename: file.filename,
+  }));
 
   // Cancel any existing chat connection before starting a new one
+  clearChatWatchdog();
+  rearmCurrentChatWatchdog = null;
   if (cancelCurrentChat.value) {
     cancelCurrentChat.value();
     cancelCurrentChat.value = null;
@@ -298,6 +348,273 @@ const chat = async (message: string = '', files: FileInfo[] = []) => {
     activeChatToken === chatToken
     && isCurrentSession(targetSessionId, generation)
   );
+
+  let connectionSequence = 0;
+  let progressVersion = 0;
+  let stalledReconnects = 0;
+  let lastProgressAt = Date.now();
+
+  const isActiveConnection = (sequence: number) => (
+    isActiveChat() && connectionSequence === sequence
+  );
+
+  const finishChat = (cancelTransport: boolean) => {
+    if (!isActiveChat()) return;
+    clearChatWatchdog();
+    rearmCurrentChatWatchdog = null;
+    const cancel = cancelCurrentChat.value;
+    cancelCurrentChat.value = null;
+    activeChatToken = null;
+    isLoading.value = false;
+    streamStalled.value = false;
+    retryAttempt.value = 0;
+    if (cancelTransport) {
+      cancel?.();
+    }
+  };
+
+  const failChatBeforeStreaming = (error: unknown) => {
+    if (!isActiveChat()) return;
+    console.error('Chat error:', error);
+    clearChatWatchdog();
+    rearmCurrentChatWatchdog = null;
+    cancelCurrentChat.value = null;
+    activeChatToken = null;
+    isLoading.value = false;
+    streamStalled.value = false;
+    retryAttempt.value = 0;
+    showErrorToast(t('Connection lost. Please retry.'));
+  };
+
+  const markStreamStalled = () => {
+    if (!isActiveChat()) return;
+    clearChatWatchdog();
+    rearmCurrentChatWatchdog = null;
+    const cancel = cancelCurrentChat.value;
+    cancelCurrentChat.value = null;
+    activeChatToken = null;
+    // The durable task is still active. Keep submission blocked and the stop
+    // control available, but remove the indefinite thinking animation.
+    isLoading.value = true;
+    streamStalled.value = true;
+    retryAttempt.value = 0;
+    cancel?.();
+    showErrorToast(t(
+      'Live updates stopped while the task may still be running. Refresh this page or stop the task.',
+    ));
+  };
+
+  const isTerminalSnapshot = (events: AgentSSEEvent[]) => (
+    submissionId
+      ? hasTerminalEventForTurn(events, submissionId)
+      : hasTerminalEventForLatestTurn(events)
+  );
+
+  const applyDurableSnapshot = (events: AgentSSEEvent[]): boolean => {
+    let snapshotMadeProgress = false;
+    for (const event of events) {
+      const isCurrentUserInput = (
+        submissionId
+        && event.event === 'message'
+        && (event.data as { role?: string }).role === 'user'
+        && event.data.turn_id === submissionId
+      );
+      // A newly submitted turn is already rendered optimistically. The live
+      // durable stream intentionally skips this event, so reconciliation must
+      // not append a second copy from full session history.
+      if (isCurrentUserInput) continue;
+      if (handleEvent(event)) {
+        snapshotMadeProgress = true;
+        progressVersion += 1;
+      }
+    }
+    return snapshotMadeProgress;
+  };
+
+  const reconcileTransportFailure = async (
+    sequence: number,
+    error: unknown,
+  ) => {
+    if (!isActiveConnection(sequence) || isStopping.value) return;
+    console.error('Chat stream retries exhausted:', error);
+    clearChatWatchdog();
+    retryAttempt.value = 0;
+
+    try {
+      const latest = await agentApi.getSession(targetSessionId);
+      if (!isActiveConnection(sequence) || isStopping.value) return;
+      applyDurableSnapshot(latest.events);
+      const isActiveStatus = (
+        latest.status === SessionStatus.RUNNING
+        || latest.status === SessionStatus.PENDING
+      );
+      if (isTerminalSnapshot(latest.events) || !isActiveStatus) {
+        finishChat(true);
+        return;
+      }
+    } catch (reconcileError) {
+      console.error(
+        'Failed to reconcile session after chat stream failure:',
+        reconcileError,
+      );
+      if (!isActiveConnection(sequence) || isStopping.value) return;
+    }
+
+    // A POST may already have been durably accepted even when its stream can
+    // no longer reconnect. Never unlock another submission without proving
+    // the current turn terminal; keep the explicit stop control available.
+    markStreamStalled();
+  };
+
+  const connectStream = async (includeSubmission: boolean): Promise<void> => {
+    if (!isActiveChat() || isStopping.value) return;
+
+    clearChatWatchdog();
+    if (cancelCurrentChat.value) {
+      cancelCurrentChat.value();
+      cancelCurrentChat.value = null;
+    }
+
+    const sequence = ++connectionSequence;
+    const armWatchdog = () => {
+      if (
+        !isActiveConnection(sequence)
+        || isStopping.value
+        || streamStalled.value
+      ) {
+        return;
+      }
+      clearChatWatchdog();
+      const elapsed = Date.now() - lastProgressAt;
+      const remaining = Math.max(0, CHAT_NO_PROGRESS_TIMEOUT_MS - elapsed);
+      chatWatchdogTimer = window.setTimeout(() => {
+        chatWatchdogTimer = undefined;
+        void reconcileNoProgress(sequence, progressVersion);
+      }, remaining);
+    };
+    rearmCurrentChatWatchdog = armWatchdog;
+
+    try {
+      const cancel = await agentApi.chatWithSession(
+        targetSessionId,
+        includeSubmission ? message : '',
+        lastEventId.value,
+        includeSubmission ? attachmentPayload : [],
+        {
+          onOpen: () => {
+            if (!isActiveConnection(sequence)) return;
+            retryAttempt.value = 0;
+            armWatchdog();
+          },
+          onMessage: ({ event, data }) => {
+            if (!isActiveConnection(sequence)) return false;
+            const madeProgress = handleEvent({
+              event: event as AgentSSEEvent['event'],
+              data: data as AgentSSEEvent['data'],
+            });
+            if (madeProgress) {
+              progressVersion += 1;
+              stalledReconnects = 0;
+              lastProgressAt = Date.now();
+              streamStalled.value = false;
+              armWatchdog();
+            }
+            return madeProgress;
+          },
+          onClose: () => {
+            if (!isActiveConnection(sequence)) return;
+            finishChat(false);
+          },
+          onError: (error) => {
+            if (!isActiveConnection(sequence)) return;
+            void reconcileTransportFailure(sequence, error);
+          },
+          onRetry: ({ attempt }) => {
+            if (!isActiveConnection(sequence)) return;
+            clearChatWatchdog();
+            retryAttempt.value = attempt;
+          },
+        },
+        submissionId,
+      );
+      if (!isActiveConnection(sequence)) {
+        cancel();
+        return;
+      }
+      cancelCurrentChat.value = cancel;
+      armWatchdog();
+    } catch (error) {
+      if (!isActiveConnection(sequence)) return;
+      failChatBeforeStreaming(error);
+    }
+  };
+
+  const recoverActiveStream = async (sequence: number, madeProgress: boolean) => {
+    if (!isActiveConnection(sequence) || isStopping.value) return;
+    if (madeProgress) {
+      stalledReconnects = 0;
+    } else {
+      stalledReconnects += 1;
+    }
+    if (stalledReconnects > CHAT_MAX_STALLED_RECONNECTS) {
+      markStreamStalled();
+      return;
+    }
+    isLoading.value = true;
+    streamStalled.value = false;
+    retryAttempt.value = stalledReconnects;
+    // Give the next connection a full observation window. This is recovery
+    // progress, not task progress, so it does not reset stalledReconnects.
+    lastProgressAt = Date.now();
+    await connectStream(false);
+  };
+
+  const reconcileNoProgress = async (
+    sequence: number,
+    observedProgressVersion: number,
+  ) => {
+    if (!isActiveConnection(sequence) || isStopping.value) return;
+
+    try {
+      const latest = await agentApi.getSession(targetSessionId);
+      if (
+        !isActiveConnection(sequence)
+        || isStopping.value
+        || progressVersion !== observedProgressVersion
+      ) {
+        return;
+      }
+
+      const snapshotMadeProgress = applyDurableSnapshot(latest.events);
+
+      const isActiveStatus = (
+        latest.status === SessionStatus.RUNNING
+        || latest.status === SessionStatus.PENDING
+      );
+      if (isTerminalSnapshot(latest.events) || !isActiveStatus) {
+        finishChat(true);
+        return;
+      }
+
+      // Older terminal events in full session history are not terminal for the
+      // active durable turn.
+      isLoading.value = true;
+      if (snapshotMadeProgress) {
+        lastProgressAt = Date.now();
+      }
+      await recoverActiveStream(sequence, snapshotMadeProgress);
+    } catch (error) {
+      console.error('Failed to reconcile stalled chat stream:', error);
+      if (
+        !isActiveConnection(sequence)
+        || isStopping.value
+        || progressVersion !== observedProgressVersion
+      ) {
+        return;
+      }
+      await recoverActiveStream(sequence, false);
+    }
+  };
 
   if (message.trim()) {
     // Add user message to conversation list
@@ -327,59 +644,9 @@ const chat = async (message: string = '', files: FileInfo[] = []) => {
   inputMessage.value = '';
   attachments.value = [];
   isLoading.value = true;
-  try {
-    // Use the split event handler function and store the cancel function
-    const cancel = await agentApi.chatWithSession(
-      targetSessionId,
-      message,
-      lastEventId.value,
-      files.map((file: FileInfo) => ({file_id : file.file_id, 
-                                        filename : file.filename})),
-      {
-        onOpen: () => {
-          if (!isActiveChat()) return;
-          isLoading.value = true;
-        },
-        onMessage: ({ event, data }) => {
-          if (!isActiveChat()) return;
-          handleEvent({
-            event: event as AgentSSEEvent['event'],
-            data: data as AgentSSEEvent['data']
-          });
-        },
-        onClose: () => {
-          if (!isActiveChat()) return;
-          isLoading.value = false;
-          // Clear the cancel function when connection is closed normally
-          if (cancelCurrentChat.value) {
-            cancelCurrentChat.value = null;
-          }
-          activeChatToken = null;
-        },
-        onError: (error) => {
-          if (!isActiveChat()) return;
-          console.error('Chat error:', error);
-          isLoading.value = false;
-          // Clear the cancel function when there's an error
-          if (cancelCurrentChat.value) {
-            cancelCurrentChat.value = null;
-          }
-          activeChatToken = null;
-        }
-      },
-    );
-    if (!isActiveChat()) {
-      cancel();
-      return;
-    }
-    cancelCurrentChat.value = cancel;
-  } catch (error) {
-    if (!isActiveChat()) return;
-    console.error('Chat error:', error);
-    isLoading.value = false;
-    cancelCurrentChat.value = null;
-    activeChatToken = null;
-  }
+  streamStalled.value = false;
+  retryAttempt.value = 0;
+  await connectStream(hasNewSubmission);
 }
 
 const restoreSession = async () => {
@@ -389,26 +656,38 @@ const restoreSession = async () => {
     return;
   }
   const generation = sessionGeneration;
-  const session = await agentApi.getSession(targetSessionId);
-  if (!isCurrentSession(targetSessionId, generation)) return;
-  syncSelectedSessionModel(session.model_config);
-  // Initialize share mode based on session state
-  shareMode.value = session.is_shared ? 'public' : 'private';
-  realTime.value = false;
-  for (const event of session.events) {
-    handleEvent(event);
-  }
-  realTime.value = true;
-  const hasTerminalEvent = hasTerminalEventForLatestTurn(session.events);
-  if (
-    (session.status === SessionStatus.RUNNING || session.status === SessionStatus.PENDING)
-    && !hasTerminalEvent
-  ) {
-    await chat();
-  } else {
+  try {
+    const session = await agentApi.getSession(targetSessionId);
+    if (!isCurrentSession(targetSessionId, generation)) return;
+    syncSelectedSessionModel(session.model_config);
+    // Initialize share mode based on session state
+    shareMode.value = session.is_shared ? 'public' : 'private';
+    realTime.value = false;
+    for (const event of session.events) {
+      handleEvent(event);
+    }
+    realTime.value = true;
+    const hasTerminalEvent = hasTerminalEventForLatestTurn(session.events);
+    if (
+      (session.status === SessionStatus.RUNNING || session.status === SessionStatus.PENDING)
+      && !hasTerminalEvent
+    ) {
+      await chat('', [], getLatestTurnId(session.events));
+    } else {
+      isLoading.value = false;
+      streamStalled.value = false;
+    }
+    void agentApi.clearUnreadMessageCount(targetSessionId).catch((error) => {
+      console.error('Failed to clear unread message count:', error);
+    });
+  } catch (error) {
+    if (!isCurrentSession(targetSessionId, generation)) return;
+    console.error('Failed to restore session:', error);
     isLoading.value = false;
+    streamStalled.value = false;
+    retryAttempt.value = 0;
+    showErrorToast(t('Failed to restore session. Please retry.'));
   }
-  agentApi.clearUnreadMessageCount(targetSessionId);
 }
 
 
@@ -427,9 +706,11 @@ onBeforeRouteUpdate((to, _, next) => {
 
 // Initialize active conversation
 onMounted(async () => {
+  const initializationGeneration = sessionGeneration;
   hideFilePanel();
   const initialModelId = history.state?.modelId;
   await loadModelOptions();
+  if (componentUnmounted || sessionGeneration !== initializationGeneration) return;
   if (typeof initialModelId === 'string') {
     selectedModelId.value = initialModelId;
   }
@@ -439,10 +720,10 @@ onMounted(async () => {
     sessionId.value = String(routeParams.sessionId) as string;
     // Get initial message from history.state
     const message = history.state?.message;
-    const files: FileInfo[] = history.state?.files;
+    const files: FileInfo[] = history.state?.files ?? [];
     history.replaceState({}, document.title);
-    if (message) {
-      chat(message, files);
+    if (message || files.length > 0) {
+      chat(message ?? '', files);
     } else {
       restoreSession();
     }
@@ -452,8 +733,11 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  componentUnmounted = true;
   sessionGeneration += 1;
   activeChatToken = null;
+  rearmCurrentChatWatchdog = null;
+  clearChatWatchdog();
   if (cancelCurrentChat.value) {
     cancelCurrentChat.value();
     cancelCurrentChat.value = null;
@@ -502,17 +786,42 @@ const handleScroll = (_: Event) => {
 
 const handleStop = async () => {
   const targetSessionId = sessionId.value;
-  if (targetSessionId) {
+  if (targetSessionId && !isStopping.value) {
     const generation = sessionGeneration;
+    isStopping.value = true;
+    clearChatWatchdog();
     try {
       await agentApi.stopSession(targetSessionId);
       if (!isCurrentSession(targetSessionId, generation)) return;
       activeChatToken = null;
+      rearmCurrentChatWatchdog = null;
       cancelCurrentChat.value?.();
       cancelCurrentChat.value = null;
       isLoading.value = false;
+      streamStalled.value = false;
+      retryAttempt.value = 0;
     } catch (error) {
       console.error('Failed to stop session:', error);
+      if (!isCurrentSession(targetSessionId, generation)) return;
+      // The backend intentionally returns 409/503 when task cancellation may
+      // have succeeded but sandbox process cleanup was not confirmed. Session
+      // status or a terminal turn cannot prove that shell descendants are
+      // gone, so every failed stop remains explicitly retryable.
+      activeChatToken = null;
+      rearmCurrentChatWatchdog = null;
+      cancelCurrentChat.value?.();
+      cancelCurrentChat.value = null;
+      isLoading.value = true;
+      streamStalled.value = true;
+      retryAttempt.value = 0;
+      showErrorToast(t('Failed to stop task. It may still be running; please try again.'));
+    } finally {
+      if (isCurrentSession(targetSessionId, generation)) {
+        isStopping.value = false;
+        if (isLoading.value && !streamStalled.value) {
+          rearmCurrentChatWatchdog?.();
+        }
+      }
     }
   }
 }

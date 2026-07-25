@@ -8,7 +8,10 @@ import uuid
 from weakref import WeakValueDictionary
 from datetime import UTC, datetime
 from app.domain.models.session import Session, SessionStatus
-from app.domain.external.sandbox import Sandbox
+from app.domain.external.sandbox import (
+    Sandbox,
+    SharedSandboxShellCleanupError,
+)
 from app.domain.external.sandbox_provisioner import (
     SandboxProvisioner,
     SandboxProvisioningRequiredError,
@@ -825,8 +828,10 @@ class AgentDomainService:
             normalized_submission_id = str(uuid.UUID(str(submission_id)))
         except (TypeError, ValueError, AttributeError) as exc:
             raise ValueError("submission_id must be a UUID") from exc
-        if not message:
-            raise ValueError("A durable submission requires a non-empty message")
+        if not message and not attachments:
+            raise ValueError(
+                "A durable submission requires a message or at least one attachment"
+            )
 
         async with self._get_session_lock(session_id):
             async def submit() -> TurnSubmission:
@@ -1101,11 +1106,12 @@ class AgentDomainService:
                 )
 
     async def stop_session(self, session_id: str) -> None:
-        """Stop a session"""
+        """Stop the task, then terminate shells in its owned private sandbox."""
         session = await self._session_repository.find_by_id(session_id)
         if not session:
             logger.error(f"Attempted to stop non-existent Session {session_id}")
             raise RuntimeError("Session not found")
+        stopped_task_id = session.task_id
         task = await self._get_task(session)
         if task:
             await task.cancel()
@@ -1115,10 +1121,44 @@ class AgentDomainService:
                     "task did not acknowledge cancellation within "
                     f"{self._TASK_CANCEL_TIMEOUT_SECONDS:g}s"
                 )
+        current = await self._session_repository.find_by_id(session_id)
+        if not current:
+            raise RuntimeError("Session disappeared while stopping")
+        if self._sandbox_provisioner is None:
+            if current.sandbox_id:
+                raise SandboxProvisioningRequiredError(
+                    "No sandbox lifecycle provisioner is configured"
+                )
+        else:
+            cleanup = getattr(
+                self._sandbox_provisioner,
+                "terminate_shell_processes_locked",
+                None,
+            )
+            if not callable(cleanup):
+                if current.sandbox_id:
+                    raise SandboxProvisioningRequiredError(
+                        "Sandbox lifecycle provisioner cannot terminate shell processes"
+                    )
+            else:
+                cleaned = await cleanup(current)
+                if cleaned is False:
+                    logger.warning(
+                        "Task cancellation was acknowledged, but shell cleanup "
+                        "is unsafe for the shared sandbox: "
+                        "session_id=%s sandbox_id=%s",
+                        current.id,
+                        current.sandbox_id,
+                    )
+                    raise SharedSandboxShellCleanupError(
+                        "Task cancellation was acknowledged, but background "
+                        "shell processes cannot be safely terminated in the "
+                        "shared sandbox topology"
+                    )
         await self._finalize_turns_after_task_stop(
             session_id,
-            user_id=session.user_id,
-            task_id=session.task_id,
+            user_id=current.user_id,
+            task_id=stopped_task_id,
         )
         await self._session_repository.update_status(session_id, SessionStatus.COMPLETED)
 
@@ -1212,12 +1252,17 @@ class AgentDomainService:
         """
 
         if self._turn_submission_repository is not None:
-            if message:
+            has_new_submission = (
+                accepted_submission is not None
+                or bool(message)
+                or bool(attachments)
+            )
+            if has_new_submission:
                 turn = accepted_submission or await self.accept_chat_submission(
                     session_id=session_id,
                     user_id=user_id,
                     submission_id=submission_id or "",
-                    message=message,
+                    message=message or "",
                     timestamp=timestamp,
                     attachments=attachments,
                 )

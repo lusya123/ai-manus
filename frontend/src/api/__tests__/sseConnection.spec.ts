@@ -41,6 +41,7 @@ describe('createSSEConnection lifecycle', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     localStorage.clear();
@@ -75,7 +76,7 @@ describe('createSSEConnection lifecycle', () => {
     });
 
     await retryObserved.promise;
-    expect(retryDelay).toBeUndefined();
+    expect(retryDelay).toBe(1_000);
     expect(onError).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();
 
@@ -216,5 +217,222 @@ describe('createSSEConnection lifecycle', () => {
     expect(onError).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();
     expect(consoleError).not.toHaveBeenCalled();
+  });
+
+  it('closes the transport immediately after delivering a terminal event', async () => {
+    fetchEventSourceMock.mockImplementation(
+      async (_input: RequestInfo, init: FetchEventSourceInit) => {
+        await init.onopen?.(successfulSSE());
+        init.onmessage?.({
+          id: 'done-1',
+          event: 'done',
+          data: JSON.stringify({ event_id: 'done-1' }),
+        });
+      },
+    );
+
+    const onMessage = vi.fn();
+    const onClose = vi.fn();
+    const onError = vi.fn();
+    const cancel = await createSSEConnection(
+      '/sessions/example/chat',
+      { terminalEvents: ['done', 'error', 'wait'] },
+      { onMessage, onClose, onError },
+    );
+
+    await vi.waitFor(() => expect(onClose).toHaveBeenCalledOnce());
+    expect(onMessage).toHaveBeenCalledWith({
+      event: 'done',
+      data: { event_id: 'done-1' },
+    });
+    expect(onError).not.toHaveBeenCalled();
+    cancel();
+  });
+
+  it('retries a clean EOF without a terminal event and then reports one final error', async () => {
+    fetchEventSourceMock.mockImplementation(
+      async (_input: RequestInfo, init: FetchEventSourceInit) => {
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          await init.onopen?.(successfulSSE());
+          let closeError: unknown;
+          try {
+            init.onclose?.();
+          } catch (error) {
+            closeError = error;
+          }
+          try {
+            init.onerror?.(closeError);
+          } catch {
+            return;
+          }
+        }
+      },
+    );
+
+    const onClose = vi.fn();
+    const onRetry = vi.fn();
+    const onError = vi.fn();
+    const cancel = await createSSEConnection(
+      '/sessions/example/chat',
+      {
+        terminalEvents: ['done'],
+        maxRetryAttempts: 2,
+        maxRetryDurationMs: 1_000,
+      },
+      { onClose, onRetry, onError },
+    );
+
+    await vi.waitFor(() => expect(onError).toHaveBeenCalledOnce());
+    expect(onRetry.mock.calls.map(([info]) => info.attempt)).toEqual([1, 2]);
+    expect(onClose).not.toHaveBeenCalled();
+    expect(onError.mock.calls[0]?.[0].message).toContain('retry limit exceeded');
+    cancel();
+  });
+
+  it('resets the consecutive retry budget only after newly applied progress', async () => {
+    fetchEventSourceMock.mockImplementation(
+      async (_input: RequestInfo, init: FetchEventSourceInit) => {
+        expect(init.onerror?.(new TypeError('first outage'))).toBe(1_000);
+        await init.onopen?.(successfulSSE());
+        init.onmessage?.(agentEvent({ event_id: 'new-progress' }));
+
+        expect(init.onerror?.(new TypeError('second outage'))).toBe(1_000);
+        await init.onopen?.(successfulSSE());
+        init.onmessage?.(agentEvent({ event_id: 'replayed-progress' }));
+
+        expect(init.onerror?.(new TypeError('third outage'))).toBe(1_000);
+        try {
+          init.onerror?.(new TypeError('fourth outage'));
+        } catch {
+          // Expected: the duplicate replay did not replenish the retry budget.
+        }
+      },
+    );
+
+    const onRetry = vi.fn();
+    const onError = vi.fn();
+    const cancel = await createSSEConnection(
+      '/sessions/example/chat',
+      {
+        terminalEvents: ['done'],
+        maxRetryAttempts: 2,
+        maxRetryDurationMs: 1_000,
+      },
+      {
+        onMessage: ({ data }) => (
+          (data as { event_id: string }).event_id === 'new-progress'
+        ),
+        onRetry,
+        onError,
+      },
+    );
+
+    await vi.waitFor(() => expect(onError).toHaveBeenCalledOnce());
+    expect(onRetry.mock.calls.map(([info]) => info.attempt)).toEqual([1, 1, 2]);
+    expect(onError.mock.calls[0]?.[0].message).toContain('retry limit exceeded');
+    cancel();
+  });
+
+  it('does not treat comment-only ping frames as business progress', async () => {
+    fetchEventSourceMock.mockImplementation(
+      async (_input: RequestInfo, init: FetchEventSourceInit) => {
+        expect(init.onerror?.(new TypeError('first outage'))).toBe(1_000);
+        await init.onopen?.(successfulSSE());
+        init.onmessage?.({ id: '', event: '', data: '' });
+        try {
+          init.onerror?.(new TypeError('second outage'));
+        } catch {
+          // Expected: the empty ping never replenished the retry budget.
+        }
+      },
+    );
+
+    const onMessage = vi.fn();
+    const onError = vi.fn();
+    const cancel = await createSSEConnection(
+      '/sessions/example/chat',
+      {
+        terminalEvents: ['done'],
+        maxRetryAttempts: 1,
+        maxRetryDurationMs: 1_000,
+      },
+      { onMessage, onError },
+    );
+
+    await vi.waitFor(() => expect(onError).toHaveBeenCalledOnce());
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(onError.mock.calls[0]?.[0].message).toContain('retry limit exceeded');
+    cancel();
+  });
+
+  it.each([
+    ['HTTP 429', () => new Response(null, { status: 429 })],
+    ['HTTP 503', () => new Response(null, { status: 503 })],
+    ['network error', () => new TypeError('network unavailable')],
+  ])('bounds persistent retryable %s failures', async (_label, failure) => {
+    fetchEventSourceMock.mockImplementation(
+      async (_input: RequestInfo, init: FetchEventSourceInit) => {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          let retryError: unknown = failure();
+          if (retryError instanceof Response) {
+            try {
+              await init.onopen?.(retryError);
+            } catch (error) {
+              retryError = error;
+            }
+          }
+          try {
+            init.onerror?.(retryError);
+          } catch {
+            return;
+          }
+        }
+      },
+    );
+
+    const onRetry = vi.fn();
+    const onError = vi.fn();
+    const cancel = await createSSEConnection(
+      '/sessions/example/chat',
+      {
+        maxRetryAttempts: 1,
+        maxRetryDurationMs: 1_000,
+      },
+      { onRetry, onError },
+    );
+
+    await vi.waitFor(() => expect(onError).toHaveBeenCalledOnce());
+    expect(onRetry).toHaveBeenCalledOnce();
+    expect(onRetry.mock.calls[0]?.[0]).toMatchObject({
+      attempt: 1,
+      nextRetryMs: 1_000,
+    });
+    cancel();
+  });
+
+  it('enforces a total retry deadline even if the next fetch never settles', async () => {
+    vi.useFakeTimers();
+    const pending = deferred();
+    fetchEventSourceMock.mockImplementation(
+      async (_input: RequestInfo, init: FetchEventSourceInit) => {
+        init.onerror?.(new TypeError('temporary outage'));
+        await pending.promise;
+      },
+    );
+
+    const onRetry = vi.fn();
+    const onError = vi.fn();
+    const cancel = await createSSEConnection(
+      '/sessions/example/chat',
+      { maxRetryDurationMs: 25 },
+      { onRetry, onError },
+    );
+
+    expect(onRetry).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(25);
+    expect(onError).toHaveBeenCalledOnce();
+    expect(onError.mock.calls[0]?.[0].message).toContain('retry deadline exceeded');
+    cancel();
+    pending.resolve();
   });
 });

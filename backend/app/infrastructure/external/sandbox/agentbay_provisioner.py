@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import uuid
 from typing import Any
 
@@ -17,7 +18,12 @@ from app.domain.external.agentbay_quota import (
     AgentBayQuotaReservation,
     AgentBayReservationPhase,
 )
-from app.domain.external.sandbox import Sandbox, SandboxUnavailableError
+from app.domain.external.sandbox import (
+    Sandbox,
+    SandboxShellCleanupUnsupportedError,
+    SandboxShellProcessScope,
+    SandboxUnavailableError,
+)
 from app.domain.external.sandbox_provisioner import SandboxProvisioner
 from app.domain.models.session import Session
 from app.domain.repositories.session_repository import SessionRepository
@@ -25,6 +31,8 @@ from app.infrastructure.external.sandbox.agentbay_sandbox import AgentBaySandbox
 
 
 _EXPECTED_TASK_SANDBOX_ID_UNSET = object()
+
+logger = logging.getLogger(__name__)
 
 
 class AgentBayProvisioner(SandboxProvisioner):
@@ -52,6 +60,7 @@ class AgentBayProvisioner(SandboxProvisioner):
         # returning the authoritative operation that must be recovered.
         AgentBayQuotaOutcome.STALE_OPERATION,
     }
+    _SHELL_CLEANUP_TIMEOUT_SECONDS = 20.0
 
     def __init__(
         self,
@@ -629,6 +638,101 @@ class AgentBayProvisioner(SandboxProvisioner):
             reservation,
             allow_allocate=result.outcome is AgentBayQuotaOutcome.RESERVED,
         )
+
+    async def terminate_shell_processes_locked(self, session: Session) -> bool:
+        """Bound lookup, API discovery, cleanup, and compatibility fallback."""
+
+        try:
+            async with asyncio.timeout(self._SHELL_CLEANUP_TIMEOUT_SECONDS):
+                return await self._terminate_shell_processes_locked(session)
+        except TimeoutError as exc:
+            raise SandboxUnavailableError(
+                "AgentBay shell cleanup exceeded its safety deadline; retry stop"
+            ) from exc
+
+    async def _terminate_shell_processes_locked(
+        self, session: Session
+    ) -> bool:
+        """Terminate shells only after the cost ledger proves exact ownership."""
+
+        if session.sandbox_provider not in (None, self._PROVIDER_NAME):
+            raise AgentBayQuotaInconsistentError(
+                "Session sandbox belongs to a different provider"
+            )
+        if session.sandbox_destroying:
+            await self.destroy_locked(session, preserve_task=True)
+            return True
+        reservation = await self._ledger.get_reservation_for_cleanup(
+            session.id, session.user_id
+        )
+        await self._adopt_legacy_ownership(session, reservation)
+        if reservation is None:
+            if session.sandbox_id:
+                raise AgentBayQuotaInconsistentError(
+                    "Session has AgentBay ownership missing from the cost ledger"
+                )
+            return True
+        if (
+            reservation.phase is not AgentBayReservationPhase.PROVISIONED
+            or not reservation.provider_id
+            or session.sandbox_id != reservation.provider_id
+        ):
+            raise AgentBayQuotaInconsistentError(
+                "AgentBay shell process ownership could not be verified"
+            )
+
+        provider = await self._sandbox_cls.lookup_provider_session(
+            reservation.provider_id
+        )
+        if provider is None:
+            return True
+        self._exact_provider_id(provider, reservation.provider_id)
+        connect_api = getattr(self._sandbox_cls, "connect_api", None)
+        if not callable(connect_api):
+            raise AgentBayQuotaInconsistentError(
+                "AgentBay adapter does not support API-only shell cleanup"
+            )
+        sandbox = await connect_api(provider)
+        try:
+            if (
+                getattr(
+                    sandbox,
+                    "shell_process_scope",
+                    SandboxShellProcessScope.UNKNOWN,
+                )
+                != SandboxShellProcessScope.EXCLUSIVE
+            ):
+                raise AgentBayQuotaInconsistentError(
+                    "AgentBay sandbox did not confirm exclusive process scope"
+                )
+            cleanup = getattr(sandbox, "kill_all_shell_processes", None)
+            if not callable(cleanup):
+                raise AgentBayQuotaInconsistentError(
+                    "AgentBay sandbox does not support shell process cleanup"
+                )
+            try:
+                result = await cleanup()
+            except SandboxShellCleanupUnsupportedError:
+                # Existing AgentBay sessions can outlive a backend rollout and
+                # still run an older image. Exact ledger/provider ownership
+                # allows deletion of only this session as a safe compatibility
+                # fallback; the next chat provisions a current image.
+                logger.warning(
+                    "Owned AgentBay sandbox lacks scoped shell cleanup; "
+                    "deleting exact provider session for compatibility: "
+                    "session_id=%s sandbox_id=%s",
+                    session.id,
+                    session.sandbox_id,
+                )
+                await self.destroy_locked(session, preserve_task=True)
+                return True
+            if getattr(result, "success", None) is not True:
+                raise SandboxUnavailableError(
+                    "AgentBay sandbox did not confirm shell process cleanup"
+                )
+            return True
+        finally:
+            await sandbox.aclose()
 
     async def _release(
         self, session: Session, reservation: AgentBayQuotaReservation

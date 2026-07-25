@@ -27,15 +27,19 @@
                         @update:selectedModelId="emit('update:selectedModelId', $event)" />
                 </div>
                 <div class="flex gap-2 ml-auto">
-                    <button v-if="!isRunning || sendEnabled || hideStopButton"
+                    <button v-if="!isRunning || hideStopButton"
                         class="inline-flex items-center justify-center whitespace-nowrap font-medium transition-colors text-sm rounded-full p-0 w-8 h-8 min-w-0 hover:opacity-90"
                         :class="!sendEnabled ? 'cursor-not-allowed bg-[var(--fill-tsp-white-dark)] hover:opacity-100' : 'cursor-pointer bg-[var(--Button-primary-black)]'"
                         @click="handleSubmit()">
                         <SendIcon :disabled="!sendEnabled" />
                     </button>
-                    <button v-else-if="!hideStopButton" @click="handleStop"
-                        class="inline-flex items-center justify-center whitespace-nowrap text-sm font-medium transition-colors bg-[var(--Button-primary-black)] text-[var(--text-onblack)] gap-[4px] hover:opacity-90 rounded-full p-0 w-8 h-8">
-                        <div class="w-[10px] h-[10px] bg-[var(--icon-onblack)] rounded-[2px]">
+                    <button v-else-if="!hideStopButton" @click="handleStop" :disabled="isStopping"
+                        :aria-label="isStopping ? t('Stopping task') : t('Stop task')"
+                        class="inline-flex items-center justify-center whitespace-nowrap text-sm font-medium transition-colors bg-[var(--Button-primary-black)] text-[var(--text-onblack)] gap-[4px] hover:opacity-90 rounded-full p-0 w-8 h-8 disabled:cursor-wait disabled:opacity-70">
+                        <div v-if="isStopping"
+                            class="w-[12px] h-[12px] border-2 border-[var(--icon-onblack)] border-t-transparent rounded-full animate-spin">
+                        </div>
+                        <div v-else class="w-[10px] h-[10px] bg-[var(--icon-onblack)] rounded-[2px]">
                         </div>
                     </button>
                 </div>
@@ -63,6 +67,7 @@ const props = withDefaults(defineProps<{
     modelValue: string;
     rows: number;
     isRunning: boolean;
+    isStopping?: boolean;
     attachments: FileInfo[];
     hideStopButton?: boolean;
     allowSendFilesOnly?: boolean;
@@ -75,6 +80,7 @@ const props = withDefaults(defineProps<{
     modelOptions: () => [],
     selectedModelId: SYSTEM_MODEL_ID,
     modelPickerDisabled: false,
+    isStopping: false,
 });
 
 const canSubmit = (draftValue = props.modelValue) => {
@@ -106,7 +112,7 @@ const handleEnterKeydown = (event: KeyboardEvent) => {
     const draftValue = (event.currentTarget as HTMLTextAreaElement | null)?.value ?? props.modelValue;
 
     // Read from the textarea itself so Enter cannot race the parent v-model update.
-    if (canSubmit(draftValue)) {
+    if (!props.isRunning && canSubmit(draftValue)) {
         event.preventDefault();
         emit('update:modelValue', draftValue);
         handleSubmit(draftValue);
@@ -114,7 +120,7 @@ const handleEnterKeydown = (event: KeyboardEvent) => {
 };
 
 const handleSubmit = (draftValue = props.modelValue) => {
-    if (!canSubmit(draftValue)) return;
+    if (props.isRunning || !canSubmit(draftValue)) return;
     emit('submit');
 };
 

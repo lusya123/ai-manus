@@ -1,12 +1,20 @@
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from app.core.config import get_settings
-from app.domain.external.sandbox import SandboxProvisioningError
+from app.domain.external.sandbox import (
+    SandboxProvisioningError,
+    SandboxShellCleanupUnsupportedError,
+    SandboxShellProcessScope,
+    SandboxUnavailableError,
+)
 from app.domain.external.coordination import mark_lifecycle_task_lease_lost
 from app.domain.models.session import Session
+from app.domain.models.tool_result import ToolResult
 from app.infrastructure.external.sandbox.docker_sandbox import DockerSandbox
 from app.infrastructure.external.sandbox.passthrough_provisioner import (
     PassthroughSandboxProvisioner,
@@ -169,6 +177,405 @@ async def test_passthrough_create_failure_clears_pointer_after_exact_not_found()
     assert session.sandbox_id is None
     assert session.sandbox_provider is None
     assert repository.updates == []
+
+
+@pytest.mark.parametrize(
+    ("scope", "expected_cleaned", "expected_calls"),
+    [
+        (SandboxShellProcessScope.EXCLUSIVE, True, 1),
+        (SandboxShellProcessScope.SHARED, False, 0),
+    ],
+)
+async def test_shell_cleanup_only_runs_for_owner_verified_exclusive_sandbox(
+    scope,
+    expected_cleaned,
+    expected_calls,
+):
+    cleanup = AsyncMock(return_value=ToolResult(success=True))
+    handle = SimpleNamespace(
+        shell_process_scope=scope,
+        kill_all_shell_processes=cleanup,
+        aclose=AsyncMock(),
+    )
+
+    class Factory:
+        @staticmethod
+        def is_owned_id(sandbox_id, owner_id):
+            return (sandbox_id, owner_id) == ("owned-runtime", "session-1")
+
+        @staticmethod
+        async def get_owned(sandbox_id, owner_id):
+            assert (sandbox_id, owner_id) == (
+                "owned-runtime",
+                "session-1",
+            )
+            return handle
+
+    provisioner = PassthroughSandboxProvisioner(
+        Factory,
+        SessionRepository(),
+    )
+    session = Session(
+        id="session-1",
+        user_id="user-1",
+        agent_id="agent-1",
+        sandbox_id="owned-runtime",
+        sandbox_provider="docker",
+    )
+
+    assert (
+        await provisioner.terminate_shell_processes_locked(session)
+        is expected_cleaned
+    )
+    assert cleanup.await_count == expected_calls
+    handle.aclose.assert_awaited_once()
+
+
+async def test_shell_cleanup_fails_closed_for_unverified_process_scope():
+    handle = SimpleNamespace(
+        shell_process_scope=SandboxShellProcessScope.UNKNOWN,
+        kill_all_shell_processes=AsyncMock(
+            side_effect=AssertionError("cleanup must not run")
+        ),
+        aclose=AsyncMock(),
+    )
+
+    class Factory:
+        @staticmethod
+        def is_owned_id(_sandbox_id, _owner_id):
+            return True
+
+        @staticmethod
+        async def get_owned(_sandbox_id, _owner_id):
+            return handle
+
+    provisioner = PassthroughSandboxProvisioner(
+        Factory,
+        SessionRepository(),
+    )
+    session = Session(
+        id="session-1",
+        user_id="user-1",
+        agent_id="agent-1",
+        sandbox_id="runtime",
+        sandbox_provider="docker",
+    )
+
+    with pytest.raises(
+        SandboxProvisioningError,
+        match="ownership could not be verified",
+    ):
+        await provisioner.terminate_shell_processes_locked(session)
+
+    handle.kill_all_shell_processes.assert_not_awaited()
+    handle.aclose.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "sandbox",
+    [
+        DockerSandbox(
+            ip="127.0.0.1",
+            container_name="dev-sandbox",
+            managed_container=False,
+        ),
+        DockerSandbox(
+            ip="127.0.0.1",
+            container_name="unverified-runtime",
+            managed_container=True,
+        ),
+    ],
+)
+async def test_sandbox_handle_itself_refuses_broad_cleanup_without_owner(
+    sandbox,
+):
+    sandbox.client.post = AsyncMock(
+        side_effect=AssertionError("sandbox API must not be called")
+    )
+    try:
+        with pytest.raises(PermissionError, match="exclusive"):
+            await sandbox.kill_all_shell_processes()
+        sandbox.client.post.assert_not_awaited()
+    finally:
+        await sandbox.aclose()
+
+
+async def test_owner_verified_handle_maps_kill_all_http_failure_to_retryable():
+    sandbox = DockerSandbox(
+        ip="127.0.0.1",
+        container_name="owned-runtime",
+        managed_container=True,
+        owner_id="session-1",
+    )
+    request = httpx.Request(
+        "POST",
+        "http://127.0.0.1:8080/api/v1/shell/kill-all",
+    )
+    sandbox.client.post = AsyncMock(
+        return_value=httpx.Response(500, request=request)
+    )
+    try:
+        with pytest.raises(
+            SandboxUnavailableError,
+            match=r"HTTP 500",
+        ):
+            await sandbox.kill_all_shell_processes()
+        sandbox.client.post.assert_awaited_once_with(
+            "http://127.0.0.1:8080/api/v1/shell/kill-all",
+            timeout=15.0,
+        )
+    finally:
+        await sandbox.aclose()
+
+
+@pytest.mark.parametrize("status_code", [404, 405, 501])
+async def test_old_runtime_reports_scoped_cleanup_as_unsupported(
+    status_code,
+):
+    sandbox = DockerSandbox(
+        ip="127.0.0.1",
+        container_name="owned-runtime",
+        managed_container=True,
+        owner_id="session-1",
+    )
+    request = httpx.Request(
+        "POST",
+        "http://127.0.0.1:8080/api/v1/shell/kill-all",
+    )
+    sandbox.client.post = AsyncMock(
+        return_value=httpx.Response(status_code, request=request)
+    )
+    try:
+        with pytest.raises(
+            SandboxShellCleanupUnsupportedError
+        ) as exc_info:
+            await sandbox.kill_all_shell_processes()
+        assert exc_info.value.status_code == status_code
+        sandbox.client.post.assert_awaited_once_with(
+            "http://127.0.0.1:8080/api/v1/shell/kill-all",
+            timeout=15.0,
+        )
+    finally:
+        await sandbox.aclose()
+
+
+async def test_old_private_runtime_is_deleted_exactly_without_clearing_task():
+    repository = SessionRepository()
+    cleanup = AsyncMock(
+        side_effect=SandboxShellCleanupUnsupportedError(404)
+    )
+    handle = SimpleNamespace(
+        shell_process_scope=SandboxShellProcessScope.EXCLUSIVE,
+        kill_all_shell_processes=cleanup,
+        aclose=AsyncMock(),
+    )
+
+    class Factory:
+        destroy_owned_by_id = AsyncMock(return_value=True)
+
+        @staticmethod
+        def is_owned_id(sandbox_id, owner_id):
+            return (sandbox_id, owner_id) == (
+                "owned-runtime",
+                "session-1",
+            )
+
+        @staticmethod
+        async def get_owned(sandbox_id, owner_id):
+            assert (sandbox_id, owner_id) == (
+                "owned-runtime",
+                "session-1",
+            )
+            return handle
+
+    provisioner = PassthroughSandboxProvisioner(Factory, repository)
+    session = Session(
+        id="session-1",
+        user_id="user-1",
+        agent_id="agent-1",
+        sandbox_id="owned-runtime",
+        sandbox_provider="docker",
+        task_id="task-1",
+        task_sandbox_id="owned-runtime",
+    )
+
+    assert await provisioner.terminate_shell_processes_locked(session) is True
+
+    cleanup.assert_awaited_once()
+    Factory.destroy_owned_by_id.assert_awaited_once_with(
+        "owned-runtime",
+        "session-1",
+    )
+    handle.aclose.assert_awaited_once()
+    assert session.sandbox_id is None
+    assert session.sandbox_provider is None
+    assert session.task_id == "task-1"
+    assert session.task_sandbox_id == "owned-runtime"
+    assert repository.updates[-1] == (
+        "session-1",
+        None,
+        "task-1",
+        None,
+    )
+
+
+async def test_old_private_runtime_failed_delete_resumes_from_durable_claim():
+    session = Session(
+        id="session-1",
+        user_id="user-1",
+        agent_id="agent-1",
+        sandbox_id="owned-runtime",
+        sandbox_provider="docker",
+        task_id="task-1",
+        task_sandbox_id="owned-runtime",
+    )
+
+    class Repository:
+        def __init__(self):
+            self.current = session.model_copy(deep=True)
+
+        async def claim_runtime_destroy(
+            self,
+            session_id,
+            sandbox_id,
+            task_id,
+            task_sandbox_id,
+            sandbox_provider,
+        ):
+            current = self.current
+            if (
+                current.id != session_id
+                or current.sandbox_id != sandbox_id
+                or current.task_id != task_id
+                or current.task_sandbox_id != task_sandbox_id
+                or current.sandbox_provider != sandbox_provider
+                or current.sandbox_destroying
+            ):
+                return False
+            current.sandbox_destroying = True
+            return True
+
+        async def finish_runtime_destroy(
+            self,
+            session_id,
+            expected_sandbox_id,
+            expected_task_id,
+            expected_task_sandbox_id,
+            expected_sandbox_provider,
+            sandbox_id,
+            task_id,
+            sandbox_provider,
+            task_sandbox_id,
+        ):
+            current = self.current
+            if (
+                current.id != session_id
+                or current.sandbox_id != expected_sandbox_id
+                or current.task_id != expected_task_id
+                or current.task_sandbox_id != expected_task_sandbox_id
+                or current.sandbox_provider != expected_sandbox_provider
+                or not current.sandbox_destroying
+            ):
+                return False
+            current.sandbox_id = sandbox_id
+            current.task_id = task_id
+            current.task_sandbox_id = task_sandbox_id
+            current.sandbox_provider = sandbox_provider
+            current.sandbox_destroying = False
+            return True
+
+        async def find_by_id(self, _session_id):
+            return self.current.model_copy(deep=True)
+
+    cleanup = AsyncMock(
+        side_effect=SandboxShellCleanupUnsupportedError(404)
+    )
+    handle = SimpleNamespace(
+        shell_process_scope=SandboxShellProcessScope.EXCLUSIVE,
+        kill_all_shell_processes=cleanup,
+        aclose=AsyncMock(),
+    )
+
+    class Factory:
+        destroy_owned_by_id = AsyncMock(side_effect=[False, True])
+
+        @staticmethod
+        def is_owned_id(sandbox_id, owner_id):
+            return (sandbox_id, owner_id) == (
+                "owned-runtime",
+                "session-1",
+            )
+
+        @staticmethod
+        async def get_owned(_sandbox_id, _owner_id):
+            return handle
+
+    repository = Repository()
+    provisioner = PassthroughSandboxProvisioner(Factory, repository)
+
+    with pytest.raises(
+        SandboxUnavailableError,
+        match="did not confirm deletion",
+    ):
+        await provisioner.terminate_shell_processes_locked(session)
+
+    assert session.sandbox_destroying is True
+    assert session.sandbox_id == "owned-runtime"
+    assert repository.current.sandbox_destroying is True
+    assert repository.current.sandbox_id == "owned-runtime"
+
+    assert await provisioner.terminate_shell_processes_locked(session) is True
+
+    assert Factory.destroy_owned_by_id.await_count == 2
+    cleanup.assert_awaited_once()
+    handle.aclose.assert_awaited_once()
+    assert session.sandbox_destroying is False
+    assert session.sandbox_id is None
+    assert session.task_id == "task-1"
+    assert repository.current.sandbox_destroying is False
+    assert repository.current.sandbox_id is None
+    assert repository.current.task_id == "task-1"
+
+
+async def test_private_shell_cleanup_has_a_total_retryable_deadline(
+    monkeypatch,
+):
+    entered = asyncio.Event()
+
+    class Factory:
+        @staticmethod
+        def is_owned_id(_sandbox_id, _owner_id):
+            return True
+
+        @staticmethod
+        async def get_owned(_sandbox_id, _owner_id):
+            entered.set()
+            await asyncio.Event().wait()
+
+    provisioner = PassthroughSandboxProvisioner(
+        Factory,
+        SessionRepository(),
+    )
+    monkeypatch.setattr(
+        provisioner,
+        "_SHELL_CLEANUP_TIMEOUT_SECONDS",
+        0.01,
+    )
+    session = Session(
+        id="session-1",
+        user_id="user-1",
+        agent_id="agent-1",
+        sandbox_id="owned-runtime",
+        sandbox_provider="docker",
+    )
+
+    with pytest.raises(
+        SandboxUnavailableError,
+        match="safety deadline",
+    ):
+        await provisioner.terminate_shell_processes_locked(session)
+
+    assert entered.is_set()
 
 
 @pytest.mark.parametrize(

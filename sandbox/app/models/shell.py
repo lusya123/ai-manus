@@ -50,4 +50,11 @@ class ShellWriteResult(BaseModel):
 class ShellKillResult(BaseModel):
     """Process termination result model"""
     status: str = Field(..., description="Process status")
-    returncode: int = Field(..., description="Process return code") 
+    returncode: int = Field(..., description="Process return code")
+
+
+class ShellKillAllResult(BaseModel):
+    """Sandbox-wide shell termination result model."""
+
+    sessions_seen: int = Field(..., ge=0)
+    sessions_terminated: int = Field(..., ge=0)

@@ -100,3 +100,15 @@ async def kill_process(request: ShellKillProcessRequest):
         message=message,
         data=result.model_dump()
     )
+
+
+@router.post("/kill-all", response_model=Response)
+async def kill_all_processes():
+    """Terminate every shell process registered in this sandbox."""
+
+    result = await shell_service.kill_all_processes()
+    return Response(
+        success=True,
+        message="All shell processes terminated",
+        data=result.model_dump(),
+    )

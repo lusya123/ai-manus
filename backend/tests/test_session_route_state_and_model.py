@@ -4,10 +4,11 @@ from types import SimpleNamespace
 import pytest
 
 from app.domain.models.agent import Agent
+from app.domain.models.file import FileInfo
 from app.domain.models.session import Session, SessionStatus, SessionSummary
 from app.domain.models.turn_submission import TurnSubmissionState
 from app.interfaces.api import session_routes
-from app.interfaces.schemas.session import ListSessionItem
+from app.interfaces.schemas.session import ChatRequest, ListSessionItem
 
 
 def test_session_summary_naive_mongo_timestamp_is_interpreted_as_utc():
@@ -143,3 +144,65 @@ async def test_get_session_falls_back_to_inferred_model_id_for_legacy_agent(
     )
 
     assert response.data.agent_model_config.model_id == "legacy-derived-id"
+
+
+class _ChatRouteServiceStub:
+    def __init__(self):
+        self.accept_calls = []
+
+    async def accept_chat_submission(self, **kwargs):
+        self.accept_calls.append(kwargs)
+        return SimpleNamespace(submission_id=kwargs["submission_id"])
+
+    async def chat(self, **_kwargs):
+        if False:
+            yield None
+
+
+@pytest.mark.asyncio
+async def test_chat_route_accepts_attachment_only_before_sse_headers():
+    service = _ChatRouteServiceStub()
+    submission_id = "77777777-7777-4777-8777-777777777777"
+
+    await session_routes.chat(
+        "session-attachment",
+        ChatRequest(
+            message="",
+            submission_id=submission_id,
+            attachments=[{"file_id": "owned-file", "filename": "report.pdf"}],
+        ),
+        current_user=SimpleNamespace(id="owner"),
+        agent_service=service,
+    )
+
+    assert service.accept_calls == [
+        {
+            "session_id": "session-attachment",
+            "user_id": "owner",
+            "submission_id": submission_id,
+            "message": "",
+            "timestamp": None,
+            "attachments": [
+                FileInfo(file_id="owned-file", filename="report.pdf")
+            ],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_chat_route_does_not_accept_empty_reconnect_as_new_submission():
+    service = _ChatRouteServiceStub()
+
+    await session_routes.chat(
+        "session-attachment",
+        ChatRequest(
+            message="",
+            event_id="durable-cursor",
+            submission_id="88888888-8888-4888-8888-888888888888",
+            attachments=[],
+        ),
+        current_user=SimpleNamespace(id="owner"),
+        agent_service=service,
+    )
+
+    assert service.accept_calls == []

@@ -10,6 +10,7 @@ from app.domain.models.event import (
     TitleEvent,
 )
 from app.domain.models.file import FileInfo
+from app.domain.models.message import Message
 from app.domain.models.session import SessionStatus
 from app.domain.services.agent_task_runner import AgentTaskRunner
 
@@ -74,6 +75,58 @@ async def test_browser_screenshot_bytes_are_wrapped_for_file_storage():
             ),
         ),
     ]
+
+
+async def test_run_flow_accepts_attachment_only_message():
+    class Flow:
+        def __init__(self):
+            self.messages = []
+
+        async def run(self, message, resumes_waiting=None):
+            self.messages.append((message, resumes_waiting))
+            yield DoneEvent()
+
+    runner = object.__new__(AgentTaskRunner)
+    runner._agent_id = "agent-attachment"
+    runner._flow = Flow()
+
+    events = [
+        event
+        async for event in runner._run_flow(
+            Message(message="", attachments=["/home/ubuntu/upload/report.pdf"]),
+            resumes_waiting=False,
+        )
+    ]
+
+    assert [event.type for event in events] == ["done"]
+    assert runner._flow.messages == [
+        (
+            Message(
+                message="",
+                attachments=["/home/ubuntu/upload/report.pdf"],
+            ),
+            False,
+        )
+    ]
+
+
+async def test_run_flow_rejects_only_fully_empty_message():
+    class Flow:
+        async def run(self, *_args, **_kwargs):
+            raise AssertionError("fully empty input must not reach the flow")
+            yield
+
+    runner = object.__new__(AgentTaskRunner)
+    runner._agent_id = "agent-empty"
+    runner._flow = Flow()
+
+    events = [
+        event async for event in runner._run_flow(Message(), resumes_waiting=False)
+    ]
+
+    assert len(events) == 1
+    assert events[0].type == "error"
+    assert events[0].error == "No message"
 
 
 async def test_runner_finishes_current_turn_before_processing_queued_message():

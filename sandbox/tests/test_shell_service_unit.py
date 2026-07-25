@@ -1,11 +1,12 @@
 import asyncio
 import os
+import shlex
 import time
 from types import SimpleNamespace
 
 import pytest
 
-from app.core.exceptions import BadRequestException
+from app.core.exceptions import AppException, BadRequestException
 from app.models.shell import ConsoleRecord
 from app.services import shell as shell_module
 from app.services.shell import ShellService
@@ -457,3 +458,68 @@ async def test_shell_input_has_service_level_size_limit():
             "x" * (service._MAX_STDIN_BYTES + 1),
             False,
         )
+
+
+@pytest.mark.asyncio
+async def test_kill_all_prevents_late_side_effect_and_shell_can_be_reused(
+    tmp_path,
+):
+    service = ShellService()
+    marker = tmp_path / "late-marker"
+    command = (
+        "sleep 0.4; printf late > "
+        f"{shlex.quote(str(marker))}"
+    )
+    execution = asyncio.create_task(
+        service.exec_command("reusable", str(tmp_path), command)
+    )
+    for _ in range(100):
+        if "reusable" in service.active_shells:
+            break
+        await asyncio.sleep(0.01)
+    assert "reusable" in service.active_shells
+
+    first = await service.kill_all_processes()
+    await asyncio.wait_for(execution, timeout=1)
+    await asyncio.sleep(0.5)
+
+    assert first.sessions_seen == 1
+    assert first.sessions_terminated == 1
+    assert marker.exists() is False
+
+    second = await service.kill_all_processes()
+    assert second.sessions_seen == 1
+    assert second.sessions_terminated == 0
+
+    resumed = await service.exec_command(
+        "reusable",
+        str(tmp_path),
+        "printf resumed",
+    )
+    assert resumed.status == "completed"
+    assert resumed.output == "resumed"
+
+
+@pytest.mark.asyncio
+async def test_kill_all_propagates_partial_cleanup_failure(monkeypatch):
+    service = ShellService()
+    process = SimpleNamespace(returncode=None, pid=123)
+    service.active_shells["stuck"] = {
+        "process": process,
+        "reader_task": None,
+    }
+
+    async def fail_stop(_process):
+        raise TimeoutError("still alive")
+
+    monkeypatch.setattr(service, "_stop_process", fail_stop)
+    monkeypatch.setattr(
+        service,
+        "_process_group_has_members",
+        lambda _pid: False,
+    )
+
+    with pytest.raises(AppException, match="Failed to terminate all"):
+        await service.kill_all_processes()
+
+    assert service.active_shells["stuck"]["process"] is process

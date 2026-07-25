@@ -27,6 +27,7 @@ from app.core.config import get_settings
 from app.domain.external.sandbox import (
     Sandbox,
     SandboxProvisioningError,
+    SandboxShellProcessScope,
     SandboxUnavailableError,
 )
 from app.infrastructure.external.sandbox.docker_sandbox import DockerSandbox
@@ -82,6 +83,7 @@ class AgentBaySandbox(DockerSandbox):
     """
 
     _PROVIDER_DELETE_TIMEOUT_SECONDS = 30.0
+    _GATEWAY_LINK_TIMEOUT_SECONDS = 10.0
 
     def __init__(
         self,
@@ -109,15 +111,29 @@ class AgentBaySandbox(DockerSandbox):
         """Sandbox ID is the AgentBay session ID (persisted per chat session)."""
         return self._session.session_id
 
+    @property
+    def shell_process_scope(self) -> SandboxShellProcessScope:
+        """Each AgentBay provider session is dedicated to one chat session."""
+
+        return SandboxShellProcessScope.EXCLUSIVE
+
     @staticmethod
     async def _resolve_links(session) -> tuple[str, str, str]:
         """Fetch gateway URLs for the three forwarded service ports concurrently."""
         settings = get_settings()
-        api_link, cdp_link, vnc_link = await asyncio.gather(
-            session.get_link("https", settings.agentbay_api_port),
-            session.get_link("wss", settings.agentbay_cdp_port),
-            session.get_link("wss", settings.agentbay_vnc_port),
-        )
+        try:
+            async with asyncio.timeout(
+                AgentBaySandbox._GATEWAY_LINK_TIMEOUT_SECONDS
+            ):
+                api_link, cdp_link, vnc_link = await asyncio.gather(
+                    session.get_link("https", settings.agentbay_api_port),
+                    session.get_link("wss", settings.agentbay_cdp_port),
+                    session.get_link("wss", settings.agentbay_vnc_port),
+                )
+        except TimeoutError as exc:
+            raise SandboxUnavailableError(
+                "AgentBay gateway link resolution timed out"
+            ) from exc
         for name, link in (("api", api_link), ("cdp", cdp_link), ("vnc", vnc_link)):
             if not link.success or not link.data:
                 raise SandboxUnavailableError(
@@ -132,6 +148,28 @@ class AgentBaySandbox(DockerSandbox):
         # query parameters. Never write them to logs.
         logger.info("AgentBay sandbox %s gateway links resolved", session.session_id)
         return cls(session=session, base_url=base_url, cdp_url=cdp_url, vnc_url=vnc_url)
+
+    @staticmethod
+    async def _resolve_api_link(session) -> str:
+        """Resolve only the control API capability needed for shell cleanup."""
+
+        settings = get_settings()
+        try:
+            async with asyncio.timeout(
+                AgentBaySandbox._GATEWAY_LINK_TIMEOUT_SECONDS
+            ):
+                api_link = await session.get_link(
+                    "https", settings.agentbay_api_port
+                )
+        except TimeoutError as exc:
+            raise SandboxUnavailableError(
+                "AgentBay API gateway link resolution timed out"
+            ) from exc
+        if not api_link.success or not api_link.data:
+            raise SandboxUnavailableError(
+                "AgentBay API gateway link is unavailable"
+            )
+        return api_link.data
 
     @classmethod
     async def allocate(
@@ -171,6 +209,17 @@ class AgentBaySandbox(DockerSandbox):
     async def connect(cls, session: Any) -> "AgentBaySandbox":
         """Resolve service links for an already-owned provider session."""
         return await cls._from_session(session)
+
+    @classmethod
+    async def connect_api(cls, session: Any) -> "AgentBaySandbox":
+        """Create a shell-control handle without depending on CDP or VNC."""
+
+        base_url = await cls._resolve_api_link(session)
+        logger.info(
+            "AgentBay sandbox %s API gateway link resolved",
+            session.session_id,
+        )
+        return cls(session=session, base_url=base_url, cdp_url="", vnc_url="")
 
     @classmethod
     async def lookup_provider_session(cls, id: str) -> Optional[Any]:

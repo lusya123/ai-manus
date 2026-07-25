@@ -1,9 +1,16 @@
 """Unbilled sandbox lifecycle used by Docker and fixed local sandboxes."""
 
 import asyncio
+import logging
 from typing import Type
 
-from app.domain.external.sandbox import Sandbox, SandboxProvisioningError
+from app.domain.external.sandbox import (
+    Sandbox,
+    SandboxProvisioningError,
+    SandboxShellCleanupUnsupportedError,
+    SandboxShellProcessScope,
+    SandboxUnavailableError,
+)
 from app.domain.external.sandbox_provisioner import SandboxProvisioner
 from app.domain.external.coordination import current_lifecycle_task_lost_lease
 from app.domain.models.session import Session
@@ -14,10 +21,13 @@ _EXPECTED_SANDBOX_ID_UNSET = object()
 _EXPECTED_TASK_ID_UNSET = object()
 _EXPECTED_TASK_SANDBOX_ID_UNSET = object()
 
+logger = logging.getLogger(__name__)
+
 
 class PassthroughSandboxProvisioner(SandboxProvisioner):
     _OWNERSHIP_RECONCILE_INTERVAL_SECONDS = 1.0
     _OWNERSHIP_RECONCILE_MAX_ATTEMPTS = 3
+    _SHELL_CLEANUP_TIMEOUT_SECONDS = 20.0
 
     def __init__(
         self,
@@ -30,6 +40,15 @@ class PassthroughSandboxProvisioner(SandboxProvisioner):
         self._sandbox_cls = sandbox_cls
         self._session_repository = session_repository
         self._provider_name = provider_name
+
+    @staticmethod
+    async def _close_sandbox_handle(sandbox: Sandbox | None) -> None:
+        close = getattr(sandbox, "aclose", None)
+        if callable(close):
+            try:
+                await close()
+            except Exception:
+                pass
 
     async def _persist(
         self,
@@ -673,6 +692,89 @@ class PassthroughSandboxProvisioner(SandboxProvisioner):
             raise
         return sandbox
 
+    async def terminate_shell_processes_locked(self, session: Session) -> bool:
+        """Bound the complete lookup/cleanup/fallback lifecycle."""
+
+        try:
+            async with asyncio.timeout(self._SHELL_CLEANUP_TIMEOUT_SECONDS):
+                return await self._terminate_shell_processes_locked(session)
+        except TimeoutError as exc:
+            raise SandboxUnavailableError(
+                "Sandbox shell cleanup exceeded its safety deadline; retry stop"
+            ) from exc
+
+    async def _terminate_shell_processes_locked(
+        self, session: Session
+    ) -> bool:
+        """Stop every shell only for an owner-verified private sandbox.
+
+        A configured fixed development sandbox is deliberately shared by many
+        logical sessions. Its handle reports ``SHARED`` and is left untouched;
+        an unverified scope fails closed instead of risking another session's
+        processes.
+        """
+
+        if session.sandbox_provider not in (None, self._provider_name):
+            raise SandboxProvisioningError(
+                session.sandbox_id or "",
+                "Session sandbox belongs to a different provider",
+            )
+        if session.sandbox_destroying:
+            await self.destroy_locked(session, preserve_task=True)
+            return True
+        if not session.sandbox_id:
+            return True
+
+        legacy_sandbox = await self._adopt_legacy_if_exact(session)
+        if legacy_sandbox is not None:
+            await self._close_sandbox_handle(legacy_sandbox)
+
+        sandbox = await self._get_persisted_sandbox(session)
+        if sandbox is None:
+            return True
+        try:
+            scope = getattr(
+                sandbox,
+                "shell_process_scope",
+                SandboxShellProcessScope.UNKNOWN,
+            )
+            if scope == SandboxShellProcessScope.SHARED:
+                return False
+            if scope != SandboxShellProcessScope.EXCLUSIVE:
+                raise SandboxProvisioningError(
+                    session.sandbox_id,
+                    "Sandbox shell process ownership could not be verified",
+                )
+            cleanup = getattr(sandbox, "kill_all_shell_processes", None)
+            if not callable(cleanup):
+                raise SandboxProvisioningError(
+                    session.sandbox_id,
+                    "Sandbox does not support shell process cleanup",
+                )
+            try:
+                result = await cleanup()
+            except SandboxShellCleanupUnsupportedError:
+                # A pre-deployment runtime may not yet expose kill-all. Because
+                # this handle was owner-verified and exclusive, deleting this
+                # exact generation is the only compatible fallback that cannot
+                # kill another session's processes.
+                logger.warning(
+                    "Owned sandbox lacks scoped shell cleanup; deleting exact "
+                    "runtime generation for compatibility: session_id=%s "
+                    "sandbox_id=%s",
+                    session.id,
+                    session.sandbox_id,
+                )
+                await self.destroy_locked(session, preserve_task=True)
+                return True
+            if getattr(result, "success", None) is not True:
+                raise SandboxUnavailableError(
+                    "Sandbox did not confirm shell process cleanup"
+                )
+            return True
+        finally:
+            await self._close_sandbox_handle(sandbox)
+
     async def destroy_locked(
         self, session: Session, *, preserve_task: bool = False
     ) -> None:
@@ -713,10 +815,14 @@ class PassthroughSandboxProvisioner(SandboxProvisioner):
             session, session.sandbox_id
         )
         if exact_destroyed is False:
-            raise RuntimeError("Sandbox provider did not confirm deletion")
+            raise SandboxUnavailableError(
+                "Sandbox provider did not confirm deletion"
+            )
         if exact_destroyed is None:
             if sandbox is not None and await sandbox.destroy() is not True:
-                raise RuntimeError("Sandbox provider did not confirm deletion")
+                raise SandboxUnavailableError(
+                    "Sandbox provider did not confirm deletion"
+                )
         session.sandbox_id = None
         session.sandbox_provider = None
         if not preserve_task:

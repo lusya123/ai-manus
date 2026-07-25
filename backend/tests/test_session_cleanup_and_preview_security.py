@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 import io
 
@@ -5,6 +6,7 @@ import httpx
 import pytest
 from fastapi import FastAPI, HTTPException
 from starlette.requests import Request
+from starlette.websockets import WebSocketDisconnect
 
 from app.application.errors.exceptions import NotFoundError, UnauthorizedError
 from app.application.services.agent_service import AgentService
@@ -592,6 +594,63 @@ async def test_vnc_exception_never_logs_or_returns_capability_url(caplog):
     assert "signature=" not in caplog.text
     assert secret not in websocket.close_args["reason"]
     assert "signature=" not in websocket.close_args["reason"]
+
+
+async def test_vnc_awaits_cancelled_opposite_forwarder(monkeypatch):
+    cancelled_cleanup_finished = asyncio.Event()
+
+    class WebSocketStub:
+        async def accept(self, **kwargs):
+            return None
+
+        async def receive_bytes(self):
+            raise WebSocketDisconnect()
+
+        async def send_bytes(self, data):
+            raise AssertionError(f"unexpected VNC payload: {data!r}")
+
+        async def close(self, **kwargs):
+            return None
+
+    class SandboxWebSocket:
+        async def send(self, data):
+            raise AssertionError(f"unexpected browser payload: {data!r}")
+
+        async def recv(self):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                # This extra suspension makes the assertion distinguish
+                # cancel-and-forget from cancellation that is fully awaited.
+                await asyncio.sleep(0)
+                cancelled_cleanup_finished.set()
+
+    sandbox_websocket = SandboxWebSocket()
+
+    class Connection:
+        async def __aenter__(self):
+            return sandbox_websocket
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    monkeypatch.setattr(
+        "app.interfaces.api.session_routes.websockets.connect",
+        lambda _url: Connection(),
+    )
+
+    class AgentServiceStub:
+        async def get_vnc_url(self, session_id):
+            return "ws://sandbox.example/vnc"
+
+    await vnc_websocket(
+        websocket=WebSocketStub(),
+        session_id="session-1",
+        signature="verified",
+        agent_service=AgentServiceStub(),
+    )
+
+    assert cancelled_cleanup_finished.is_set()
 
 
 async def test_preview_upstream_exception_never_logs_capability_url(

@@ -16,7 +16,8 @@ import shutil
 from typing import Dict, Any, Optional, List
 from app.models.shell import (
     ShellExecResult, ShellViewResult, ShellWaitResult,
-    ShellWriteResult, ShellKillResult, ShellTask, ConsoleRecord
+    ShellWriteResult, ShellKillResult, ShellKillAllResult, ShellTask,
+    ConsoleRecord
 )
 from app.core.exceptions import AppException, ResourceNotFoundException, BadRequestException
 
@@ -36,6 +37,7 @@ class ShellService:
     _COMPLETED_SHELL_TTL_SECONDS = 300.0
     _MAX_COMMAND_CHARS = 65_536
     _MAX_STDIN_BYTES = 65_536
+    _MAX_SHELL_CLEANUP_CONCURRENCY = 8
     _STDIN_DRAIN_TIMEOUT_SECONDS = 5.0
     _PROCESS_STOP_WAIT_SECONDS = 2.0
     _READER_STOP_WAIT_SECONDS = 0.5
@@ -1114,6 +1116,66 @@ class ShellService:
         except Exception as e:
             logger.error(f"Failed to kill process: {str(e)}", exc_info=True)
             raise AppException(message=f"Failed to terminate process: {str(e)}")
+
+    async def kill_all_processes(self) -> ShellKillAllResult:
+        """Terminate every registered shell process in this sandbox instance.
+
+        The caller must establish that the whole sandbox is exclusively owned.
+        Holding the registry lock prevents a new command from being admitted
+        between the snapshot and completion of the cleanup.
+        """
+
+        async with self._session_lock:
+            shells = list(self.active_shells.items())
+            cleanup_slots = asyncio.Semaphore(
+                self._MAX_SHELL_CLEANUP_CONCURRENCY
+            )
+
+            async def stop_one(shell: Dict[str, Any]) -> bool:
+                process = shell["process"]
+                was_live = (
+                    process.returncode is None
+                    or self._process_group_has_members(
+                        getattr(process, "pid", -1)
+                    )
+                    or (
+                        getattr(process, "_manus_shell_uid", None) is not None
+                        and not getattr(
+                            process,
+                            "_manus_shell_uid_cleaned",
+                            False,
+                        )
+                    )
+                )
+                async with cleanup_slots:
+                    await self._stop_process(process)
+                    await self._stop_reader_task(shell.get("reader_task"))
+                return was_live
+
+            results = await asyncio.gather(
+                *(stop_one(shell) for _session_id, shell in shells),
+                return_exceptions=True,
+            )
+
+        failures = [
+            result for result in results if isinstance(result, BaseException)
+        ]
+        if failures:
+            for failure in failures:
+                logger.error(
+                    "Failed to terminate one sandbox shell process: %s",
+                    type(failure).__name__,
+                )
+            raise AppException(
+                message=(
+                    "Failed to terminate all shell processes "
+                    f"({len(failures)} failed)"
+                )
+            )
+        return ShellKillAllResult(
+            sessions_seen=len(shells),
+            sessions_terminated=sum(result is True for result in results),
+        )
 
     def create_session_id(self) -> str:
         """

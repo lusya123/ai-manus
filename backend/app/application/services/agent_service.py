@@ -19,15 +19,26 @@ from app.domain.services.agent_domain_service import AgentDomainService
 from app.domain.models.event import AgentEvent
 from typing import Type
 from app.domain.models.agent import Agent
-from app.domain.external.sandbox import Sandbox
+from app.domain.external.sandbox import (
+    Sandbox,
+    SandboxProvisioningError,
+    SandboxUnavailableError,
+    SharedSandboxShellCleanupError,
+)
 from app.domain.external.search import SearchEngine
 from app.domain.external.file import FileStorage
 from app.domain.external.llm import LLM
 from app.domain.repositories.agent_repository import AgentRepository
 from app.domain.external.task import Task
 from app.domain.external.coordination import SessionLifecycleLease
-from app.domain.external.sandbox_provisioner import SandboxProvisioner
-from app.domain.external.agentbay_quota import AgentBayQuotaExceededError
+from app.domain.external.sandbox_provisioner import (
+    SandboxProvisioner,
+    SandboxProvisioningRequiredError,
+)
+from app.domain.external.agentbay_quota import (
+    AgentBayQuotaError,
+    AgentBayQuotaExceededError,
+)
 from app.domain.models.file import FileInfo
 from app.core.config import SUPPORTED_BYOK_PROVIDERS, get_settings
 from app.application.errors.exceptions import (
@@ -77,6 +88,11 @@ _MODEL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
 _PROVIDER_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 
 class AgentService:
+    # The browser API client has a 30-second request timeout. This bound covers
+    # local/distributed lock acquisition, task cancellation, provider lookup,
+    # shell cleanup, and any exact-destroy compatibility fallback.
+    _STOP_REQUEST_TIMEOUT_SECONDS = 25.0
+
     def __init__(
         self,
         agent_repository: AgentRepository,
@@ -473,18 +489,48 @@ class AgentService:
         if not session:
             logger.error(f"Session {session_id} not found for user {user_id}")
             raise RuntimeError("Session not found")
-        async with self._agent_domain_service._get_session_lock(session_id):
-            async def stop_locked() -> None:
-                current = await self._session_repository.find_by_id_and_user_id(
-                    session_id, user_id
-                )
-                if not current:
-                    raise RuntimeError("Session not found")
-                await self._agent_domain_service.stop_session(session_id)
+        try:
+            async with asyncio.timeout(self._STOP_REQUEST_TIMEOUT_SECONDS):
+                async with self._agent_domain_service._get_session_lock(
+                    session_id
+                ):
+                    async def stop_locked() -> None:
+                        current = (
+                            await self._session_repository.find_by_id_and_user_id(
+                                session_id, user_id
+                            )
+                        )
+                        if not current:
+                            raise RuntimeError("Session not found")
+                        await self._agent_domain_service.stop_session(session_id)
 
-            await self._agent_domain_service.run_session_lifecycle_exclusive(
-                session_id, stop_locked
+                    await self._agent_domain_service.run_session_lifecycle_exclusive(
+                        session_id, stop_locked
+                    )
+        except SharedSandboxShellCleanupError as exc:
+            raise ConflictError(
+                "Task cancellation was acknowledged, but background shell "
+                "processes cannot be safely terminated in a shared sandbox"
+            ) from exc
+        except TimeoutError as exc:
+            raise ServiceUnavailableError(
+                "Stop did not complete within the safety deadline; please retry"
+            ) from exc
+        except (
+            AgentBayQuotaError,
+            SandboxProvisioningError,
+            SandboxProvisioningRequiredError,
+            SandboxUnavailableError,
+        ) as exc:
+            logger.warning(
+                "Stop requires retry after sandbox cleanup failure: "
+                "session_id=%s error=%s",
+                session_id,
+                safe_exception_summary(exc),
             )
+            raise ServiceUnavailableError(
+                "Sandbox cleanup was not confirmed; please retry stop"
+            ) from exc
         logger.info(f"Session {session_id} stopped successfully")
 
     async def clear_unread_message_count(self, session_id: str, user_id: str) -> None:

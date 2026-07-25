@@ -46,7 +46,10 @@ def get_search_engine() -> Optional[SearchEngine]:
             logger.warning("Bing Search Engine not initialized: missing API key (BING_SEARCH_API_KEY)")
     elif settings.search_provider == "bing_web":
         logger.info("Initializing Bing Web Search Engine (scraping)")
-        return BingWebSearchEngine()
+        return BingWebSearchEngine(
+            market=settings.bing_web_market,
+            setlang=settings.bing_web_setlang,
+        )
     elif settings.search_provider == "tavily":
         if settings.tavily_api_key:
             logger.info("Initializing Tavily Search Engine")

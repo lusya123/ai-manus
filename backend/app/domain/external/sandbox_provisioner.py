@@ -23,3 +23,11 @@ class SandboxProvisioner(Protocol):
     async def destroy_locked(self, session: Session) -> None:
         """Confirm provider deletion and persist cleanup before returning."""
         ...
+
+    async def terminate_shell_processes_locked(self, session: Session) -> bool:
+        """Terminate shell processes only after proving exclusive ownership.
+
+        Returns ``False`` for an explicitly shared sandbox where broad process
+        cleanup must be skipped, and ``True`` when no process can remain.
+        """
+        ...

@@ -2376,7 +2376,7 @@ class AgentTaskRunner(TaskRunner):
         resumes_waiting: Optional[bool] = None,
     ) -> AsyncGenerator[BaseEvent, None]:
         """Process a single message through the agent's flow and yield events"""
-        if not message.message:
+        if not message.message and not message.attachments:
             logger.warning(f"Agent {self._agent_id} received empty message")
             yield ErrorEvent(error="No message")
             return

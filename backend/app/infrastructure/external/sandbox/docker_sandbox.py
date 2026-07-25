@@ -17,6 +17,8 @@ from app.domain.models.tool_result import ToolResult
 from app.domain.external.sandbox import (
     Sandbox,
     SandboxProvisioningError,
+    SandboxShellCleanupUnsupportedError,
+    SandboxShellProcessScope,
     SandboxUnavailableError,
 )
 from app.infrastructure.external.browser.playwright_browser import PlaywrightBrowser
@@ -99,6 +101,16 @@ class DockerSandbox(Sandbox):
         if not getattr(self, "_container_name", None):
             return "dev-sandbox"
         return self._container_name
+
+    @property
+    def shell_process_scope(self) -> SandboxShellProcessScope:
+        """Only owner-verified managed containers have a private process set."""
+
+        if self._managed_container and self._owner_id:
+            return SandboxShellProcessScope.EXCLUSIVE
+        if not self._managed_container:
+            return SandboxShellProcessScope.SHARED
+        return SandboxShellProcessScope.UNKNOWN
 
     @property
     def cdp_url(self) -> str:
@@ -634,6 +646,48 @@ class DockerSandbox(Sandbox):
             json={"id": session_id}
         )
         return ToolResult(**response.json())
+
+    async def kill_all_shell_processes(self) -> ToolResult:
+        """Terminate all registered shells in this sandbox.
+
+        The lifecycle provisioner is responsible for calling this only through
+        an owner-verified, exclusively-scoped handle.
+        """
+
+        if self.shell_process_scope != SandboxShellProcessScope.EXCLUSIVE:
+            raise PermissionError(
+                "Refusing broad shell cleanup without exclusive sandbox ownership"
+            )
+        try:
+            response = await self.client.post(
+                self._api_url("/api/v1/shell/kill-all"),
+                timeout=15.0,
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if response.status_code in {404, 405, 501}:
+                raise SandboxShellCleanupUnsupportedError(
+                    response.status_code
+                ) from exc
+            raise SandboxUnavailableError(
+                "Sandbox shell cleanup request failed "
+                f"(HTTP {response.status_code})"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise SandboxUnavailableError(
+                "Sandbox shell cleanup request failed"
+            ) from exc
+        try:
+            result = ToolResult(**response.json())
+        except (TypeError, ValueError) as exc:
+            raise SandboxUnavailableError(
+                "Sandbox returned an invalid shell cleanup response"
+            ) from exc
+        if not result.success:
+            raise SandboxUnavailableError(
+                "Sandbox did not confirm shell process cleanup"
+            )
+        return result
 
     async def file_write(self, file: str, content: str, append: bool = False, 
                         leading_newline: bool = False, trailing_newline: bool = False, 

@@ -18,25 +18,42 @@ import {
 
 const TERMINAL_EVENTS = new Set<AgentSSEEvent['event']>(['done', 'error', 'wait']);
 
+export function getLatestTurnId(events: AgentSSEEvent[]): string | undefined {
+  let latestTurnId: string | undefined;
+  for (const event of events) {
+    const role = (event.data as { role?: string }).role;
+    if ((event.event === 'message' || event.event === 'attachments') && role === 'user') {
+      latestTurnId = event.data.turn_id;
+    }
+  }
+  return latestTurnId;
+}
+
+export function hasTerminalEventForTurn(
+  events: AgentSSEEvent[],
+  turnId: string,
+): boolean {
+  return events.some(
+    event => TERMINAL_EVENTS.has(event.event) && event.data.turn_id === turnId,
+  );
+}
+
 /**
  * A session contains every historical turn. Terminal events from an older
  * turn must not prevent reconnecting to a newer running turn.
  */
 export function hasTerminalEventForLatestTurn(events: AgentSSEEvent[]): boolean {
   let latestTurnStart = -1;
-  let latestTurnId: string | undefined;
   events.forEach((event, index) => {
     const role = (event.data as { role?: string }).role;
     if ((event.event === 'message' || event.event === 'attachments') && role === 'user') {
       latestTurnStart = index;
-      latestTurnId = event.data.turn_id;
     }
   });
   if (latestTurnStart < 0) return false;
+  const latestTurnId = getLatestTurnId(events);
   if (latestTurnId) {
-    return events.some(
-      event => TERMINAL_EVENTS.has(event.event) && event.data.turn_id === latestTurnId,
-    );
+    return hasTerminalEventForTurn(events, latestTurnId);
   }
   // Legacy history predates stable turn IDs. Retain its ordered fallback while
   // new durable turns use an exact logical-turn match above.
@@ -154,13 +171,20 @@ export function useAgentEvents(state: AgentEventState, options: AgentEventOption
     plan.value = planData;
   };
 
-  const handleEvent = (event: AgentSSEEvent) => {
+  const handleEvent = (event: AgentSSEEvent): boolean => {
+    // Terminal state transitions are idempotent control-plane effects. Apply
+    // them before content deduplication so a terminal event replayed after an
+    // SSE reconnect can never leave the page stuck in a loading state.
+    if (TERMINAL_EVENTS.has(event.event)) {
+      isLoading.value = false;
+    }
+
     // Mongo history replay and Redis live delivery can overlap. Stable logical
     // event IDs make that overlap harmless while transport cursors remain
     // independently usable for reconnects.
     if (event.data.event_id && seenEventIds.has(event.data.event_id)) {
       lastEventId.value = event.data.transport_cursor ?? lastEventId.value;
-      return;
+      return false;
     }
     if (event.data.event_id) {
       seenEventIds.add(event.data.event_id);
@@ -171,11 +195,6 @@ export function useAgentEvents(state: AgentEventState, options: AgentEventOption
       handleToolEvent(event.data as ToolEventData);
     } else if (event.event === 'step') {
       handleStepEvent(event.data as StepEventData);
-    } else if (event.event === 'done') {
-      // Some task backends keep the SSE connection open briefly after a terminal event.
-      isLoading.value = false;
-    } else if (event.event === 'wait') {
-      isLoading.value = false;
     } else if (event.event === 'error') {
       handleErrorEvent(event.data as ErrorEventData);
     } else if (event.event === 'title') {
@@ -184,6 +203,7 @@ export function useAgentEvents(state: AgentEventState, options: AgentEventOption
       handlePlanEvent(event.data as PlanEventData);
     }
     lastEventId.value = event.data.transport_cursor ?? lastEventId.value;
+    return true;
   };
 
   return { handleEvent, resetEventHistory };

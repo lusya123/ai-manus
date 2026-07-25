@@ -53,8 +53,10 @@ class ChatRequest(BaseModel):
         settings = get_settings()
         if self.attachments and len(self.attachments) > settings.chat_max_attachments:
             raise ValueError("too many attachments")
-        if self.message and self.submission_id is None:
-            raise ValueError("submission_id is required when message is present")
+        if (self.message or self.attachments) and self.submission_id is None:
+            raise ValueError(
+                "submission_id is required when message or attachments are present"
+            )
         return self
 
 

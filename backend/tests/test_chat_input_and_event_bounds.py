@@ -42,6 +42,21 @@ def test_chat_request_requires_uuid_and_enforces_decoded_limits():
             attachments=[{"file_id": "x" * 257}],
         )
 
+    with pytest.raises(ValidationError, match="submission_id"):
+        ChatRequest(
+            message="",
+            attachments=[{"file_id": "attachment-only"}],
+        )
+
+    attachment_only = ChatRequest(
+        message="",
+        submission_id="22222222-2222-4222-8222-222222222222",
+        attachments=[{"file_id": "attachment-only"}],
+    )
+    assert str(attachment_only.submission_id) == (
+        "22222222-2222-4222-8222-222222222222"
+    )
+
     # Reconnect-only requests intentionally do not need a submission UUID.
     assert ChatRequest(message="", event_id="1-0").submission_id is None
 

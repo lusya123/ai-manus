@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ref } from 'vue';
-import { hasTerminalEventForLatestTurn, useAgentEvents } from '../useAgentEvents';
+import {
+  getLatestTurnId,
+  hasTerminalEventForLatestTurn,
+  hasTerminalEventForTurn,
+  useAgentEvents,
+} from '../useAgentEvents';
 import type { Message, ToolContent } from '../../types/message';
 import type { AgentSSEEvent, PlanEventData } from '../../types/event';
 
@@ -54,13 +59,50 @@ describe('useAgentEvents terminal state', () => {
         timestamp: 1,
       },
     } as AgentSSEEvent;
-    handleEvent(event);
-    handleEvent({
+    expect(handleEvent(event)).toBe(true);
+    expect(handleEvent({
       ...event,
       data: { ...event.data, transport_cursor: '1-0' },
-    } as AgentSSEEvent);
+    } as AgentSSEEvent)).toBe(false);
     expect(state.messages.value).toHaveLength(1);
     expect(state.lastEventId.value).toBe('1-0');
+  });
+
+  it('reapplies terminal loading state even when the terminal event is a duplicate', () => {
+    const { state, handleEvent } = createHarness();
+    const terminal = {
+      event: 'done',
+      data: { event_id: 'stable-done', transport_cursor: '1-0' },
+    } as AgentSSEEvent;
+
+    handleEvent(terminal);
+    state.isLoading.value = true;
+    handleEvent({
+      ...terminal,
+      data: { ...terminal.data, transport_cursor: '2-0' },
+    } as AgentSSEEvent);
+
+    expect(state.isLoading.value).toBe(false);
+    expect(state.lastEventId.value).toBe('2-0');
+  });
+
+  it('does not duplicate an error message when a terminal error is replayed', () => {
+    const { state, handleEvent } = createHarness();
+    const terminal = {
+      event: 'error',
+      data: {
+        event_id: 'stable-error',
+        error: 'failed safely',
+        timestamp: 1,
+      },
+    } as AgentSSEEvent;
+
+    handleEvent(terminal);
+    state.isLoading.value = true;
+    handleEvent(terminal);
+
+    expect(state.isLoading.value).toBe(false);
+    expect(state.messages.value).toHaveLength(1);
   });
 
   it('resets logical event deduplication when the page changes sessions', () => {
@@ -133,6 +175,9 @@ describe('useAgentEvents terminal state', () => {
     ] as AgentSSEEvent[];
 
     expect(hasTerminalEventForLatestTurn(events)).toBe(true);
+    expect(getLatestTurnId(events)).toBe('turn-2');
+    expect(hasTerminalEventForTurn(events, 'turn-1')).toBe(true);
+    expect(hasTerminalEventForTurn(events, 'turn-2')).toBe(true);
   });
 
   it('keeps tool activity routed through the shared upstream handler', () => {

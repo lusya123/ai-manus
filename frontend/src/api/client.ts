@@ -266,16 +266,40 @@ apiClient.interceptors.response.use(
 
 export interface SSECallbacks<T = any> {
   onOpen?: () => void;
-  onMessage?: (event: { event: string; data: T }) => void;
+  /**
+   * Return false when this is a replay of an event the caller already applied.
+   * Only newly applied business events reset the consecutive retry budget.
+   */
+  onMessage?: (event: { event: string; data: T }) => boolean | void;
   onClose?: () => void;
   /** Called once when the SSE connection has stopped permanently. */
   onError?: (error: Error) => void;
+  /** Called before each bounded retry so callers can expose reconnect state. */
+  onRetry?: (info: SSERetryInfo) => void;
+}
+
+export interface SSERetryInfo {
+  attempt: number;
+  elapsedMs: number;
+  error: Error;
+  nextRetryMs: number;
 }
 
 export interface SSEOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
   body?: any;
   headers?: Record<string, string>;
+  /** Maximum transient retries during one connection lifecycle. */
+  maxRetryAttempts?: number;
+  /** Maximum time spent waiting for one retry episode to reopen successfully. */
+  maxRetryDurationMs?: number;
+  retryIntervalMs?: number;
+  /**
+   * When provided, a clean EOF before one of these events is treated as an
+   * interrupted stream and retried. Receiving a terminal event closes the
+   * transport immediately after delivering it to the caller.
+   */
+  terminalEvents?: readonly string[];
 }
 
 class FatalSSEError extends Error {
@@ -303,6 +327,10 @@ const isRetryableSSEStatus = (status: number): boolean => (
   || status >= 500
 );
 
+const DEFAULT_SSE_MAX_RETRY_ATTEMPTS = 5;
+const DEFAULT_SSE_MAX_RETRY_DURATION_MS = 30_000;
+const DEFAULT_SSE_RETRY_INTERVAL_MS = 1_000;
+
 /**
  * Generic SSE connection function
  * @param endpoint - API endpoint (relative to BASE_URL)
@@ -315,12 +343,21 @@ export const createSSEConnection = async <T = any>(
   options: SSEOptions = {},
   callbacks: SSECallbacks<T> = {}
 ): Promise<() => void> => {
-  const { onOpen, onMessage, onClose, onError } = callbacks;
+  const { onOpen, onMessage, onClose, onError, onRetry } = callbacks;
   const { 
     method = 'GET', 
     body, 
-    headers = {}
+    headers = {},
+    maxRetryAttempts = DEFAULT_SSE_MAX_RETRY_ATTEMPTS,
+    maxRetryDurationMs = DEFAULT_SSE_MAX_RETRY_DURATION_MS,
+    retryIntervalMs = DEFAULT_SSE_RETRY_INTERVAL_MS,
+    terminalEvents = [],
   } = options;
+  const retryLimit = Math.max(0, Math.floor(maxRetryAttempts));
+  const retryDuration = Math.max(1, Math.floor(maxRetryDurationMs));
+  const retryInterval = Math.max(0, Math.floor(retryIntervalMs));
+  const terminalEventNames = new Set(terminalEvents);
+  const requiresTerminalEvent = terminalEventNames.size > 0;
   
   // Create AbortController for cancellation
   const abortController = new AbortController();
@@ -359,11 +396,75 @@ export const createSSEConnection = async <T = any>(
 
   let authRefreshAttempted = false;
   let terminalCallbackSent = false;
+  let retryAttempts = 0;
+  let retryStartedAt: number | null = null;
+  let retryDeadlineTimer: number | undefined;
 
-  const notifyTerminalError = (error: Error) => {
+  const clearRetryDeadline = () => {
+    if (retryDeadlineTimer !== undefined) {
+      window.clearTimeout(retryDeadlineTimer);
+      retryDeadlineTimer = undefined;
+    }
+    retryStartedAt = null;
+  };
+
+  const finishWithError = (error: Error) => {
     if (terminalCallbackSent || abortController.signal.aborted) return;
     terminalCallbackSent = true;
-    onError?.(error);
+    clearRetryDeadline();
+    try {
+      onError?.(error);
+    } finally {
+      abortController.abort();
+    }
+  };
+
+  const finishNormally = () => {
+    if (terminalCallbackSent || abortController.signal.aborted) return;
+    terminalCallbackSent = true;
+    clearRetryDeadline();
+    try {
+      onClose?.();
+    } finally {
+      abortController.abort();
+    }
+  };
+
+  const startRetryDeadline = (cause: Error) => {
+    if (retryStartedAt !== null) return;
+    retryStartedAt = Date.now();
+    retryDeadlineTimer = window.setTimeout(() => {
+      finishWithError(new FatalSSEError(
+        `SSE retry deadline exceeded after ${retryDuration}ms: ${cause.message}`,
+      ));
+    }, retryDuration);
+  };
+
+  const scheduleRetry = (error: Error, nextRetryMs: number): number => {
+    retryAttempts += 1;
+    if (retryAttempts > retryLimit) {
+      const exhausted = new FatalSSEError(
+        `SSE retry limit exceeded after ${retryLimit} attempts: ${error.message}`,
+      );
+      finishWithError(exhausted);
+      throw exhausted;
+    }
+
+    startRetryDeadline(error);
+    const elapsedMs = retryStartedAt === null ? 0 : Date.now() - retryStartedAt;
+    try {
+      onRetry?.({
+        attempt: retryAttempts,
+        elapsedMs,
+        error,
+        nextRetryMs,
+      });
+    } catch {
+      const callbackError = new FatalSSEError('SSE retry callback failed');
+      finishWithError(callbackError);
+      throw callbackError;
+    }
+    return nextRetryMs;
   };
 
   const connectionPromise = fetchEventSource(apiUrl, {
@@ -374,6 +475,7 @@ export const createSSEConnection = async <T = any>(
     signal: abortController.signal,
     fetch: fetchWithCurrentAuth,
     async onopen(response) {
+      if (terminalCallbackSent || abortController.signal.aborted) return;
       if (response.status === 401) {
         if (authRefreshAttempted) {
           throw new FatalSSEError('SSE authentication failed after token refresh');
@@ -405,6 +507,13 @@ export const createSSEConnection = async <T = any>(
       }
 
       authRefreshAttempted = false;
+      // Response headers prove that this retry episode successfully reopened.
+      // Keep the cumulative attempt count for terminal streams so repeated
+      // open-then-EOF cycles still reach a finite limit.
+      clearRetryDeadline();
+      if (!requiresTerminalEvent) {
+        retryAttempts = 0;
+      }
       try {
         onOpen?.();
       } catch {
@@ -412,6 +521,7 @@ export const createSSEConnection = async <T = any>(
       }
     },
     onmessage(event: EventSourceMessage) {
+      if (terminalCallbackSent || abortController.signal.aborted) return;
       if (!event.event || event.event.trim() === '') return;
 
       let data: T;
@@ -421,41 +531,54 @@ export const createSSEConnection = async <T = any>(
         throw new FatalSSEError('SSE event contains invalid JSON');
       }
 
+      let madeProgress: boolean;
       try {
-        onMessage?.({ event: event.event, data });
+        madeProgress = onMessage?.({ event: event.event, data }) !== false;
       } catch {
         throw new FatalSSEError('SSE message callback failed');
+      }
+
+      if (madeProgress) {
+        retryAttempts = 0;
+        clearRetryDeadline();
+      }
+
+      if (terminalEventNames.has(event.event)) {
+        finishNormally();
       }
     },
     onclose() {
       if (terminalCallbackSent || abortController.signal.aborted) return;
-      terminalCallbackSent = true;
-      onClose?.();
+      if (requiresTerminalEvent) {
+        throw new Error('SSE connection closed before a terminal event');
+      }
+      finishNormally();
     },
     onerror(error: unknown) {
       const normalizedError = toError(error);
       if (normalizedError instanceof RetrySSEWithFreshAuthError) {
-        return 0;
+        return scheduleRetry(normalizedError, 0);
       }
       if (normalizedError instanceof FatalSSEError || terminalCallbackSent) {
-        notifyTerminalError(normalizedError);
+        finishWithError(normalizedError);
         throw normalizedError;
       }
 
-      // Returning normally delegates transient network/server recovery to the
-      // library's single retry loop. It must not look terminal to the page.
-      return undefined;
+      return scheduleRetry(normalizedError, retryInterval);
     },
   });
 
   connectionPromise.catch((error: unknown) => {
     if (abortController.signal.aborted) return;
     const normalizedError = toError(error);
-    notifyTerminalError(normalizedError);
+    finishWithError(normalizedError);
     console.error('SSE connection failed:', normalizedError);
   });
 
   return () => {
+    if (abortController.signal.aborted) return;
+    terminalCallbackSent = true;
+    clearRetryDeadline();
     abortController.abort();
   };
 };

@@ -1,11 +1,30 @@
 from functools import lru_cache
 from typing import Optional
 import logging
+from urllib.parse import urlsplit
 
 from app.domain.external.search import SearchEngine
 from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+def _is_official_anthropic_api_base(api_base: str | None) -> bool:
+    if not api_base:
+        return False
+    try:
+        parsed = urlsplit(api_base)
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.lower() == "https"
+        and (parsed.hostname or "").lower() == "api.anthropic.com"
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.query
+        and not parsed.fragment
+    )
+
 
 @lru_cache()
 def get_search_engine() -> Optional[SearchEngine]:
@@ -13,6 +32,7 @@ def get_search_engine() -> Optional[SearchEngine]:
     from app.infrastructure.external.search.google_search import GoogleSearchEngine
     from app.infrastructure.external.search.baidu_search import BaiduSearchEngine
     from app.infrastructure.external.search.baidu_web_search import BaiduWebSearchEngine
+    from app.infrastructure.external.search.anthropic_web_search import AnthropicWebSearchEngine
     from app.infrastructure.external.search.bing_search import BingSearchEngine
     from app.infrastructure.external.search.bing_web_search import BingWebSearchEngine
     from app.infrastructure.external.search.tavily_search import TavilySearchEngine
@@ -49,6 +69,43 @@ def get_search_engine() -> Optional[SearchEngine]:
         return BingWebSearchEngine(
             market=settings.bing_web_market,
             setlang=settings.bing_web_setlang,
+        )
+    elif settings.search_provider == "anthropic_web":
+        search_api_base = settings.anthropic_web_search_api_base
+        search_api_key = settings.anthropic_web_search_api_key
+        if not search_api_base and (
+            not settings.api_base
+            or _is_official_anthropic_api_base(settings.api_base)
+        ):
+            search_api_base = (
+                settings.api_base or "https://api.anthropic.com"
+            )
+        if (
+            not search_api_key
+            and _is_official_anthropic_api_base(search_api_base)
+        ):
+            search_api_key = (
+                settings.anthropic_api_key or settings.api_key
+            )
+        if (
+            settings.model_provider.lower() == "anthropic"
+            and search_api_base
+            and search_api_key
+        ):
+            logger.info(
+                "Initializing Anthropic server-side Web Search Engine"
+            )
+            return AnthropicWebSearchEngine(
+                api_base=search_api_base,
+                api_key=search_api_key,
+                model=settings.model_name,
+            )
+        logger.warning(
+            "Anthropic Web Search Engine not initialized: "
+            "MODEL_PROVIDER=anthropic and endpoint-bound search credentials "
+            "are required; non-Anthropic API_BASE values require both "
+            "ANTHROPIC_WEB_SEARCH_API_BASE and "
+            "ANTHROPIC_WEB_SEARCH_API_KEY"
         )
     elif settings.search_provider == "tavily":
         if settings.tavily_api_key:

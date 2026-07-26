@@ -233,9 +233,11 @@ class Settings(BaseSettings):
     cors_allowed_origins: str | None = None
     
     # Search engine configuration
-    search_provider: str | None = "bing_web"  # "baidu", "baidu_web", "google", "bing", "bing_web", "tavily", "serper", "custom"
+    search_provider: str | None = "bing_web"  # "anthropic_web", "baidu", "baidu_web", "google", "bing", "bing_web", "tavily", "serper", "custom"
     bing_web_market: str = "en-US"
     bing_web_setlang: str = "en"
+    anthropic_web_search_api_base: str | None = None
+    anthropic_web_search_api_key: str | None = None
     baidu_search_api_key: str | None = None
     bing_search_api_key: str | None = None
     google_search_api_key: str | None = None

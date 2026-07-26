@@ -77,9 +77,16 @@ TEMPERATURE=0.7                          # Model temperature parameter
 MAX_TOKENS=2000                          # Maximum output tokens per model request
 
 # Search engine configuration
-SEARCH_PROVIDER=bing_web                 # baidu / baidu_web / google / bing / bing_web / tavily / serper / custom
+SEARCH_PROVIDER=bing_web                 # anthropic_web / baidu / baidu_web / google / bing / bing_web / tavily / serper / custom
 GOOGLE_SEARCH_API_KEY=                   # Google Search API key (SEARCH_PROVIDER=google)
 GOOGLE_SEARCH_ENGINE_ID=                 # Google custom search engine ID (SEARCH_PROVIDER=google)
+
+# anthropic_web uses Anthropic's billed server-side web search with the
+# configured Anthropic endpoint/key. Freshness ranges fail closed because the
+# API has no enforceable search-date parameter.
+# Non-official gateways require an explicit endpoint/key binding:
+#ANTHROPIC_WEB_SEARCH_API_BASE=https://gateway.example
+#ANTHROPIC_WEB_SEARCH_API_KEY=
 
 # Sandbox configuration
 SANDBOX_PROVIDER=docker                   # docker or agentbay

@@ -185,6 +185,7 @@ def test_fork_deployment_worker_bridges_runtime_and_data_networks_safely():
     deploy_script = ssh_step["with"]["script"]
     override = deploy_script.split('cat > "$incoming_override" <<EOF', 1)[1]
     override = override.split("\nEOF", 1)[0]
+    override = override.replace("${anthropic_web_search_bindings}", "")
     compose_override = yaml.safe_load(textwrap.dedent(override))
     worker = compose_override["services"]["worker"]
 
@@ -235,6 +236,7 @@ def test_fork_worker_internal_datastore_addresses_override_polluted_env(tmp_path
     deploy_script = ssh_step["with"]["script"]
     override = deploy_script.split('cat > "$incoming_override" <<EOF', 1)[1]
     override = override.split("\nEOF", 1)[0]
+    override = override.replace("${anthropic_web_search_bindings}", "")
     worker = yaml.safe_load(textwrap.dedent(override))["services"]["worker"]
 
     (tmp_path / ".env").write_text(
@@ -554,6 +556,161 @@ def test_fork_deployment_uses_approved_sha_and_immutable_image_digests():
     assert "ai-manus-frontend:${IMAGE_TAG}" not in deploy_script
     assert "ai-manus-backend:${IMAGE_TAG}" not in deploy_script
     assert "ai-manus-sandbox:${IMAGE_TAG}" not in deploy_script
+
+
+def test_fork_search_provider_override_is_validated_injected_and_audited():
+    workflow = yaml.safe_load(
+        (PROJECT_ROOT / ".github/workflows/docker-build-and-push.yml").read_text()
+    )
+    preflight = workflow["jobs"]["deploy-preflight"]
+    deploy = workflow["jobs"]["deploy-fork"]
+    approval_step = next(
+        step for step in preflight["steps"] if step.get("id") == "secrets"
+    )
+    ssh_step = next(
+        step for step in deploy["steps"] if step.get("uses") == SSH_ACTION
+    )
+    deploy_script = ssh_step["with"]["script"]
+
+    assert preflight["outputs"]["search_provider"] == (
+        "${{ steps.secrets.outputs.search_provider }}"
+    )
+    assert approval_step["env"]["FORK_SEARCH_PROVIDER"] == (
+        "${{ vars.FORK_SEARCH_PROVIDER }}"
+    )
+    assert 'case "$FORK_SEARCH_PROVIDER" in' in approval_step["run"]
+    assert '""|anthropic_web)' in approval_step["run"]
+    assert (
+        "FORK_SEARCH_PROVIDER must be empty or anthropic_web."
+        in approval_step["run"]
+    )
+    assert (
+        "printf 'search_provider=%s\\n' \"$FORK_SEARCH_PROVIDER\""
+        in approval_step["run"]
+    )
+
+    assert ssh_step["env"]["FORK_SEARCH_PROVIDER"] == (
+        "${{ needs.deploy-preflight.outputs.search_provider }}"
+    )
+    assert "FORK_SEARCH_PROVIDER" in ssh_step["with"]["envs"].split(",")
+    assert "${{ vars.FORK_SEARCH_PROVIDER }}" not in ssh_step["env"].values()
+    assert 'case "${FORK_SEARCH_PROVIDER:-}" in' in deploy_script
+    assert (
+        "Unvalidated FORK_SEARCH_PROVIDER reached the deployment host."
+        in deploy_script
+    )
+
+    assert (
+        "deploy_search_provider_value='${SEARCH_PROVIDER:-bing_web}'"
+        in deploy_script
+    )
+    assert (
+        deploy_script.count(
+            "- SEARCH_PROVIDER=${deploy_search_provider_value}"
+        )
+        == 2
+    )
+    assert (
+        "ANTHROPIC_WEB_SEARCH_API_BASE=${API_BASE}" in deploy_script
+    )
+    assert "ANTHROPIC_WEB_SEARCH_API_KEY=${API_KEY}" in deploy_script
+    assert deploy_script.count("${anthropic_web_search_bindings}") == 2
+    assert "ANTHROPIC_WEB_SEARCH_EXTRA_HEADERS" not in deploy_script
+    assert "- EXTRA_HEADERS=" not in deploy_script
+
+    override = deploy_script.split('cat > "$incoming_override" <<EOF', 1)[1]
+    override = textwrap.dedent(override.split("\nEOF", 1)[0])
+    override = override.replace(
+        "${anthropic_web_search_bindings}",
+        "      - ANTHROPIC_WEB_SEARCH_API_BASE=${API_BASE}\n"
+        "      - ANTHROPIC_WEB_SEARCH_API_KEY=${API_KEY}",
+    )
+    override = override.replace(
+        "${deploy_search_provider_value}", "anthropic_web"
+    )
+    compose_override = yaml.safe_load(override)
+    for service_name in ("backend", "worker"):
+        environment = _environment_map(
+            compose_override["services"][service_name]
+        )
+        assert environment["SEARCH_PROVIDER"] == "anthropic_web"
+        assert (
+            environment["ANTHROPIC_WEB_SEARCH_API_BASE"] == "${API_BASE}"
+        )
+        assert environment["ANTHROPIC_WEB_SEARCH_API_KEY"] == "${API_KEY}"
+        assert "ANTHROPIC_WEB_SEARCH_EXTRA_HEADERS" not in environment
+        assert "EXTRA_HEADERS" not in environment
+
+    assert (
+        '["services"]["backend"]["environment"].get("SEARCH_PROVIDER", "")'
+        in deploy_script
+    )
+    assert (
+        '["services"]["worker"]["environment"].get("SEARCH_PROVIDER", "")'
+        in deploy_script
+    )
+    assert "validate_search_provider() {" in deploy_script
+    assert "read_effective_search_provider() {" in deploy_script
+    assert "verify_anthropic_web_search_bindings() {" in deploy_script
+    assert "read_effective_search_provider backend" in deploy_script
+    assert "read_effective_search_provider worker" in deploy_script
+    assert "verify_anthropic_web_search_bindings backend" in deploy_script
+    assert "verify_anthropic_web_search_bindings worker" in deploy_script
+    assert (
+        'os.environ.get("ANTHROPIC_WEB_SEARCH_API_BASE") == api_base'
+        in deploy_script
+    )
+    assert (
+        'os.environ.get("ANTHROPIC_WEB_SEARCH_API_KEY") == api_key'
+        in deploy_script
+    )
+    assert 'settings.model_provider.lower() == "anthropic"' in deploy_script
+    assert (
+        'engine.__class__.__name__ == "AnthropicWebSearchEngine"'
+        in deploy_script
+    )
+    audit_lines = [
+        line for line in deploy_script.splitlines() if "AUDIT " in line
+    ]
+    assert audit_lines
+    assert all(
+        "ANTHROPIC_WEB_SEARCH_API_BASE" not in line
+        and "ANTHROPIC_WEB_SEARCH_API_KEY" not in line
+        and "EXTRA_HEADERS" not in line
+        for line in audit_lines
+    )
+    assert (
+        'echo "AUDIT effective_search_provider=${effective_backend_search_provider}"'
+        in deploy_script
+    )
+    assert (
+        'echo "AUDIT worker_effective_search_provider=${effective_worker_search_provider}"'
+        in deploy_script
+    )
+
+
+def test_server_maintenance_audits_effective_search_provider():
+    workflow = yaml.safe_load(
+        (PROJECT_ROOT / ".github/workflows/docker-build-and-push.yml").read_text()
+    )
+    maintenance = workflow["jobs"]["server-maintenance"]
+    ssh_step = next(
+        step for step in maintenance["steps"] if step.get("uses") == SSH_ACTION
+    )
+    script = ssh_step["with"]["script"]
+
+    assert "AUDIT env_search_provider=" in script
+    assert "project_service_ids backend" in script
+    assert (
+        'from app.core.config import get_settings; '
+        'print(get_settings().search_provider or "")'
+        in script
+    )
+    assert (
+        'echo "AUDIT effective_search_provider=${effective_search_provider}"'
+        in script
+    )
+    assert "Running backend reported an invalid effective search provider." in script
 
 
 def test_fork_deployment_fails_closed_and_bounds_hotpatch_state():

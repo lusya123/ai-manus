@@ -1,11 +1,12 @@
 import base64
+import ipaddress
 import logging
 import re
+import socket
 import unicodedata
 from typing import Optional
 from urllib.parse import (
     parse_qs,
-    unquote,
     urlparse,
     urlsplit,
     urlunsplit,
@@ -22,6 +23,10 @@ from app.domain.utils.error_reporting import safe_exception_summary
 logger = logging.getLogger(__name__)
 
 _MAX_ATTEMPTS = 2
+_MAX_QUERY_CHARACTERS = 500
+_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+_MAX_RESULT_TITLE_CHARACTERS = 500
+_MAX_RESULT_SNIPPET_CHARACTERS = 2000
 _BING_HOST = "www.bing.com"
 _HTML_CONTENT_TYPES = {"text/html", "application/xhtml+xml"}
 _GENERIC_QUERY_TERMS = {
@@ -29,20 +34,19 @@ _GENERIC_QUERY_TERMS = {
     "an",
     "and",
     "best",
-    "current",
     "documentation",
     "docs",
+    "example",
+    "examples",
     "find",
     "for",
     "from",
     "how",
     "in",
     "is",
-    "latest",
     "me",
     "near",
     "of",
-    "official",
     "on",
     "search",
     "site",
@@ -58,7 +62,25 @@ _GENERIC_QUERY_TERMS = {
     "why",
     "with",
 }
-_GENERIC_CJK_TERMS = {"官网", "官方", "搜索", "网站", "最新", "查询"}
+_GENERIC_CJK_TERMS = {"搜索", "网站", "查询"}
+_SEPARATE_CJK_CONCEPT_TERMS = {
+    "代码",
+    "价格",
+    "使用",
+    "天气",
+    "招聘",
+    "教程",
+    "文档",
+    "新闻",
+    "更新",
+    "用法",
+    "示例",
+    "股价",
+    "评价",
+    "课程",
+    "财报",
+    "下载",
+}
 _NO_RESULTS_PHRASES = (
     "there are no results for",
     "no results found for",
@@ -88,7 +110,7 @@ def _text_terms(value: str, *, drop_generic: bool) -> set[str]:
     terms = {
         term
         for term in re.findall(r"[a-z0-9]+", normalized)
-        if len(term) >= 2
+        if len(term) >= 2 or term.isdigit()
     }
     terms.update(
         term
@@ -115,15 +137,28 @@ def _text_terms(value: str, *, drop_generic: bool) -> set[str]:
     return terms
 
 
-def _query_term_groups(value: str) -> list[tuple[set[str], int]]:
+def _compact_east_asian(value: str) -> str:
+    return "".join(
+        re.findall(
+            (
+                r"[\u3040-\u30ff\u31f0-\u31ff"
+                r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+                r"\uac00-\ud7af]"
+            ),
+            _canonical_text(value),
+        )
+    )
+
+
+def _query_term_groups(
+    value: str,
+) -> list[tuple[set[str], int, str | None]]:
     """Build independently-counted query concepts.
 
-    English words are naturally separated concepts. A contiguous CJK phrase
-    needs overlapping bigrams for matching, but those bigrams must never cast
-    multiple votes toward the *overall* query threshold. Generic intent words
-    are removed before grouping so ``苹果公司 最新新闻`` becomes the two
-    concepts ``苹果公司`` and ``新闻`` rather than a pile of correlated
-    n-grams.
+    English words are naturally separated concepts. An East Asian concept
+    retains its full ordered Han/Kana/Hangul phrase so whitespace or
+    punctuation may be ignored without turning shared fragments into false
+    matches. Generic intent words are removed before grouping.
     """
 
     normalized = _canonical_text(value)
@@ -133,13 +168,17 @@ def _query_term_groups(value: str) -> list[tuple[set[str], int]]:
         normalized,
         flags=re.UNICODE,
     )
-    groups: list[tuple[set[str], int]] = []
-    cjk_pattern = re.compile(
-        r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]"
+    groups: list[tuple[set[str], int, str | None]] = []
+    east_asian_pattern = re.compile(
+        (
+            r"[\u3040-\u30ff\u31f0-\u31ff"
+            r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+            r"\uac00-\ud7af]"
+        )
     )
 
     for raw_segment in raw_segments:
-        if cjk_pattern.search(raw_segment):
+        if east_asian_pattern.search(raw_segment):
             remaining = raw_segment
             for generic in sorted(
                 _GENERIC_CJK_TERMS,
@@ -147,6 +186,15 @@ def _query_term_groups(value: str) -> list[tuple[set[str], int]]:
                 reverse=True,
             ):
                 remaining = remaining.replace(generic, " ")
+            for separate in sorted(
+                _SEPARATE_CJK_CONCEPT_TERMS,
+                key=len,
+                reverse=True,
+            ):
+                remaining = remaining.replace(
+                    separate,
+                    f" {separate} ",
+                )
             concept_segments = remaining.split()
         else:
             concept_segments = [raw_segment]
@@ -155,53 +203,85 @@ def _query_term_groups(value: str) -> list[tuple[set[str], int]]:
             terms = _text_terms(concept, drop_generic=True)
             if not terms:
                 continue
-            # One CJK concept may be written without spaces. Requiring roughly
-            # two-thirds of its bigrams allows ``北京 天气`` to match
-            # ``北京天气`` while rejecting an entity-only result for
-            # ``苹果公司新闻``.
-            if cjk_pattern.search(concept) and len(terms) > 1:
-                required_within_group = max(
-                    2,
-                    (2 * len(terms) + 2) // 3,
+            cjk_concept = _compact_east_asian(concept)
+            groups.append(
+                (
+                    terms,
+                    1,
+                    cjk_concept or None,
                 )
-            else:
-                required_within_group = 1
-            groups.append((terms, required_within_group))
+            )
     return groups
 
 
-def _results_match_query(
-    query: str, search_results: list[SearchResultItem]
+def _result_matches_query(
+    query: str,
+    item: SearchResultItem,
 ) -> bool:
     query_groups = _query_term_groups(query)
     if not query_groups:
         return False
 
-    # One incidental word such as "example", "api", or the Chinese bigram
-    # "公司" is not enough to trust an otherwise unrelated 200 response. Each
-    # independently separated concept contributes at most one vote, so the
-    # overlapping bigrams of one Chinese entity cannot satisfy another concept
-    # such as "新闻". All required concepts must still co-occur in one result.
-    required_group_matches = (
-        1
-        if len(query_groups) == 1
-        else max(2, (len(query_groups) + 1) // 2)
+    # Match only human-visible result text. A malicious or SEO-optimized URL
+    # path can contain every query term while leading to unrelated content.
+    visible_fields = (item.title, item.snippet)
+    result_terms = set().union(
+        *(
+            _text_terms(field, drop_generic=False)
+            for field in visible_fields
+        )
     )
-    for item in search_results[:10]:
-        parsed_link = urlsplit(item.link)
-        link_text = f"{parsed_link.hostname or ''} {unquote(parsed_link.path)}"
-        result_terms = _text_terms(
-            f"{item.title} {link_text} {item.snippet}",
-            drop_generic=False,
+    compact_east_asian_fields = tuple(
+        _compact_east_asian(field) for field in visible_fields
+    )
+    east_asian_pattern = re.compile(
+        (
+            r"[\u3040-\u30ff\u31f0-\u31ff"
+            r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+            r"\uac00-\ud7af]"
         )
-        matched_groups = sum(
-            len(group_terms.intersection(result_terms))
-            >= required_within_group
-            for group_terms, required_within_group in query_groups
+    )
+    return all(
+        (
+            any(
+                cjk_concept in compact_field
+                for compact_field in compact_east_asian_fields
+            )
+            and all(
+                term in result_terms
+                for term in group_terms
+                if not east_asian_pattern.search(term)
+            )
+            if cjk_concept
+            else (
+                len(group_terms.intersection(result_terms))
+                >= required_within_group
+            )
         )
-        if matched_groups >= required_group_matches:
-            return True
-    return False
+        for (
+            group_terms,
+            required_within_group,
+            cjk_concept,
+        ) in query_groups
+    )
+
+
+def _filter_results_matching_query(
+    query: str,
+    search_results: list[SearchResultItem],
+) -> list[SearchResultItem]:
+    """Return only individually relevant results, preserving source order."""
+    return [
+        item
+        for item in search_results
+        if _result_matches_query(query, item)
+    ]
+
+
+def _results_match_query(
+    query: str, search_results: list[SearchResultItem]
+) -> bool:
+    return bool(_filter_results_matching_query(query, search_results[:10]))
 
 
 def _decode_bing_redirect(url: str) -> str:
@@ -226,7 +306,11 @@ def _decode_bing_redirect(url: str) -> str:
 
 def _normalize_result_url(url: str) -> str:
     candidate = _decode_bing_redirect(url) if "/ck/a?" in url else url
-    if "/ck/a?" in candidate:
+    if (
+        "/ck/a?" in candidate
+        or "\\" in candidate
+        or any(ord(character) < 0x20 for character in candidate)
+    ):
         return ""
 
     try:
@@ -243,7 +327,70 @@ def _normalize_result_url(url: str) -> str:
     ):
         return ""
 
-    hostname = hostname_value.lower()
+    try:
+        # IDNA performs compatibility normalization, including full-width or
+        # circled digits and non-ASCII dot separators. Canonicalize first and
+        # then run every IP check on the exact ASCII host that clients use.
+        hostname = (
+            hostname_value.lower()
+            .encode("idna")
+            .decode("ascii")
+            .rstrip(".")
+        )
+    except UnicodeError:
+        return ""
+    if not hostname:
+        return ""
+
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        address = None
+    if address is None:
+        try:
+            # inet_aton also recognizes legacy IPv4 forms such as 127.1,
+            # octal components, and hexadecimal components.
+            address = ipaddress.ip_address(socket.inet_aton(hostname))
+        except (OSError, ValueError):
+            address = None
+    if address is not None:
+        if (
+            not address.is_global
+            or address.is_multicast
+            or address.is_loopback
+            or address.is_private
+            or address.is_link_local
+            or address.is_reserved
+            or address.is_unspecified
+            or getattr(address, "is_site_local", False)
+        ):
+            return ""
+    else:
+        labels = hostname.split(".")
+        if (
+            len(labels) < 2
+            or any(
+                not re.fullmatch(
+                    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?",
+                    label,
+                )
+                for label in labels
+            )
+            or hostname == "localhost"
+            or hostname.endswith(
+                (
+                    ".localhost",
+                    ".local",
+                    ".internal",
+                    ".lan",
+                    ".home",
+                )
+            )
+        ):
+            return ""
+    default_port = 80 if parsed.scheme.lower() == "http" else 443
+    if port is not None and port != default_port:
+        return ""
     if ":" in hostname:
         hostname = f"[{hostname}]"
     if port is not None:
@@ -284,8 +431,32 @@ async def _request_bing(
     params: dict[str, str],
 ):
     async with AsyncSession(impersonate="chrome") as session:
-        response = await session.get(base_url, params=params, timeout=30)
+        response = await session.get(
+            base_url,
+            params=params,
+            timeout=30,
+            stream=True,
+            allow_redirects=False,
+        )
         response.raise_for_status()
+        content_length = response.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > _MAX_RESPONSE_BYTES:
+                    await response.aclose()
+                    raise _UntrustedBingResponse()
+            except ValueError:
+                pass
+
+        chunks: list[bytes] = []
+        total_bytes = 0
+        async for chunk in response.aiter_content():
+            total_bytes += len(chunk)
+            if total_bytes > _MAX_RESPONSE_BYTES:
+                await response.aclose()
+                raise _UntrustedBingResponse()
+            chunks.append(chunk)
+        response.content = b"".join(chunks)
         return response
 
 
@@ -339,7 +510,9 @@ def _parse_bing_response(
             if h2:
                 anchor = h2.find("a")
                 if anchor:
-                    title = anchor.get_text(" ", strip=True)
+                    title = anchor.get_text(" ", strip=True)[
+                        :_MAX_RESULT_TITLE_CHARACTERS
+                    ]
                     href = anchor.get("href", "")
                     if isinstance(href, str):
                         link = _normalize_result_url(href)
@@ -356,14 +529,18 @@ def _parse_bing_response(
             ):
                 text = tag.get_text(" ", strip=True)
                 if len(text) > 20:
-                    snippet = text
+                    snippet = text[
+                        :_MAX_RESULT_SNIPPET_CHARACTERS
+                    ]
                     break
 
             if not snippet:
                 for paragraph in item.find_all("p"):
                     text = paragraph.get_text(" ", strip=True)
                     if len(text) > 20:
-                        snippet = text
+                        snippet = text[
+                            :_MAX_RESULT_SNIPPET_CHARACTERS
+                        ]
                         break
 
             search_results.append(
@@ -390,7 +567,8 @@ def _parse_bing_response(
             )
         raise _UntrustedBingResponse()
 
-    if not _results_match_query(query, search_results):
+    search_results = _filter_results_matching_query(query, search_results)
+    if not search_results:
         raise _UntrustedBingResponse()
 
     total_results = 0
@@ -442,24 +620,50 @@ class BingWebSearchEngine(SearchEngine):
         Returns:
             Search results
         """
+        normalized_query = query.strip()
+        if (
+            not normalized_query
+            or len(normalized_query) > _MAX_QUERY_CHARACTERS
+        ):
+            return ToolResult(
+                success=False,
+                message="Bing Web Search query is invalid",
+                data=SearchResults(
+                    query=query,
+                    date_range=date_range,
+                    total_results=0,
+                    results=[],
+                ),
+            )
+
+        freshness_filters = {
+            "past_hour": 'ex1:"ez1"',
+            "past_day": 'ex1:"ez2"',
+            "past_week": 'ex1:"ez3"',
+            "past_month": 'ex1:"ez4"',
+            "past_year": 'ex1:"ez5"',
+        }
+        if date_range not in (None, "", "all", *freshness_filters):
+            return ToolResult(
+                success=False,
+                message="Bing Web Search date range is invalid",
+                data=SearchResults(
+                    query=query,
+                    date_range=date_range,
+                    total_results=0,
+                    results=[],
+                ),
+            )
+
         params: dict[str, str] = {
-            "q": query,
+            "q": normalized_query,
             "count": "20",
             "mkt": self.market,
             "setlang": self.setlang,
         }
 
         if date_range and date_range != "all":
-            freshness_filters = {
-                "past_hour": 'ex1:"ez1"',
-                "past_day": 'ex1:"ez2"',
-                "past_week": 'ex1:"ez3"',
-                "past_month": 'ex1:"ez4"',
-                "past_year": 'ex1:"ez5"',
-            }
-            f = freshness_filters.get(date_range)
-            if f:
-                params["filters"] = f
+            params["filters"] = freshness_filters[date_range]
 
         last_error: Exception | None = None
         saw_untrusted_response = False
@@ -468,7 +672,7 @@ class BingWebSearchEngine(SearchEngine):
                 response = await _request_bing(self.base_url, params)
                 results = _parse_bing_response(
                     response,
-                    query=query,
+                    query=normalized_query,
                     date_range=date_range,
                 )
                 return ToolResult(success=True, data=results)

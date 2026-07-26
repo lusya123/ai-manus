@@ -77,9 +77,15 @@ TEMPERATURE=0.7                          # 模型温度参数
 MAX_TOKENS=2000                          # 模型单次请求最大输出 token 数量
 
 # Search engine configuration
-SEARCH_PROVIDER=bing_web                 # baidu / baidu_web / google / bing / bing_web / tavily / serper / custom
+SEARCH_PROVIDER=bing_web                 # anthropic_web / baidu / baidu_web / google / bing / bing_web / tavily / serper / custom
 GOOGLE_SEARCH_API_KEY=                   # Google Search API 密钥（SEARCH_PROVIDER=google）
 GOOGLE_SEARCH_ENGINE_ID=                 # Google 自定义搜索引擎 ID（SEARCH_PROVIDER=google）
+
+# anthropic_web 使用当前 Anthropic 端点/密钥调用按次计费的服务端网页搜索。
+# 该 API 没有可强制执行的搜索日期参数，请求 freshness/date_range 时会失败关闭。
+# 非官方兼容网关必须显式绑定专用端点和密钥：
+#ANTHROPIC_WEB_SEARCH_API_BASE=https://gateway.example
+#ANTHROPIC_WEB_SEARCH_API_KEY=
 
 # Sandbox configuration
 SANDBOX_PROVIDER=docker                   # docker 或 agentbay

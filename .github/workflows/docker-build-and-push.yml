@@ -611,7 +611,7 @@ jobs:
             print("AUDIT auth_provider=" + values.get("AUTH_PROVIDER", ""))
             print("AUDIT task_backend=" + values.get("TASK_BACKEND", "local"))
             print("AUDIT sandbox_provider=" + values.get("SANDBOX_PROVIDER", ""))
-            print("AUDIT search_provider=" + values.get("SEARCH_PROVIDER", ""))
+            print("AUDIT env_search_provider=" + values.get("SEARCH_PROVIDER", ""))
             print("AUDIT model_name=" + values.get("MODEL_NAME", ""))
             print("AUDIT api_base_host=" + (urlsplit(api_base).hostname or ""))
             print("AUDIT api_base_is_mock=" + str("mockserver" in api_base.lower()).lower())
@@ -620,6 +620,24 @@ jobs:
                 + str(bool(values.get("API_KEY") or values.get("ANTHROPIC_API_KEY"))).lower()
             )
             PY
+
+            effective_search_provider="unavailable"
+            backend_ids="$(project_service_ids backend)"
+            if [ "$(count_nonempty_lines "$backend_ids")" = 1 ] && \
+              [ "$(timeout 10s docker inspect --format '{{.State.Running}}' "$backend_ids")" = true ]; then
+              effective_search_provider="$(
+                timeout 10s docker exec "$backend_ids" python -c \
+                  'from app.core.config import get_settings; print(get_settings().search_provider or "")'
+              )"
+              case "$effective_search_provider" in
+                anthropic_web|baidu|baidu_web|google|bing|bing_web|tavily|serper|custom)
+                  ;;
+                *)
+                  fail "Running backend reported an invalid effective search provider."
+                  ;;
+              esac
+            fi
+            echo "AUDIT effective_search_provider=${effective_search_provider}"
 
             if [ "$OPERATION" = audit ]; then
               echo "AUDIT_COMPLETE mongodb_id=${mongodb_id} redis_id=${redis_id}"
@@ -1091,6 +1109,7 @@ jobs:
       )
     outputs:
       enabled: ${{ steps.secrets.outputs.enabled }}
+      search_provider: ${{ steps.secrets.outputs.search_provider }}
     steps:
       - name: Verify deployment secrets
         id: secrets
@@ -1101,6 +1120,7 @@ jobs:
           SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
           ENABLE_FORK_DEPLOY: ${{ vars.ENABLE_FORK_DEPLOY }}
           APPROVED_SHA: ${{ vars.FORK_DEPLOY_APPROVED_SHA }}
+          FORK_SEARCH_PROVIDER: ${{ vars.FORK_SEARCH_PROVIDER }}
         shell: bash
         run: |
           if [[ "$ENABLE_FORK_DEPLOY" != "true" ]]; then
@@ -1111,7 +1131,16 @@ jobs:
             echo "::error::FORK_DEPLOY_APPROVED_SHA does not authorize this immutable commit."
             exit 1
           fi
+          case "$FORK_SEARCH_PROVIDER" in
+            ""|anthropic_web)
+              ;;
+            *)
+              echo "::error::FORK_SEARCH_PROVIDER must be empty or anthropic_web."
+              exit 1
+              ;;
+          esac
           if [[ -n "$SERVER_HOST" && -n "$SERVER_HOST_FINGERPRINT" && -n "$SERVER_USER" && -n "$SERVER_PASSWORD" ]]; then
+            printf 'search_provider=%s\n' "$FORK_SEARCH_PROVIDER" >> "$GITHUB_OUTPUT"
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
             echo "::error::Fork deployment was authorized, but one or more SERVER_* secrets are missing."
@@ -1186,6 +1215,7 @@ jobs:
           COMPOSE_B64: ${{ steps.deploy.outputs.compose_b64 }}
           DEPLOY_REF: ${{ github.ref }}
           EXPECTED_SHA: ${{ github.sha }}
+          FORK_SEARCH_PROVIDER: ${{ needs.deploy-preflight.outputs.search_provider }}
           PUBLIC_HOST: ${{ secrets.SERVER_HOST }}
           CORE_RESOURCE_PREFIX: manus
           HOTPATCH_ENABLED: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/tags/deploy-test-20260721-artifact-fix-01' }}
@@ -1196,10 +1226,19 @@ jobs:
           password: ${{ secrets.SERVER_PASSWORD }}
           fingerprint: ${{ secrets.SERVER_HOST_FINGERPRINT }}
           command_timeout: 30m
-          envs: REGISTRY,OWNER,IMAGE_TAG,FRONTEND_IMAGE,BACKEND_IMAGE,SANDBOX_IMAGE,CLAW_IMAGE,MOCKSERVER_IMAGE,DEPLOY_PATH,FRONTEND_HOST_PORT,GHCR_TOKEN,GHCR_USER,COMPOSE_B64,DEPLOY_REF,EXPECTED_SHA,PUBLIC_HOST,CORE_RESOURCE_PREFIX,HOTPATCH_ENABLED,HOTPATCH_TARGET
+          envs: REGISTRY,OWNER,IMAGE_TAG,FRONTEND_IMAGE,BACKEND_IMAGE,SANDBOX_IMAGE,CLAW_IMAGE,MOCKSERVER_IMAGE,DEPLOY_PATH,FRONTEND_HOST_PORT,GHCR_TOKEN,GHCR_USER,COMPOSE_B64,DEPLOY_REF,EXPECTED_SHA,FORK_SEARCH_PROVIDER,PUBLIC_HOST,CORE_RESOURCE_PREFIX,HOTPATCH_ENABLED,HOTPATCH_TARGET
           script: |
             set -eu
             cd "$DEPLOY_PATH"
+
+            case "${FORK_SEARCH_PROVIDER:-}" in
+              ""|anthropic_web)
+                ;;
+              *)
+                echo "Unvalidated FORK_SEARCH_PROVIDER reached the deployment host." >&2
+                exit 1
+                ;;
+            esac
 
             if ! command -v flock >/dev/null 2>&1; then
               echo "flock is unavailable; refusing an unlocked deployment." >&2
@@ -1503,6 +1542,42 @@ jobs:
               if ! printf '%s\n' "$verify_repo_digests" | \
                 grep -Fq "@${verify_expected_digest}"; then
                 echo "Image store lacks the expected RepoDigest for ${verify_service}." >&2
+                return 1
+              fi
+            }
+
+            validate_search_provider() {
+              provider_label="$1"
+              provider_value="$2"
+              case "$provider_value" in
+                anthropic_web|baidu|baidu_web|google|bing|bing_web|tavily|serper|custom)
+                  ;;
+                *)
+                  echo "${provider_label} has an invalid effective search provider." >&2
+                  return 1
+                  ;;
+              esac
+              if [ -n "${FORK_SEARCH_PROVIDER:-}" ] && \
+                [ "$provider_value" != "$FORK_SEARCH_PROVIDER" ]; then
+                echo "${provider_label} does not use the authorized search provider." >&2
+                return 1
+              fi
+            }
+
+            read_effective_search_provider() {
+              provider_service="$1"
+              compose exec -T "$provider_service" python -c \
+                'from app.core.config import get_settings; print(get_settings().search_provider or "")'
+            }
+
+            verify_anthropic_web_search_bindings() {
+              provider_service="$1"
+              if [ "${FORK_SEARCH_PROVIDER:-}" != anthropic_web ]; then
+                return 0
+              fi
+              if ! compose exec -T "$provider_service" python -c \
+                'import os, sys; from app.core.config import get_settings; from app.infrastructure.external.search import get_search_engine; api_base = os.environ.get("API_BASE"); api_key = os.environ.get("API_KEY"); settings = get_settings(); engine = get_search_engine(); sys.exit(0 if api_base and api_key and os.environ.get("ANTHROPIC_WEB_SEARCH_API_BASE") == api_base and os.environ.get("ANTHROPIC_WEB_SEARCH_API_KEY") == api_key and settings.model_provider.lower() == "anthropic" and engine is not None and engine.__class__.__name__ == "AnthropicWebSearchEngine" else 1)'; then
+                echo "${provider_service} does not have valid Anthropic web-search source bindings." >&2
                 return 1
               fi
             }
@@ -3057,6 +3132,22 @@ jobs:
 
             printf '%s' "$COMPOSE_B64" | base64 -d > "$incoming_compose"
             chmod 600 "$incoming_compose"
+            if [ -n "${FORK_SEARCH_PROVIDER:-}" ]; then
+              deploy_search_provider_value="$FORK_SEARCH_PROVIDER"
+            else
+              # Preserve an existing .env choice and otherwise retain the
+              # application's bing_web default without injecting an empty
+              # SEARCH_PROVIDER into either task-producing service.
+              deploy_search_provider_value='${SEARCH_PROVIDER:-bing_web}'
+            fi
+            anthropic_web_search_bindings=""
+            if [ "${FORK_SEARCH_PROVIDER:-}" = anthropic_web ]; then
+              # Keep these as Compose expressions in the generated override.
+              # Compose resolves both from the server-side .env; neither value
+              # is expanded into the workflow log or copied from EXTRA_HEADERS.
+              anthropic_web_search_bindings='      - ANTHROPIC_WEB_SEARCH_API_BASE=${API_BASE}
+                  - ANTHROPIC_WEB_SEARCH_API_KEY=${API_KEY}'
+            fi
 
             cat > "$incoming_override" <<EOF
             services:
@@ -3091,6 +3182,8 @@ jobs:
                   - MANUS_API_BASE_URL=http://backend:8000
                   - SANDBOX_IMAGE=${SANDBOX_IMAGE}
                   - CLAW_IMAGE=${CLAW_IMAGE}
+                  - SEARCH_PROVIDER=${deploy_search_provider_value}
+            ${anthropic_web_search_bindings}
 
               sandbox:
                 image: ${SANDBOX_IMAGE}
@@ -3138,6 +3231,8 @@ jobs:
                   - RUNTIME_DEPLOYMENT_ID=ai-manus
                   - CLAW_PUBLISH_HOST_PORTS=false
                   - RUNTIME_GATEWAY_CONTAINER=deployment-pending-backend
+                  - SEARCH_PROVIDER=${deploy_search_provider_value}
+            ${anthropic_web_search_bindings}
                 networks:
                   - manus-network
                   - manus-data-network
@@ -3155,6 +3250,47 @@ jobs:
             chmod 600 "$incoming_override"
 
             docker compose -p ai-manus -f "$incoming_compose" -f "$incoming_override" config -q
+            configured_backend_search_provider="$(
+              docker compose -p ai-manus \
+                -f "$incoming_compose" -f "$incoming_override" \
+                config --format json | python3 -c \
+                'import json, sys; print(json.load(sys.stdin)["services"]["backend"]["environment"].get("SEARCH_PROVIDER", ""))'
+            )"
+            configured_worker_search_provider="$(
+              docker compose -p ai-manus \
+                -f "$incoming_compose" -f "$incoming_override" \
+                config --format json | python3 -c \
+                'import json, sys; print(json.load(sys.stdin)["services"]["worker"]["environment"].get("SEARCH_PROVIDER", ""))'
+            )"
+            validate_search_provider \
+              "Configured backend" "$configured_backend_search_provider"
+            validate_search_provider \
+              "Configured worker" "$configured_worker_search_provider"
+            if [ "$configured_backend_search_provider" != \
+              "$configured_worker_search_provider" ]; then
+              echo "Backend and worker search providers differ in the generated Compose configuration." >&2
+              exit 1
+            fi
+            if [ "${FORK_SEARCH_PROVIDER:-}" = anthropic_web ]; then
+              docker compose -p ai-manus \
+                -f "$incoming_compose" -f "$incoming_override" \
+                config --format json | python3 -c 'import json, sys
+            document = json.load(sys.stdin)
+            for service_name in ("backend", "worker"):
+                environment = document["services"][service_name]["environment"]
+                api_base = environment.get("API_BASE")
+                api_key = environment.get("API_KEY")
+                if (
+                    not api_base
+                    or not api_key
+                    or environment.get("ANTHROPIC_WEB_SEARCH_API_BASE") != api_base
+                    or environment.get("ANTHROPIC_WEB_SEARCH_API_KEY") != api_key
+                ):
+                    raise SystemExit(
+                        f"{service_name} has invalid Anthropic web-search source bindings"
+                    )
+            '
+            fi
             require_docker
             verify_stateful_pre_mutation
             changed=true
@@ -3314,6 +3450,33 @@ jobs:
               echo "Backend container identity changed after worker gateway binding." >&2
               exit 1
             fi
+            effective_backend_search_provider="$(
+              read_effective_search_provider backend
+            )"
+            validate_search_provider \
+              "Running backend" "$effective_backend_search_provider"
+            verify_anthropic_web_search_bindings backend
+            if [ "$effective_backend_search_provider" != \
+              "$configured_backend_search_provider" ]; then
+              echo "Running backend search provider differs from the generated Compose configuration." >&2
+              exit 1
+            fi
+            effective_worker_search_provider="not-running"
+            if [ "${task_backend:-local}" = celery ]; then
+              effective_worker_search_provider="$(
+                read_effective_search_provider worker
+              )"
+              validate_search_provider \
+                "Running worker" "$effective_worker_search_provider"
+              verify_anthropic_web_search_bindings worker
+              if [ "$effective_worker_search_provider" != \
+                "$configured_worker_search_provider" ] || \
+                [ "$effective_worker_search_provider" != \
+                "$effective_backend_search_provider" ]; then
+                echo "Running worker search provider differs from the backend or generated Compose configuration." >&2
+                exit 1
+              fi
+            fi
 
             if [ -n "$mongodb_id_before" ] && \
               [ "$(compose ps -q mongodb)" != "$mongodb_id_before" ]; then
@@ -3332,6 +3495,8 @@ jobs:
             smoke_frontend_url \
               "http://${PUBLIC_HOST}:${FRONTEND_HOST_PORT}" \
               "public-root"
+            echo "AUDIT effective_search_provider=${effective_backend_search_provider}"
+            echo "AUDIT worker_effective_search_provider=${effective_worker_search_provider}"
 
             # Keep rollback armed until every image fingerprint and both the
             # host-local and public entry points have passed.

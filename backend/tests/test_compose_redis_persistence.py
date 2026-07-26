@@ -500,9 +500,17 @@ def test_fork_deployment_uses_approved_sha_and_immutable_image_digests():
 
     assert preflight["environment"] == "fork-production"
     assert preflight["needs"] == "publish-fork-images"
+    # Environment-scoped vars are not available while GitHub evaluates a
+    # job-level ``if``.  The job must enter the environment first and enforce
+    # the explicit enable gate inside its preflight step.
+    assert "vars.ENABLE_FORK_DEPLOY" not in preflight["if"]
     approval_step = next(
         step for step in preflight["steps"] if step.get("id") == "secrets"
     )
+    assert approval_step["env"]["ENABLE_FORK_DEPLOY"] == (
+        "${{ vars.ENABLE_FORK_DEPLOY }}"
+    )
+    assert '"$ENABLE_FORK_DEPLOY" != "true"' in approval_step["run"]
     assert approval_step["env"]["APPROVED_SHA"] == (
         "${{ vars.FORK_DEPLOY_APPROVED_SHA }}"
     )

@@ -626,7 +626,7 @@ jobs:
             if [ "$(count_nonempty_lines "$backend_ids")" = 1 ] && \
               [ "$(timeout 10s docker inspect --format '{{.State.Running}}' "$backend_ids")" = true ]; then
               effective_search_provider="$(
-                timeout 10s docker exec "$backend_ids" python -c \
+                timeout 10s docker exec "$backend_ids" /app/.venv/bin/python -c \
                   'from app.core.config import get_settings; print(get_settings().search_provider or "")'
               )"
               case "$effective_search_provider" in
@@ -1612,7 +1612,7 @@ jobs:
 
             read_effective_search_provider() {
               provider_service="$1"
-              compose exec -T "$provider_service" python -c \
+              compose exec -T "$provider_service" /app/.venv/bin/python -c \
                 'from app.core.config import get_settings; print(get_settings().search_provider or "")'
             }
 
@@ -1621,7 +1621,7 @@ jobs:
               if [ "${FORK_SEARCH_PROVIDER:-}" != anthropic_web ]; then
                 return 0
               fi
-              if ! compose exec -T "$provider_service" python -c \
+              if ! compose exec -T "$provider_service" /app/.venv/bin/python -c \
                 'import os, sys; from app.core.config import get_settings; from app.infrastructure.external.search import get_search_engine; api_base = os.environ.get("API_BASE"); api_key = os.environ.get("API_KEY"); settings = get_settings(); engine = get_search_engine(); sys.exit(0 if api_base and api_key and os.environ.get("ANTHROPIC_WEB_SEARCH_API_BASE") == api_base and os.environ.get("ANTHROPIC_WEB_SEARCH_API_KEY") == api_key and settings.model_provider.lower() == "anthropic" and engine is not None and engine.__class__.__name__ == "AnthropicWebSearchEngine" else 1)'; then
                 echo "${provider_service} does not have valid Anthropic web-search source bindings." >&2
                 return 1
@@ -3365,7 +3365,7 @@ jobs:
             fi
             for i in $(seq 1 60); do
               if compose exec -T backend \
-                python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)" >/dev/null 2>&1; then
+                /app/.venv/bin/python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)" >/dev/null 2>&1; then
                 break
               fi
               if [ "$i" -eq 60 ]; then
@@ -3394,7 +3394,7 @@ jobs:
             fi
             compose up -d --no-deps frontend
             for i in $(seq 1 30); do
-              if compose exec -T backend python -c "import urllib.request; [urllib.request.urlopen(url, timeout=2).read(1) for url in ('http://frontend/', 'http://frontend/api/v1/config/frontend')]" >/dev/null 2>&1; then
+              if compose exec -T backend /app/.venv/bin/python -c "import urllib.request; [urllib.request.urlopen(url, timeout=2).read(1) for url in ('http://frontend/', 'http://frontend/api/v1/config/frontend')]" >/dev/null 2>&1; then
                 break
               fi
               if [ "$i" -eq 30 ]; then
@@ -3436,7 +3436,7 @@ jobs:
             compose up -d --no-deps backend
             for i in $(seq 1 60); do
               if compose exec -T backend \
-                python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)" >/dev/null 2>&1; then
+                /app/.venv/bin/python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)" >/dev/null 2>&1; then
                 break
               fi
               if [ "$i" -eq 60 ]; then

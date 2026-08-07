@@ -385,6 +385,26 @@ def test_explicit_fork_publish_skips_only_the_redundant_multiarch_build():
     )
 
 
+def test_deployment_checks_use_the_backend_virtualenv_python():
+    workflow_text = (
+        PROJECT_ROOT / ".github/workflows/docker-build-and-push.yml"
+    ).read_text()
+    normalized = " ".join(workflow_text.replace("\\\n", " ").split())
+
+    for expected in (
+        'docker exec "$backend_ids" /app/.venv/bin/python -c',
+        'compose exec -T "$provider_service" /app/.venv/bin/python -c',
+        "compose exec -T backend /app/.venv/bin/python -c",
+    ):
+        assert expected in normalized
+    for forbidden in (
+        'docker exec "$backend_ids" python -c',
+        'compose exec -T "$provider_service" python -c',
+        "compose exec -T backend python -c",
+    ):
+        assert forbidden not in normalized
+
+
 def test_server_datastore_maintenance_is_exact_gated_and_backed_up():
     workflow = yaml.safe_load(
         (PROJECT_ROOT / ".github/workflows/docker-build-and-push.yml").read_text()

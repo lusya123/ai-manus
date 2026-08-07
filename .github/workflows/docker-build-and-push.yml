@@ -930,6 +930,23 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       [frontend-smoke, backend-unit-security, sandbox-unit, claw-runtime-smoke]
+    # An explicit fork publish/deploy builds and pushes the exact amd64
+    # artifacts below. Avoid doing the upstream multi-arch dry-run first; it
+    # duplicates the expensive Sandbox build without strengthening the
+    # immutable deployment gate. Pushes, PRs, ordinary dispatches and the
+    # upstream repository still run the full multi-arch matrix when their
+    # prerequisite tests are enabled.
+    if: >-
+      success() &&
+      !(
+        github.event_name == 'workflow_dispatch' &&
+        github.repository != 'Simpleyyt/ai-manus' &&
+        inputs.server_maintenance == 'none' &&
+        (
+          inputs.publish_fork_images == true ||
+          inputs.deploy_fork == true
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -987,13 +1004,33 @@ jobs:
   # environment-level enable gate and an environment-approved immutable SHA.
   publish-preflight:
     runs-on: ubuntu-latest
-    needs: build-and-push
+    needs:
+      - frontend-smoke
+      - backend-unit-security
+      - sandbox-unit
+      - claw-runtime-smoke
+      - build-and-push
     if: >-
+      always() &&
+      !cancelled() &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.server_maintenance == 'none' &&
       (
-        github.event_name == 'workflow_dispatch' &&
+        inputs.publish_fork_images == true ||
+        inputs.deploy_fork == true
+      ) &&
+      needs.frontend-smoke.result == 'success' &&
+      needs.backend-unit-security.result == 'success' &&
+      needs.sandbox-unit.result == 'success' &&
+      needs.claw-runtime-smoke.result == 'success' &&
+      (
         (
-          inputs.publish_fork_images == true ||
-          inputs.deploy_fork == true
+          github.repository == 'Simpleyyt/ai-manus' &&
+          needs.build-and-push.result == 'success'
+        ) ||
+        (
+          github.repository != 'Simpleyyt/ai-manus' &&
+          needs.build-and-push.result == 'skipped'
         )
       )
     outputs:

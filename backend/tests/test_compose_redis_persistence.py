@@ -326,6 +326,65 @@ def test_multiarch_build_registers_emulation_before_buildx():
     assert build_step["with"]["platforms"] == "linux/amd64,linux/arm64"
 
 
+def test_explicit_fork_publish_skips_only_the_redundant_multiarch_build():
+    workflow = yaml.safe_load(
+        (PROJECT_ROOT / ".github/workflows/docker-build-and-push.yml").read_text()
+    )
+    jobs = workflow["jobs"]
+    build_condition = jobs["build-and-push"]["if"]
+    preflight = jobs["publish-preflight"]
+    preflight_condition = preflight["if"]
+    test_jobs = {
+        "frontend-smoke",
+        "backend-unit-security",
+        "sandbox-unit",
+        "claw-runtime-smoke",
+    }
+
+    assert " ".join(build_condition.split()) == " ".join(
+        """
+        success() &&
+        !(
+          github.event_name == 'workflow_dispatch' &&
+          github.repository != 'Simpleyyt/ai-manus' &&
+          inputs.server_maintenance == 'none' &&
+          (
+            inputs.publish_fork_images == true ||
+            inputs.deploy_fork == true
+          )
+        )
+        """.split()
+    )
+
+    assert set(preflight["needs"]) == test_jobs | {"build-and-push"}
+    assert " ".join(preflight_condition.split()) == " ".join(
+        """
+        always() &&
+        !cancelled() &&
+        github.event_name == 'workflow_dispatch' &&
+        inputs.server_maintenance == 'none' &&
+        (
+          inputs.publish_fork_images == true ||
+          inputs.deploy_fork == true
+        ) &&
+        needs.frontend-smoke.result == 'success' &&
+        needs.backend-unit-security.result == 'success' &&
+        needs.sandbox-unit.result == 'success' &&
+        needs.claw-runtime-smoke.result == 'success' &&
+        (
+          (
+            github.repository == 'Simpleyyt/ai-manus' &&
+            needs.build-and-push.result == 'success'
+          ) ||
+          (
+            github.repository != 'Simpleyyt/ai-manus' &&
+            needs.build-and-push.result == 'skipped'
+          )
+        )
+        """.split()
+    )
+
+
 def test_server_datastore_maintenance_is_exact_gated_and_backed_up():
     workflow = yaml.safe_load(
         (PROJECT_ROOT / ".github/workflows/docker-build-and-push.yml").read_text()

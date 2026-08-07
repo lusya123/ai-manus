@@ -1,6 +1,6 @@
 # Pin the verified multi-platform OCI index. Floating `latest` previously moved
-# the Gateway from protocol v3 to v4 without any corresponding plugin change.
-FROM ghcr.io/openclaw/openclaw:2026.6.34@sha256:25f5bacf51742c3231d7dd1d319fede009a9d5aeab8b6232cd309ac6475fe82c
+# the Gateway protocol without a corresponding plugin change.
+FROM ghcr.io/openclaw/openclaw:2026.7.1-2@sha256:8789721d2e9b24b780a1504b56deb4c6bd5c7dbf96a1dd117e7c45c2ed72c8ac
 
 # Switch to root to install plugin dependencies
 USER root

@@ -1,8 +1,6 @@
-import inspect
 import asyncio
 import io
-import time
-import jwt
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -11,51 +9,49 @@ from fastapi import HTTPException
 from starlette.datastructures import UploadFile
 from starlette.websockets import WebSocketDisconnect
 
+from app.application.errors.exceptions import UnauthorizedError
 from app.domain.models.user import User, UserRole
-from app.application.services.auth_service import AuthService
-from app.application.services.token_service import TokenService
-from app.core.config import get_settings
-from app.interfaces.api.claw_routes import (
-    _resolve_ws_user,
-    claw_ws,
-    upload_claw_file,
-)
-
-
-class _RejectedWebSocket:
-    def __init__(self, first_message: dict):
-        self.first_message = first_message
-        self.accepted = False
-        self.closed = None
-
-    async def accept(self):
-        self.accepted = True
-
-    async def receive_json(self):
-        return self.first_message
-
-    async def close(self, code: int, reason: str):
-        self.closed = (code, reason)
+from app.interfaces.api.claw_routes import upload_claw_file
+from app.interfaces.api.ws_routes import claw_ws
+from app.interfaces.dependencies import resolve_ws_user
 
 
 class _ScriptedWebSocket:
-    def __init__(self, messages: list[dict], *, block_when_empty: bool = False):
-        self.messages = list(messages)
+    def __init__(
+        self,
+        messages: list[dict | str | bytes] | None = None,
+        *,
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        block_when_empty: bool = False,
+    ):
+        self.messages = list(messages or [])
+        self.headers = headers or {}
+        self.cookies = cookies or {}
         self.block_when_empty = block_when_empty
         self.accepted = False
         self.closed = None
         self.sent: list[dict] = []
         self._blocked = asyncio.Event()
+        self.receive_cancelled = False
 
     async def accept(self):
         self.accepted = True
 
-    async def receive_json(self):
+    async def receive(self):
         if self.messages:
-            return self.messages.pop(0)
+            message = self.messages.pop(0)
+            if isinstance(message, bytes):
+                return {"type": "websocket.receive", "bytes": message}
+            text = message if isinstance(message, str) else json.dumps(message)
+            return {"type": "websocket.receive", "text": text}
         if self.block_when_empty:
-            await self._blocked.wait()
-            raise AssertionError("blocked receive should be cancelled")
+            try:
+                await self._blocked.wait()
+                raise AssertionError("blocked receive should be cancelled")
+            except asyncio.CancelledError:
+                self.receive_cancelled = True
+                raise
         raise WebSocketDisconnect()
 
     async def send_json(self, payload: dict):
@@ -80,7 +76,6 @@ def _ws_service():
     return SimpleNamespace(
         event_bus=_EventBus(),
         get_pending_content=Mock(return_value=None),
-        get_pending_thinking_content=Mock(return_value=None),
         send_message=AsyncMock(),
         validate_claw_for_chat=AsyncMock(
             return_value=SimpleNamespace(http_base_url="http://resolved-claw")
@@ -105,6 +100,7 @@ def _active_user() -> User:
 def _limited_ws_settings():
     return SimpleNamespace(
         auth_provider="password",
+        session_cookie_name="session_id",
         claw_chat_max_message_bytes=64,
         claw_chat_max_attachments=2,
         claw_chat_max_attachment_bytes=8,
@@ -113,14 +109,70 @@ def _limited_ws_settings():
 
 
 @pytest.mark.asyncio
-async def test_claw_websocket_requires_auth_as_first_frame():
-    websocket = _RejectedWebSocket({"type": "chat", "message": "too early"})
+async def test_claw_websocket_rejects_connection_without_cookie_or_bearer():
+    websocket = _ScriptedWebSocket()
+    auth_service = SimpleNamespace(
+        resolve_credentials=AsyncMock(return_value=None),
+        user_from_resolved=AsyncMock(),
+    )
 
-    await claw_ws(websocket)  # type: ignore[arg-type]
+    with (
+        patch(
+            "app.interfaces.dependencies.get_settings",
+            return_value=_limited_ws_settings(),
+        ),
+        patch(
+            "app.interfaces.dependencies.get_auth_service",
+            return_value=auth_service,
+        ),
+    ):
+        await claw_ws(websocket)  # type: ignore[arg-type]
 
-    assert websocket.accepted is True
+    assert websocket.accepted is False
     assert websocket.closed == (4001, "Unauthorized")
-    assert "token" not in inspect.signature(claw_ws).parameters
+    auth_service.resolve_credentials.assert_awaited_once_with(
+        bearer_token=None,
+        cookie_session_id=None,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("credential_source", ["bearer", "cookie"])
+async def test_resolve_ws_user_accepts_cookie_or_bearer_session(
+    credential_source,
+):
+    session_id = f"{credential_source}-session"
+    websocket = _ScriptedWebSocket(
+        headers=(
+            {"authorization": f"Bearer {session_id}"}
+            if credential_source == "bearer"
+            else None
+        ),
+        cookies=(
+            {"session_id": session_id}
+            if credential_source == "cookie"
+            else None
+        ),
+    )
+    user = _active_user()
+    resolved = object()
+    auth_service = SimpleNamespace(
+        resolve_credentials=AsyncMock(return_value=resolved),
+        user_from_resolved=AsyncMock(return_value=user),
+    )
+
+    with patch(
+        "app.interfaces.dependencies.get_settings",
+        return_value=_limited_ws_settings(),
+    ):
+        result = await resolve_ws_user(websocket, auth_service)  # type: ignore[arg-type]
+
+    assert result == user
+    auth_service.resolve_credentials.assert_awaited_once_with(
+        bearer_token=session_id if credential_source == "bearer" else None,
+        cookie_session_id=session_id if credential_source == "cookie" else None,
+    )
+    auth_service.user_from_resolved.assert_awaited_once_with(resolved)
 
 
 @pytest.mark.asyncio
@@ -132,59 +184,21 @@ async def test_claw_websocket_rejects_inactive_user():
         role=UserRole.USER,
         is_active=False,
     )
-    auth_service = SimpleNamespace(verify_token=AsyncMock(return_value=inactive))
-
-    with (
-        patch(
-            "app.interfaces.api.claw_routes.get_settings",
-            return_value=SimpleNamespace(auth_provider="password"),
-        ),
-        patch("app.interfaces.dependencies.get_auth_service", return_value=auth_service),
-    ):
-        with pytest.raises(ValueError, match="Authentication failed"):
-            await _resolve_ws_user("primary-token")
-
-
-@pytest.mark.asyncio
-async def test_claw_websocket_marks_already_expired_signed_token_refreshable():
-    secret = "expired-claw-ws-test-secret-at-least-32-bytes"
-    expired_token = jwt.encode(
-        {
-            "sub": "user-1",
-            "type": "access",
-            "exp": int(time.time()) - 1,
-        },
-        secret,
-        algorithm="HS256",
+    websocket = _ScriptedWebSocket(
+        headers={"authorization": "Bearer disabled-session"}
     )
-    websocket = _RejectedWebSocket({
-        "type": "auth",
-        "token": expired_token,
-    })
+    resolved = object()
     auth_service = SimpleNamespace(
-        token_service=SimpleNamespace(
-            settings=SimpleNamespace(
-                jwt_secret_key=secret,
-                jwt_algorithm="HS256",
-            )
-        ),
-        verify_token=AsyncMock(),
+        resolve_credentials=AsyncMock(return_value=resolved),
+        user_from_resolved=AsyncMock(return_value=inactive),
     )
 
-    with (
-        patch(
-            "app.interfaces.api.claw_routes.get_settings",
-            return_value=SimpleNamespace(auth_provider="password"),
-        ),
-        patch(
-            "app.interfaces.dependencies.get_auth_service",
-            return_value=auth_service,
-        ),
+    with patch(
+        "app.interfaces.dependencies.get_settings",
+        return_value=_limited_ws_settings(),
     ):
-        await claw_ws(websocket)  # type: ignore[arg-type]
-
-    assert websocket.closed == (4002, "Authentication expired")
-    auth_service.verify_token.assert_not_awaited()
+        with pytest.raises(UnauthorizedError, match="Invalid token"):
+            await resolve_ws_user(websocket, auth_service)  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
@@ -194,183 +208,127 @@ async def test_claw_websocket_rechecks_revocation_and_disabled_state_per_chat(
 ):
     active = _active_user()
     disabled = active.model_copy(update={"is_active": False})
-    next_result = disabled if revoked_or_disabled == "disabled" else None
-    auth_service = SimpleNamespace(
-        verify_token=AsyncMock(side_effect=[active, next_result]),
-        token_service=SimpleNamespace(
-            verify_token=Mock(
-                return_value={"type": "access", "exp": time.time() + 60}
-            )
-        ),
+    next_result = (
+        disabled
+        if revoked_or_disabled == "disabled"
+        else UnauthorizedError("Authentication required")
     )
+    resolve_user = AsyncMock(side_effect=[active, next_result])
     service = _ws_service()
     websocket = _ScriptedWebSocket(
-        [
-            {"type": "auth", "token": "primary-token"},
-            {"type": "chat", "message": "must not run"},
-        ]
+        [{"type": "chat", "message": "must not run"}],
+        headers={"authorization": "Bearer opaque-session"},
     )
 
     with (
         patch(
-            "app.interfaces.api.claw_routes.get_settings",
-            return_value=SimpleNamespace(auth_provider="password"),
+            "app.interfaces.api.ws_routes.resolve_ws_user",
+            resolve_user,
         ),
         patch(
-            "app.interfaces.dependencies.get_auth_service",
-            return_value=auth_service,
+            "app.interfaces.api.ws_routes.get_settings",
+            return_value=_limited_ws_settings(),
         ),
         patch(
-            "app.interfaces.api.claw_routes.get_claw_service",
+            "app.interfaces.api.ws_routes.get_claw_service",
             return_value=service,
         ),
         patch(
-            "app.interfaces.api.claw_routes.get_file_service",
+            "app.interfaces.api.ws_routes.get_file_service",
             return_value=SimpleNamespace(),
         ),
     ):
         await asyncio.wait_for(claw_ws(websocket), timeout=1)  # type: ignore[arg-type]
 
-    assert websocket.sent == [{"type": "auth_ack"}]
+    assert websocket.accepted is True
     assert websocket.closed == (4001, "Unauthorized")
     service.send_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_claw_websocket_closes_when_short_lived_token_expires():
+async def test_claw_idle_watchdog_rechecks_revoked_session_and_cancels_io():
     active = _active_user()
-    auth_service = SimpleNamespace(
-        verify_token=AsyncMock(return_value=active),
-        token_service=SimpleNamespace(
-            verify_token=Mock(
-                return_value={"type": "access", "exp": time.time() + 0.05}
-            )
-        ),
+    resolve_user = AsyncMock(
+        side_effect=[active, UnauthorizedError("revoked details")]
     )
     service = _ws_service()
     websocket = _ScriptedWebSocket(
-        [{"type": "auth", "token": "short-lived-token"}],
+        headers={"authorization": "Bearer opaque-session"},
         block_when_empty=True,
     )
 
     with (
+        patch("app.interfaces.api.ws_routes.resolve_ws_user", resolve_user),
         patch(
-            "app.interfaces.api.claw_routes.get_settings",
-            return_value=SimpleNamespace(auth_provider="password"),
+            "app.interfaces.api.ws_routes.get_settings",
+            return_value=_limited_ws_settings(),
         ),
         patch(
-            "app.interfaces.dependencies.get_auth_service",
-            return_value=auth_service,
-        ),
-        patch(
-            "app.interfaces.api.claw_routes.get_claw_service",
+            "app.interfaces.api.ws_routes.get_claw_service",
             return_value=service,
         ),
         patch(
-            "app.interfaces.api.claw_routes.get_file_service",
+            "app.interfaces.api.ws_routes.get_file_service",
             return_value=SimpleNamespace(),
         ),
+        patch("app.interfaces.api.ws_routes.WS_AUTH_WATCHDOG_SECONDS", 0),
     ):
         await asyncio.wait_for(claw_ws(websocket), timeout=1)  # type: ignore[arg-type]
 
-    assert websocket.sent == [{"type": "auth_ack"}]
-    assert websocket.closed == (4002, "Authentication expired")
+    assert resolve_user.await_count == 2
+    assert websocket.closed == (4001, "Unauthorized")
+    assert websocket.receive_cancelled is True
+    service.send_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_claw_websocket_reconnect_reconciles_completed_turn_to_idle():
-    active = _active_user()
-    auth_service = SimpleNamespace(
-        verify_token=AsyncMock(return_value=active),
-        token_service=SimpleNamespace(
-            verify_token=Mock(
-                return_value={"type": "access", "exp": time.time() + 0.05}
-            )
+@pytest.mark.parametrize(
+    ("raw_frame", "expected_close"),
+    [
+        pytest.param(
+            json.dumps({"type": "noop", "unknown": "x" * (129 * 1024)}),
+            (1009, "Message too large"),
+            id="oversized-unknown-field",
         ),
-    )
+        pytest.param(
+            "[" * 100 + "0" + "]" * 100,
+            (1003, "Invalid JSON"),
+            id="excessive-json-depth",
+        ),
+    ],
+)
+async def test_claw_rejects_oversized_or_deep_json_before_dispatch(
+    raw_frame, expected_close
+):
+    active = _active_user()
     service = _ws_service()
-    service.is_processing = Mock(return_value=False)
     websocket = _ScriptedWebSocket(
-        [{"type": "auth", "token": "reconnect-token"}],
-        block_when_empty=True,
+        [raw_frame],
+        headers={"authorization": "Bearer opaque-session"},
     )
 
     with (
         patch(
-            "app.interfaces.api.claw_routes.get_settings",
-            return_value=SimpleNamespace(auth_provider="password"),
+            "app.interfaces.api.ws_routes.resolve_ws_user",
+            new=AsyncMock(return_value=active),
         ),
         patch(
-            "app.interfaces.dependencies.get_auth_service",
-            return_value=auth_service,
+            "app.interfaces.api.ws_routes.get_settings",
+            return_value=_limited_ws_settings(),
         ),
         patch(
-            "app.interfaces.api.claw_routes.get_claw_service",
+            "app.interfaces.api.ws_routes.get_claw_service",
             return_value=service,
         ),
         patch(
-            "app.interfaces.api.claw_routes.get_file_service",
+            "app.interfaces.api.ws_routes.get_file_service",
             return_value=SimpleNamespace(),
         ),
     ):
         await asyncio.wait_for(claw_ws(websocket), timeout=1)  # type: ignore[arg-type]
 
-    assert websocket.sent[:2] == [
-        {"type": "auth_ack"},
-        {"type": "done", "stop_reason": "idle"},
-    ]
-    assert websocket.closed == (4002, "Authentication expired")
-
-
-@pytest.mark.asyncio
-async def test_claw_websocket_reconnect_uses_terminal_latch_after_missed_fanout():
-    active = _active_user()
-    auth_service = SimpleNamespace(
-        verify_token=AsyncMock(return_value=active),
-        token_service=SimpleNamespace(
-            verify_token=Mock(
-                return_value={"type": "access", "exp": time.time() + 0.05}
-            )
-        ),
-    )
-    service = _ws_service()
-    service.get_pending_content = Mock(return_value="final answer")
-    service.get_terminal_event = Mock(return_value={
-        "type": "done",
-        "stop_reason": "end_turn",
-    })
-    service.is_processing = Mock(return_value=True)
-    websocket = _ScriptedWebSocket(
-        [{"type": "auth", "token": "reconnect-token"}],
-        block_when_empty=True,
-    )
-
-    with (
-        patch(
-            "app.interfaces.api.claw_routes.get_settings",
-            return_value=SimpleNamespace(auth_provider="password"),
-        ),
-        patch(
-            "app.interfaces.dependencies.get_auth_service",
-            return_value=auth_service,
-        ),
-        patch(
-            "app.interfaces.api.claw_routes.get_claw_service",
-            return_value=service,
-        ),
-        patch(
-            "app.interfaces.api.claw_routes.get_file_service",
-            return_value=SimpleNamespace(),
-        ),
-    ):
-        await asyncio.wait_for(claw_ws(websocket), timeout=1)  # type: ignore[arg-type]
-
-    assert websocket.sent[:3] == [
-        {"type": "auth_ack"},
-        {"type": "catchup", "content": "final answer"},
-        {"type": "done", "stop_reason": "end_turn"},
-    ]
-    assert websocket.closed == (4002, "Authentication expired")
+    assert websocket.closed == expected_close
+    service.send_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -404,58 +362,39 @@ async def test_claw_websocket_rejects_unbounded_chat_inputs(
     expected_error,
 ):
     active = _active_user()
-    auth_service = SimpleNamespace(
-        verify_token=AsyncMock(return_value=active),
-        token_service=SimpleNamespace(
-            verify_token=Mock(
-                return_value={"type": "access", "exp": time.time() + 60}
-            )
-        ),
-    )
     service = _ws_service()
     websocket = _ScriptedWebSocket(
-        [
-            {"type": "auth", "token": "primary-token"},
-            chat_frame,
-        ]
+        [chat_frame],
+        headers={"authorization": "Bearer opaque-session"},
     )
 
     with (
         patch(
-            "app.interfaces.api.claw_routes.get_settings",
+            "app.interfaces.api.ws_routes.resolve_ws_user",
+            new=AsyncMock(return_value=active),
+        ),
+        patch(
+            "app.interfaces.api.ws_routes.get_settings",
             return_value=_limited_ws_settings(),
         ),
         patch(
-            "app.interfaces.dependencies.get_auth_service",
-            return_value=auth_service,
-        ),
-        patch(
-            "app.interfaces.api.claw_routes.get_claw_service",
+            "app.interfaces.api.ws_routes.get_claw_service",
             return_value=service,
         ),
         patch(
-            "app.interfaces.api.claw_routes.get_file_service",
+            "app.interfaces.api.ws_routes.get_file_service",
             return_value=SimpleNamespace(),
         ),
     ):
         await asyncio.wait_for(claw_ws(websocket), timeout=1)  # type: ignore[arg-type]
 
-    assert websocket.sent[0] == {"type": "auth_ack"}
-    assert expected_error in websocket.sent[1]["error"]
+    assert expected_error in websocket.sent[0]["error"]
     service.send_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_claw_websocket_rejects_large_attachment_before_reading_it():
     active = _active_user()
-    auth_service = SimpleNamespace(
-        verify_token=AsyncMock(return_value=active),
-        token_service=SimpleNamespace(
-            verify_token=Mock(
-                return_value={"type": "access", "exp": time.time() + 60}
-            )
-        ),
-    )
     stream = SimpleNamespace(read=Mock(side_effect=AssertionError("must not read")))
     file_service = SimpleNamespace(
         download_file=AsyncMock(
@@ -471,27 +410,25 @@ async def test_claw_websocket_rejects_large_attachment_before_reading_it():
     )
     service = _ws_service()
     websocket = _ScriptedWebSocket(
-        [
-            {"type": "auth", "token": "primary-token"},
-            {"type": "chat", "message": "inspect", "file_ids": ["file-1"]},
-        ]
+        [{"type": "chat", "message": "inspect", "file_ids": ["file-1"]}],
+        headers={"authorization": "Bearer opaque-session"},
     )
 
     with (
         patch(
-            "app.interfaces.api.claw_routes.get_settings",
+            "app.interfaces.api.ws_routes.resolve_ws_user",
+            new=AsyncMock(return_value=active),
+        ),
+        patch(
+            "app.interfaces.api.ws_routes.get_settings",
             return_value=_limited_ws_settings(),
         ),
         patch(
-            "app.interfaces.dependencies.get_auth_service",
-            return_value=auth_service,
-        ),
-        patch(
-            "app.interfaces.api.claw_routes.get_claw_service",
+            "app.interfaces.api.ws_routes.get_claw_service",
             return_value=service,
         ),
         patch(
-            "app.interfaces.api.claw_routes.get_file_service",
+            "app.interfaces.api.ws_routes.get_file_service",
             return_value=file_service,
         ),
     ):
@@ -505,14 +442,6 @@ async def test_claw_websocket_rejects_large_attachment_before_reading_it():
 @pytest.mark.asyncio
 async def test_claw_attachment_uses_owner_resolved_runtime_address():
     active = _active_user()
-    auth_service = SimpleNamespace(
-        verify_token=AsyncMock(return_value=active),
-        token_service=SimpleNamespace(
-            verify_token=Mock(
-                return_value={"type": "access", "exp": time.time() + 60}
-            )
-        ),
-    )
     file_service = SimpleNamespace(
         download_file=AsyncMock(
             return_value=(
@@ -530,10 +459,8 @@ async def test_claw_attachment_uses_owner_resolved_runtime_address():
         http_base_url="http://stale-claw"
     )
     websocket = _ScriptedWebSocket(
-        [
-            {"type": "auth", "token": "primary-token"},
-            {"type": "chat", "message": "inspect", "file_ids": ["file-1"]},
-        ]
+        [{"type": "chat", "message": "inspect", "file_ids": ["file-1"]}],
+        headers={"authorization": "Bearer opaque-session"},
     )
     posted_urls: list[str] = []
     settings = _limited_ws_settings()
@@ -559,23 +486,23 @@ async def test_claw_attachment_uses_owner_resolved_runtime_address():
 
     with (
         patch(
-            "app.interfaces.api.claw_routes.get_settings",
+            "app.interfaces.api.ws_routes.resolve_ws_user",
+            new=AsyncMock(return_value=active),
+        ),
+        patch(
+            "app.interfaces.api.ws_routes.get_settings",
             return_value=settings,
         ),
         patch(
-            "app.interfaces.dependencies.get_auth_service",
-            return_value=auth_service,
-        ),
-        patch(
-            "app.interfaces.api.claw_routes.get_claw_service",
+            "app.interfaces.api.ws_routes.get_claw_service",
             return_value=service,
         ),
         patch(
-            "app.interfaces.api.claw_routes.get_file_service",
+            "app.interfaces.api.ws_routes.get_file_service",
             return_value=file_service,
         ),
         patch(
-            "app.interfaces.api.claw_routes.httpx.AsyncClient",
+            "app.interfaces.api.ws_routes.httpx.AsyncClient",
             return_value=Client(),
         ),
     ):
@@ -613,46 +540,3 @@ async def test_claw_capability_upload_rejects_oversized_file():
 
     assert exc_info.value.status_code == 413
     file_service.upload_file.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_password_logout_revokes_token_used_by_open_websocket(monkeypatch):
-    monkeypatch.setenv("AUTH_PROVIDER", "password")
-    monkeypatch.setenv("API_KEY", "test-model-key")
-    monkeypatch.setenv(
-        "JWT_SECRET_KEY", "claw-ws-revocation-test-secret-at-least-32-bytes"
-    )
-    get_settings.cache_clear()
-
-    user = _active_user()
-
-    class _UserRepository:
-        async def get_user_by_id(self, user_id: str):
-            return user if user_id == user.id else None
-
-    class _Redis:
-        def __init__(self):
-            self.values: dict[str, str] = {}
-
-        async def set(self, key, value, ex=None):
-            self.values[key] = value
-            return True
-
-        async def exists(self, key):
-            return int(key in self.values)
-
-        async def get(self, key):
-            return self.values.get(key)
-
-    redis = _Redis()
-    monkeypatch.setattr(
-        "app.infrastructure.storage.redis.get_redis",
-        lambda: SimpleNamespace(client=redis),
-    )
-    token_service = TokenService()
-    auth_service = AuthService(_UserRepository(), token_service)
-    token = token_service.create_access_token(user)
-
-    assert await auth_service.verify_token(token) == user
-    assert await auth_service.logout(token) is True
-    assert await auth_service.verify_token(token) is None

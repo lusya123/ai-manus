@@ -1,20 +1,13 @@
 from fastapi import (
     APIRouter,
     Depends,
-    WebSocket,
-    WebSocketDisconnect,
     Query,
     Request,
     Response,
     HTTPException,
 )
 from fastapi.responses import StreamingResponse
-from sse_starlette.sse import EventSourceResponse
-from typing import AsyncGenerator, List, Optional
-from sse_starlette.event import ServerSentEvent
-from datetime import UTC, datetime
-import asyncio
-import websockets
+from typing import List, Optional
 import logging
 import httpx
 import re
@@ -24,22 +17,33 @@ from app.interfaces.dependencies import get_file_service
 
 from app.application.services.agent_service import AgentService
 from app.application.services.token_service import TokenService
-from app.application.errors.exceptions import NotFoundError, UnauthorizedError
+from app.application.errors.exceptions import NotFoundError, UnauthorizedError, BadRequestError
 from app.core.config import get_settings
-from app.interfaces.dependencies import get_agent_service, get_current_user, get_optional_current_user, get_token_service, verify_signature, verify_signature_websocket
+from app.interfaces.dependencies import (
+    get_agent_service,
+    get_current_user,
+    get_optional_current_user,
+    get_token_service,
+    verify_signature,
+)
 from app.interfaces.schemas.base import APIResponse
 from app.interfaces.schemas.session import (
-    ChatRequest, ShellViewRequest, CreateSessionResponse, GetSessionResponse,
+    ShellViewRequest, CreateSessionResponse, GetSessionResponse,
     ListSessionItem, ListSessionResponse, ShellViewResponse,
     ShareSessionResponse, SharedSessionResponse, PreviewUrlRequest,
     CreateSessionRequest, AgentModelConfigResponse,
+    UpdateSessionTitleRequest, UpdateSessionTitleResponse,
+    FavoriteSessionResponse, PinSessionRequest, PinSessionResponse,
+    MoveSessionProjectRequest, MoveSessionProjectResponse,
+    UpdateSessionTaskModeRequest, UpdateSessionTaskModeResponse,
+    LibraryFileItem, LibraryResponse,
 )
 from app.interfaces.schemas.file import (
     FileViewRequest,
     FileViewResponse,
     SharedFileInfoResponse,
 )
-from app.interfaces.schemas.resource import AccessTokenRequest, SignedUrlResponse
+from app.interfaces.schemas.resource import SignedUrlResponse
 from app.interfaces.schemas.event import EventMapper
 from app.domain.models.file import FileInfo
 from app.domain.models.event import BrowserToolContent, MessageEvent, ToolEvent
@@ -49,7 +53,6 @@ from app.domain.models.user import User
 from app.domain.utils.error_reporting import safe_exception_summary
 
 logger = logging.getLogger(__name__)
-SESSION_POLL_INTERVAL = 5
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 
@@ -382,9 +385,13 @@ async def get_session(
         session_id=session.id,
         title=session.title,
         status=effective_status,
-        events=await EventMapper.events_to_sse_events(session.events),
+        events=await EventMapper.events_to_stream_events(session.events),
         is_shared=session.is_shared,
         agent_model_config=model_config,
+        is_favorite=session.is_favorite,
+        is_pinned=session.is_pinned,
+        project_id=session.project_id,
+        task_mode=session.task_mode,
     ))
 
 @router.delete("/{session_id}", response_model=APIResponse[None])
@@ -395,6 +402,79 @@ async def delete_session(
 ) -> APIResponse[None]:
     await agent_service.delete_session(session_id, current_user.id)
     return APIResponse.success()
+
+@router.patch("/{session_id}/title", response_model=APIResponse[UpdateSessionTitleResponse])
+async def update_session_title(
+    session_id: str,
+    request: UpdateSessionTitleRequest,
+    current_user: User = Depends(get_current_user),
+    agent_service: AgentService = Depends(get_agent_service)
+) -> APIResponse[UpdateSessionTitleResponse]:
+    title = request.title.strip()
+    if not title:
+        raise BadRequestError("Title cannot be empty")
+    await agent_service.update_session_title(session_id, current_user.id, title)
+    return APIResponse.success(UpdateSessionTitleResponse(session_id=session_id, title=title))
+
+@router.post("/{session_id}/favorite", response_model=APIResponse[FavoriteSessionResponse])
+async def favorite_session(
+    session_id: str,
+    current_user: User = Depends(get_current_user),
+    agent_service: AgentService = Depends(get_agent_service)
+) -> APIResponse[FavoriteSessionResponse]:
+    await agent_service.update_session_favorite(session_id, current_user.id, True)
+    return APIResponse.success(FavoriteSessionResponse(session_id=session_id, is_favorite=True))
+
+@router.delete("/{session_id}/favorite", response_model=APIResponse[FavoriteSessionResponse])
+async def unfavorite_session(
+    session_id: str,
+    current_user: User = Depends(get_current_user),
+    agent_service: AgentService = Depends(get_agent_service)
+) -> APIResponse[FavoriteSessionResponse]:
+    await agent_service.update_session_favorite(session_id, current_user.id, False)
+    return APIResponse.success(FavoriteSessionResponse(session_id=session_id, is_favorite=False))
+
+@router.post("/{session_id}/pin", response_model=APIResponse[PinSessionResponse])
+async def pin_session(
+    session_id: str,
+    request: PinSessionRequest,
+    current_user: User = Depends(get_current_user),
+    agent_service: AgentService = Depends(get_agent_service)
+) -> APIResponse[PinSessionResponse]:
+    await agent_service.update_session_pin(session_id, current_user.id, request.is_pinned)
+    return APIResponse.success(PinSessionResponse(session_id=session_id, is_pinned=request.is_pinned))
+
+@router.patch("/{session_id}/project", response_model=APIResponse[MoveSessionProjectResponse])
+async def move_session_project(
+    session_id: str,
+    request: MoveSessionProjectRequest,
+    current_user: User = Depends(get_current_user),
+    agent_service: AgentService = Depends(get_agent_service),
+) -> APIResponse[MoveSessionProjectResponse]:
+    if request.project_id:
+        from app.interfaces.dependencies import get_project_service
+        project_service = get_project_service()
+        await project_service.get_project(request.project_id, current_user.id)
+    await agent_service.update_session_project(session_id, current_user.id, request.project_id)
+    return APIResponse.success(MoveSessionProjectResponse(
+        session_id=session_id,
+        project_id=request.project_id,
+    ))
+
+@router.patch("/{session_id}/mode", response_model=APIResponse[UpdateSessionTaskModeResponse])
+async def update_session_task_mode(
+    session_id: str,
+    request: UpdateSessionTaskModeRequest,
+    current_user: User = Depends(get_current_user),
+    agent_service: AgentService = Depends(get_agent_service),
+) -> APIResponse[UpdateSessionTaskModeResponse]:
+    await agent_service.update_session_task_mode(
+        session_id, current_user.id, request.task_mode.value
+    )
+    return APIResponse.success(UpdateSessionTaskModeResponse(
+        session_id=session_id,
+        task_mode=request.task_mode,
+    ))
 
 @router.post("/{session_id}/stop", response_model=APIResponse[None])
 async def stop_session(
@@ -422,90 +502,6 @@ async def get_all_sessions(
     summaries = await agent_service.get_all_sessions(current_user.id)
     session_items = [ListSessionItem.from_domain(s) for s in summaries]
     return APIResponse.success(ListSessionResponse(sessions=session_items))
-
-@router.post("")
-async def stream_sessions(
-    current_user: User = Depends(get_current_user),
-    agent_service: AgentService = Depends(get_agent_service)
-) -> EventSourceResponse:
-    async def event_generator() -> AsyncGenerator[ServerSentEvent, None]:
-        while True:
-            summaries = await agent_service.get_all_sessions(current_user.id)
-            session_items = [ListSessionItem.from_domain(s) for s in summaries]
-            yield ServerSentEvent(
-                event="sessions",
-                data=ListSessionResponse(sessions=session_items).model_dump_json()
-            )
-            await asyncio.sleep(SESSION_POLL_INTERVAL)
-    return EventSourceResponse(event_generator())
-
-@router.post("/{session_id}/chat")
-async def chat(
-    session_id: str,
-    request: ChatRequest,
-    current_user: User = Depends(get_current_user),
-    agent_service: AgentService = Depends(get_agent_service)
-) -> EventSourceResponse:
-    timestamp = (
-        datetime.fromtimestamp(request.timestamp, UTC)
-        if request.timestamp
-        else None
-    )
-    attachments = (
-        [attachment.to_domain() for attachment in request.attachments]
-        if request.attachments
-        else None
-    )
-    accepted_submission = None
-    has_new_submission = bool(request.message) or bool(attachments)
-    if has_new_submission:
-        # Acceptance/409/429/503 happens before SSE response headers. Retrying
-        # the same UUID after a lost response is therefore safe and resumable.
-        accepted_submission = await agent_service.accept_chat_submission(
-            session_id=session_id,
-            user_id=current_user.id,
-            submission_id=str(request.submission_id),
-            message=request.message or "",
-            timestamp=timestamp,
-            attachments=attachments,
-        )
-
-    async def event_generator() -> AsyncGenerator[ServerSentEvent, None]:
-        async for event in agent_service.chat(
-            session_id=session_id,
-            user_id=current_user.id,
-            message=request.message,
-            timestamp=timestamp,
-            event_id=request.event_id,
-            attachments=attachments,
-            submission_id=(
-                str(request.submission_id) if request.submission_id else None
-            ),
-            accepted_submission=accepted_submission,
-        ):
-            logger.debug(
-                "Received chat event: session_id=%s type=%s",
-                session_id,
-                type(event).__name__,
-            )
-            sse_event = await EventMapper.event_to_sse_event(event)
-            logger.debug(
-                "Mapped chat event: session_id=%s event=%s",
-                session_id,
-                sse_event.event if sse_event else "ignored",
-            )
-            if sse_event:
-                yield ServerSentEvent(
-                    event=sse_event.event,
-                    data=sse_event.data.model_dump_json() if sse_event.data else None,
-                    id=(
-                        sse_event.data.transport_cursor
-                        if sse_event.data
-                        else None
-                    ),
-                )
-
-    return EventSourceResponse(event_generator())
 
 @router.post("/{session_id}/shell")
 async def view_shell(
@@ -549,99 +545,6 @@ async def view_file(
     result = await agent_service.file_view(session_id, request.file, current_user.id)
     return APIResponse.success(result)
 
-@router.websocket("/{session_id}/vnc")
-async def vnc_websocket(
-    websocket: WebSocket,
-    session_id: str,
-    signature: str = Depends(verify_signature_websocket),
-    agent_service: AgentService = Depends(get_agent_service)
-) -> None:
-    """VNC WebSocket endpoint (binary mode)
-    
-    Establishes a connection with the VNC WebSocket service in the sandbox environment and forwards data bidirectionally
-    Supports authentication via signed URL with signature verification
-    
-    Args:
-        websocket: WebSocket connection
-        session_id: Session ID
-        signature: Verified signature from dependency injection
-    """
-    
-    await websocket.accept(subprotocol="binary")
-    logger.info(f"Accepted WebSocket connection for session {session_id}")
-    
-    try:
-        # Get sandbox environment address with user validation
-        sandbox_ws_url = await agent_service.get_vnc_url(session_id)
-
-        # AgentBay gateway URLs contain short-lived bearer capabilities. Never
-        # persist the resolved VNC URL in logs.
-        logger.info("Connecting to sandbox VNC WebSocket for session %s", session_id)
-    
-        # Connect to sandbox WebSocket
-        async with websockets.connect(sandbox_ws_url) as sandbox_ws:
-            logger.info("Connected to sandbox VNC WebSocket for session %s", session_id)
-            # Create two tasks to forward data bidirectionally
-            async def forward_to_sandbox():
-                try:
-                    while True:
-                        data = await websocket.receive_bytes()
-                        await sandbox_ws.send(data)
-                except WebSocketDisconnect:
-                    logger.info("Web -> VNC connection closed")
-                    pass
-                except Exception as e:
-                    logger.error(
-                        "Error forwarding data to sandbox: %s",
-                        safe_exception_summary(e),
-                    )
-            
-            async def forward_from_sandbox():
-                try:
-                    while True:
-                        data = await sandbox_ws.recv()
-                        await websocket.send_bytes(data)
-                except websockets.exceptions.ConnectionClosed:
-                    logger.info("VNC -> Web connection closed")
-                    pass
-                except Exception as e:
-                    logger.error(
-                        "Error forwarding data from sandbox: %s",
-                        safe_exception_summary(e),
-                    )
-            
-            # Run two forwarding tasks concurrently
-            forward_task1 = asyncio.create_task(forward_to_sandbox())
-            forward_task2 = asyncio.create_task(forward_from_sandbox())
-            forward_tasks = (forward_task1, forward_task2)
-            try:
-                # Wait for either task to complete (meaning connection closed).
-                await asyncio.wait(
-                    forward_tasks,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                logger.info("WebSocket connection closed")
-            finally:
-                # Parent cancellation must not strand the opposite direction's
-                # socket read. Observe both task outcomes before the upstream
-                # WebSocket context is allowed to close.
-                for task in forward_tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*forward_tasks, return_exceptions=True)
-    
-    except ConnectionError as e:
-        summary = safe_exception_summary(e)
-        logger.error("Unable to connect to sandbox environment: %s", summary)
-        await websocket.close(
-            code=1011,
-            reason=f"Unable to connect to sandbox environment: {summary}",
-        )
-    except Exception as e:
-        summary = safe_exception_summary(e)
-        logger.error("WebSocket error: %s", summary)
-        await websocket.close(code=1011, reason=f"WebSocket error: {summary}")
-
 @router.get("/{session_id}/files")
 async def get_session_files(
     session_id: str,
@@ -650,45 +553,6 @@ async def get_session_files(
 ) -> APIResponse[List[FileInfo]]:
     files = await agent_service.get_session_files(session_id, current_user.id)
     return APIResponse.success(files)
-
-
-@router.post("/{session_id}/vnc/signed-url", response_model=APIResponse[SignedUrlResponse])
-async def create_vnc_signed_url(
-    session_id: str,
-    request_data: AccessTokenRequest,
-    current_user: User = Depends(get_current_user),
-    agent_service: AgentService = Depends(get_agent_service),
-    token_service: TokenService = Depends(get_token_service)
-) -> APIResponse[SignedUrlResponse]:
-    """Generate signed URL for VNC WebSocket access
-    
-    This endpoint creates a signed URL that allows temporary access to the VNC
-    WebSocket for a specific session without requiring authentication headers.
-    """
-    
-    # Validate expiration time (max 15 minutes)
-    expire_minutes = request_data.expire_minutes
-    if expire_minutes > 15:
-        expire_minutes = 15
-    
-    # Check if session exists and belongs to user
-    session = await agent_service.get_session(session_id, current_user.id)
-    if not session:
-        raise NotFoundError("Session not found")
-    
-    # Create signed URL for VNC WebSocket
-    ws_base_url = f"/api/v1/sessions/{session_id}/vnc"
-    signed_url = token_service.create_signed_url(
-        base_url=ws_base_url,
-        expire_minutes=expire_minutes
-    )
-    
-    logger.info(f"Created signed URL for VNC access for user {current_user.id}, session {session_id}")
-    
-    return APIResponse.success(SignedUrlResponse(
-        signed_url=signed_url,
-        expires_in=expire_minutes * 60,
-    ))
 
 
 @router.post("/{session_id}/preview-url", response_model=APIResponse[SignedUrlResponse])
@@ -914,7 +778,6 @@ async def proxy_preview(
         media_type=content_type.split(";", 1)[0] if content_type else None,
     )
 
-
 @router.post("/{session_id}/share", response_model=APIResponse[ShareSessionResponse])
 async def share_session(
     session_id: str,
@@ -1030,7 +893,7 @@ async def get_shared_session(
         session_id=session.id,
         title=session.title,
         status=session.status,
-        events=await EventMapper.events_to_shared_sse_events(
+        events=await EventMapper.events_to_shared_stream_events(
             session.events,
             session_id=session.id,
             share_epoch=session.share_epoch,

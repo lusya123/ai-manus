@@ -1,6 +1,7 @@
 import asyncio
 from types import SimpleNamespace
 import io
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -25,8 +26,8 @@ from app.interfaces.api.session_routes import (
     download_shared_session_file,
     get_shared_session_files,
     proxy_preview,
-    vnc_websocket,
 )
+from app.interfaces.api.ws_routes import vnc_ws
 from app.domain.models.file import FileInfo
 from app.interfaces.schemas.session import PreviewUrlRequest
 from app.interfaces.api.session_routes import router as session_router
@@ -565,7 +566,9 @@ async def test_preview_route_rejects_double_encoded_traversal_before_sandbox():
     assert response.status_code == 400
 
 
-async def test_vnc_exception_never_logs_or_returns_capability_url(caplog):
+async def test_vnc_exception_never_logs_or_returns_capability_url(
+    monkeypatch, caplog
+):
     secret = "vnc-secret-capability"
 
     class WebSocketStub:
@@ -576,19 +579,28 @@ async def test_vnc_exception_never_logs_or_returns_capability_url(caplog):
             self.close_args = kwargs
 
     class AgentServiceStub:
+        async def get_session(self, session_id, user_id):
+            return SimpleNamespace(id=session_id, user_id=user_id)
+
         async def get_vnc_url(self, session_id):
             raise RuntimeError(
                 f"failed wss://gateway.example/vnc?signature={secret}"
             )
 
+    async def resolve_user(_websocket):
+        return SimpleNamespace(id="user-1", is_active=True)
+
+    monkeypatch.setattr(
+        "app.interfaces.api.ws_routes.resolve_ws_user", resolve_user
+    )
+    monkeypatch.setattr(
+        "app.interfaces.api.ws_routes.get_agent_service",
+        lambda: AgentServiceStub(),
+    )
+
     websocket = WebSocketStub()
     with caplog.at_level("ERROR"):
-        await vnc_websocket(
-            websocket=websocket,
-            session_id="session-1",
-            signature="verified",
-            agent_service=AgentServiceStub(),
-        )
+        await vnc_ws(websocket=websocket, session_id="session-1")
 
     assert secret not in caplog.text
     assert "signature=" not in caplog.text
@@ -635,22 +647,110 @@ async def test_vnc_awaits_cancelled_opposite_forwarder(monkeypatch):
             return False
 
     monkeypatch.setattr(
-        "app.interfaces.api.session_routes.websockets.connect",
+        "app.interfaces.api.ws_routes.websockets.connect",
         lambda _url: Connection(),
     )
 
     class AgentServiceStub:
+        async def get_session(self, session_id, user_id):
+            return SimpleNamespace(id=session_id, user_id=user_id)
+
         async def get_vnc_url(self, session_id):
             return "ws://sandbox.example/vnc"
 
-    await vnc_websocket(
-        websocket=WebSocketStub(),
-        session_id="session-1",
-        signature="verified",
-        agent_service=AgentServiceStub(),
+    async def resolve_user(_websocket):
+        return SimpleNamespace(id="user-1", is_active=True)
+
+    monkeypatch.setattr(
+        "app.interfaces.api.ws_routes.resolve_ws_user", resolve_user
+    )
+    monkeypatch.setattr(
+        "app.interfaces.api.ws_routes.get_agent_service",
+        lambda: AgentServiceStub(),
     )
 
+    await vnc_ws(websocket=WebSocketStub(), session_id="session-1")
+
     assert cancelled_cleanup_finished.is_set()
+
+
+async def test_vnc_auth_watchdog_closes_and_cancels_both_forwarders(monkeypatch):
+    browser_forwarder_cancelled = asyncio.Event()
+    sandbox_forwarder_cancelled = asyncio.Event()
+
+    class WebSocketStub:
+        headers = {"authorization": "Bearer opaque-session"}
+        cookies = {}
+
+        def __init__(self):
+            self.closed = None
+
+        async def accept(self, **_kwargs):
+            return None
+
+        async def receive_bytes(self):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                browser_forwarder_cancelled.set()
+
+        async def send_bytes(self, data):
+            raise AssertionError(f"unexpected VNC payload: {data!r}")
+
+        async def close(self, code, reason=None):
+            self.closed = (code, reason)
+
+    class SandboxWebSocket:
+        async def send(self, data):
+            raise AssertionError(f"unexpected browser payload: {data!r}")
+
+        async def recv(self):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                sandbox_forwarder_cancelled.set()
+
+    class Connection:
+        async def __aenter__(self):
+            return SandboxWebSocket()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    monkeypatch.setattr(
+        "app.interfaces.api.ws_routes.websockets.connect",
+        lambda _url: Connection(),
+    )
+
+    class AgentServiceStub:
+        async def get_session(self, session_id, user_id):
+            return SimpleNamespace(id=session_id, user_id=user_id)
+
+        async def get_vnc_url(self, session_id):
+            return "ws://sandbox.example/vnc"
+
+    active = SimpleNamespace(id="user-1", is_active=True)
+    resolve_user = AsyncMock(
+        side_effect=[active, UnauthorizedError("revoked details")]
+    )
+    monkeypatch.setattr(
+        "app.interfaces.api.ws_routes.resolve_ws_user", resolve_user
+    )
+    monkeypatch.setattr(
+        "app.interfaces.api.ws_routes.get_agent_service",
+        lambda: AgentServiceStub(),
+    )
+    monkeypatch.setattr(
+        "app.interfaces.api.ws_routes.WS_AUTH_WATCHDOG_SECONDS", 0
+    )
+
+    websocket = WebSocketStub()
+    await vnc_ws(websocket=websocket, session_id="session-1")
+
+    assert websocket.closed == (4001, "Unauthorized")
+    assert browser_forwarder_cancelled.is_set()
+    assert sandbox_forwarder_cancelled.is_set()
+    assert resolve_user.await_count == 2
 
 
 async def test_preview_upstream_exception_never_logs_capability_url(

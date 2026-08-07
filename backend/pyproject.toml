@@ -36,7 +36,6 @@ dependencies = [
     "redis>=5.0.1",
     "rich>=14.2.0",
     "tavily-python>=0.5.0",
-    "sse-starlette>=3.0.3",
     "uvicorn>=0.38.0",
     "websockets>=15.0.1",
     "wuying-agentbay-sdk>=0.22.0",

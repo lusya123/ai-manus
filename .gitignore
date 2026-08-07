@@ -132,3 +132,6 @@ specs
 # AgentBay 联调临时工作区(不入库)
 .agentbay-work/
 .gstack/
+
+# Local demo media (never commit). Upload via gh image, then update docs/demos.yml.
+tmp/

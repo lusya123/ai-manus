@@ -199,7 +199,6 @@ def setup_logging():
     # Disable verbose logging for pymongo
     logging.getLogger("pymongo").setLevel(logging.WARNING)
     logging.getLogger("websockets").setLevel(logging.WARNING)
-    logging.getLogger("sse_starlette.sse").setLevel(logging.INFO)
     # httpx/httpcore include complete request URLs at INFO. Some providers use
     # signed gateway URLs, so those records would persist bearer capabilities.
     logging.getLogger("httpx").setLevel(logging.WARNING)

@@ -1,93 +1,193 @@
-import { describe, expect, it } from 'vitest';
-import { mount } from '@vue/test-utils';
-import ChatBox from '../ChatBox.vue';
-import ChatBoxFiles from '../ChatBoxFiles.vue';
-import { i18n } from '../../composables/useI18n';
-import type { FileInfo } from '../../api/file';
+import { describe, it, expect, vi } from 'vitest'
+import { nextTick } from 'vue'
+import { mount, flushPromises } from '@vue/test-utils'
+import { Editor } from '@tiptap/core'
+import StarterKit from '@tiptap/starter-kit'
+import ChatBox from '../ChatBox.vue'
+import { i18n } from '../../composables/useI18n'
+import { applySlashSelection, type SlashItem } from '../chatbox/slashSuggestion'
 
-const mountChatBox = (modelValue = 'hello') => mount(ChatBox, {
-  props: {
-    modelValue,
-    rows: 1,
-    isRunning: false,
-    attachments: [],
-  },
-  global: { plugins: [i18n] },
-});
+export const uploadFileMock = vi.fn()
 
-describe('ChatBox submission', () => {
-  it('submits on Enter using the textarea value', async () => {
-    const wrapper = mountChatBox('');
-    const textarea = wrapper.get('textarea');
-    await textarea.setValue('fresh draft');
-    await textarea.trigger('keydown', { key: 'Enter' });
+vi.mock('../ChatBoxFiles.vue', () => ({
+  default: {
+    name: 'ChatBoxFiles',
+    props: ['attachments'],
+    emits: ['update:attachments'],
+    setup(_: unknown, { expose }: { expose: (exposed: Record<string, unknown>) => void }) {
+      expose({ isAllUploaded: true, uploadFile: uploadFileMock })
+      return {}
+    },
+    template: '<div data-testid="chatbox-files" />'
+  }
+}))
 
-    const modelUpdates = wrapper.emitted('update:modelValue') || [];
-    expect(modelUpdates[modelUpdates.length - 1]).toEqual(['fresh draft']);
-    expect(wrapper.emitted('submit')).toHaveLength(1);
-  });
-
-  it('does not submit Enter while an IME composition is active', async () => {
-    const wrapper = mountChatBox('中文');
-    const textarea = wrapper.get('textarea');
-    await textarea.trigger('compositionstart');
-    await textarea.trigger('keydown', { key: 'Enter' });
-    expect(wrapper.emitted('submit')).toBeUndefined();
-
-    await textarea.trigger('compositionend');
-    await textarea.trigger('keydown', { key: 'Enter' });
-    expect(wrapper.emitted('submit')).toHaveLength(1);
-  });
-
-  it('does not pass the click MouseEvent into draft validation', async () => {
-    const wrapper = mountChatBox();
-    const buttons = wrapper.findAll('button');
-    await buttons[buttons.length - 1].trigger('click');
-    expect(wrapper.emitted('submit')).toHaveLength(1);
-  });
-
-  it('forwards attachment updates from ChatBoxFiles', async () => {
-    const wrapper = mountChatBox();
-    const files: FileInfo[] = [{
-      file_id: 'file-1',
-      filename: 'one.txt',
-      size: 1,
-      upload_date: '2026-01-01T00:00:00Z',
-    }];
-    wrapper.getComponent(ChatBoxFiles).vm.$emit('update:attachments', files);
-    await wrapper.vm.$nextTick();
-    expect(wrapper.emitted('update:attachments')).toEqual([[files]]);
-  });
-
-  it('does not send text while an attached file is still uploading', async () => {
-    const uploadingFile = {
-      file_id: 'temp-1',
-      filename: 'pending.txt',
-      size: 1,
-      upload_date: '2026-01-01T00:00:00Z',
-      status: 'uploading',
-    } as FileInfo & { status: 'uploading' | 'success' };
+describe('ChatBox TipTap', () => {
+  it('emits update:modelValue from editor plain text', async () => {
     const wrapper = mount(ChatBox, {
-      props: {
-        modelValue: 'send with attachment',
-        rows: 1,
-        isRunning: false,
-        allowSendFilesOnly: true,
-        attachments: [uploadingFile],
-      },
+      props: { modelValue: '', rows: 1, isRunning: false, attachments: [] },
+      global: { plugins: [i18n] }
+    })
+    await flushPromises()
+    const editorEl = wrapper.find('.ProseMirror')
+    expect(editorEl.exists()).toBe(true)
+
+    await wrapper.setProps({ modelValue: 'hello tip tap' })
+    await flushPromises()
+    await nextTick()
+    expect(wrapper.find('.ProseMirror').text()).toContain('hello tip tap')
+  })
+
+  it('applies dense min-h class on editor wrap', async () => {
+    const wrapper = mount(ChatBox, {
+      props: { modelValue: '', rows: 1, isRunning: false, attachments: [], dense: true },
+      global: { plugins: [i18n] }
+    })
+    await flushPromises()
+    expect(wrapper.find('.chat-input-editor').classes().join(' ')).toContain('min-h-[28px]')
+  })
+
+  it('default editor wrap uses min-h-[50px]', async () => {
+    const wrapper = mount(ChatBox, {
+      props: { modelValue: '', rows: 1, isRunning: false, attachments: [] },
+      global: { plugins: [i18n] }
+    })
+    await flushPromises()
+    expect(wrapper.find('.chat-input-editor').classes().join(' ')).toContain('min-h-[50px]')
+  })
+
+  it('emits multi-paragraph text with single \\n separators', async () => {
+    const wrapper = mount(ChatBox, {
+      props: { modelValue: '', rows: 1, isRunning: false, attachments: [] },
+      global: { plugins: [i18n] }
+    })
+    await flushPromises()
+    await nextTick()
+
+    type EditorLike = {
+      commands: { setContent: (c: unknown, o?: unknown) => boolean }
+      getText: (o?: { blockSeparator?: string }) => string
+    }
+    const exposed = wrapper.vm as unknown as { editor: EditorLike | { value?: EditorLike } }
+    const raw = exposed.editor
+    const ed = raw && 'commands' in raw ? raw : raw?.value
+    expect(ed).toBeTruthy()
+
+    // Two paragraphs (Enter while send disabled creates a new block)
+    ed!.commands.setContent({
+      type: 'doc',
+      content: [
+        { type: 'paragraph', content: [{ type: 'text', text: 'line one' }] },
+        { type: 'paragraph', content: [{ type: 'text', text: 'line two' }] },
+      ],
+    })
+    await flushPromises()
+    await nextTick()
+
+    const emitted = wrapper.emitted('update:modelValue')
+    expect(emitted).toBeTruthy()
+    const last = emitted![emitted!.length - 1][0] as string
+    expect(last).toBe('line one\nline two')
+    expect(last).not.toContain('\n\n')
+  })
+
+  it('plus menu lists Add local files and triggers uploadFile', async () => {
+    uploadFileMock.mockClear()
+    const wrapper = mount(ChatBox, {
+      props: { modelValue: '', rows: 1, isRunning: false, attachments: [] },
       global: { plugins: [i18n] },
-    });
-    const footerButtons = wrapper.findAll('footer button');
-    const sendButton = footerButtons[footerButtons.length - 1];
+      attachTo: document.body,
+    })
+    await flushPromises()
+    await nextTick()
 
-    await sendButton.trigger('click');
-    expect(wrapper.emitted('submit')).toBeUndefined();
+    const plusBtn = wrapper.find('button[aria-haspopup="dialog"]')
+    expect(plusBtn.exists()).toBe(true)
+    await plusBtn.trigger('click')
+    await nextTick()
 
-    const uploadedFile = { ...uploadingFile, status: 'success' } as typeof uploadingFile;
-    await wrapper.setProps({ attachments: [uploadedFile] });
-    await sendButton.trigger('click');
-    expect(wrapper.emitted('submit')).toHaveLength(1);
-  });
+    const menu = wrapper.find('[data-testid="chatbox-plus-menu"]')
+    expect(menu.exists()).toBe(true)
+    // Official + shell (not slash rounded-xl w-[240px])
+    expect(menu.classes().join(' ')).toContain('rounded-[12px]')
+    expect(menu.classes().join(' ')).toContain('p-1')
+    expect(menu.text()).toContain('Add local files')
+
+    const row = menu.findAll('button').find((b) => b.text().includes('Add local files'))
+    expect(row).toBeTruthy()
+    expect(row!.classes().join(' ')).toContain('rounded-[8px]')
+    expect(row!.classes().join(' ')).toContain('p-2')
+    await row!.trigger('click')
+    await nextTick()
+
+    expect(uploadFileMock).toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('slash menu rows prevent mousedown default to keep editor selection', async () => {
+    const wrapper = mount(ChatBox, {
+      props: { modelValue: '', rows: 1, isRunning: false, attachments: [] },
+      global: { plugins: [i18n] },
+      attachTo: document.body,
+    })
+    await flushPromises()
+    await nextTick()
+
+    type EditorLike = {
+      chain: () => {
+        focus: () => {
+          insertContent: (c: string) => { run: () => boolean }
+        }
+      }
+    }
+    const exposed = wrapper.vm as unknown as { editor: EditorLike | { value?: EditorLike } }
+    const raw = exposed.editor
+    const ed = raw && 'chain' in raw ? raw : raw?.value
+    expect(ed).toBeTruthy()
+
+    ed!.chain().focus().insertContent('/').run()
+    await flushPromises()
+    await nextTick()
+    await flushPromises()
+
+    const menu = wrapper.find('[data-testid="chatbox-slash-menu"]')
+    expect(menu.exists()).toBe(true)
+    const row = menu.findAll('button').find((b) => b.text().includes('Add local files'))
+    expect(row).toBeTruthy()
+
+    const ev = new MouseEvent('mousedown', { bubbles: true, cancelable: true })
+    row!.element.dispatchEvent(ev)
+    expect(ev.defaultPrevented).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('applySlashSelection fallback deletes / range when suggestion command is gone', () => {
+    const run = vi.fn()
+    const item: SlashItem = {
+      id: 'add_local_files',
+      titleKey: 'Add local files',
+      run,
+    }
+    const editor = new Editor({
+      extensions: [StarterKit],
+      content: '<p>/</p>',
+    })
+    const from = 1
+    const to = 2 // the "/" character in the paragraph
+    expect(editor.getText()).toBe('/')
+
+    // Simulate mouse race: suggestion command cleared, only stored range remains
+    applySlashSelection({
+      editor,
+      range: { from, to },
+      command: null,
+      item,
+    })
+
+    expect(editor.getText()).toBe('')
+    expect(run).toHaveBeenCalled()
+    editor.destroy()
+  })
 
   it('keeps the stop control visible and blocks submission while running', async () => {
     const wrapper = mount(ChatBox, {
@@ -98,19 +198,22 @@ describe('ChatBox submission', () => {
         attachments: [],
       },
       global: { plugins: [i18n] },
-    });
-    const textarea = wrapper.get('textarea');
-    const footerButtons = wrapper.findAll('footer button');
-    const actionButton = footerButtons[footerButtons.length - 1];
+    })
+    await flushPromises()
+    await nextTick()
 
-    expect(actionButton.attributes('aria-label')).toBeTruthy();
-    await textarea.trigger('keydown', { key: 'Enter' });
-    expect(wrapper.emitted('submit')).toBeUndefined();
+    const editorEl = wrapper.get('.ProseMirror')
+    const buttons = wrapper.findAll('button')
+    const actionButton = buttons[buttons.length - 1]
+    expect(actionButton.attributes('aria-label')).toBeTruthy()
 
-    await actionButton.trigger('click');
-    expect(wrapper.emitted('stop')).toHaveLength(1);
-    expect(wrapper.emitted('submit')).toBeUndefined();
-  });
+    await editorEl.trigger('keydown', { key: 'Enter' })
+    expect(wrapper.emitted('submit')).toBeUndefined()
+
+    await actionButton.trigger('click')
+    expect(wrapper.emitted('stop')).toHaveLength(1)
+    expect(wrapper.emitted('submit')).toBeUndefined()
+  })
 
   it('disables repeated stop clicks while a stop request is pending', async () => {
     const wrapper = mount(ChatBox, {
@@ -122,12 +225,13 @@ describe('ChatBox submission', () => {
         attachments: [],
       },
       global: { plugins: [i18n] },
-    });
-    const footerButtons = wrapper.findAll('footer button');
-    const stopButton = footerButtons[footerButtons.length - 1];
+    })
+    await flushPromises()
 
-    expect(stopButton.attributes('disabled')).toBeDefined();
-    await stopButton.trigger('click');
-    expect(wrapper.emitted('stop')).toBeUndefined();
-  });
-});
+    const buttons = wrapper.findAll('button')
+    const stopButton = buttons[buttons.length - 1]
+    expect(stopButton.attributes('disabled')).toBeDefined()
+    await stopButton.trigger('click')
+    expect(wrapper.emitted('stop')).toBeUndefined()
+  })
+})

@@ -32,6 +32,8 @@ from app.infrastructure.models.documents import (
     TurnSubmissionDocument,
     TurnQuotaDocument,
     TurnOutputEventDocument,
+    ProjectDocument,
+    FileFavoriteDocument,
 )
 from beanie import init_beanie
 
@@ -112,6 +114,8 @@ async def lifespan(app: FastAPI):
             TurnSubmissionDocument,
             TurnQuotaDocument,
             TurnOutputEventDocument,
+            ProjectDocument,
+            FileFavoriteDocument,
         ]
     )
     logger.info("Successfully initialized Beanie")

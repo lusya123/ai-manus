@@ -17,4 +17,4 @@
 
 > Task: Analyze the GitHub repositories of user simpleyyt
 
-![](https://raw.githubusercontent.com/Simpleyyt/picgo-image/master/mcp.mp4 ':include controls width="100%"') 
+![](https://raw.githubusercontent.com/Simpleyyt/picgo-image/master/mcp.mp4 ':include controls width="100%"')

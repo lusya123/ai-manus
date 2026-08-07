@@ -20,30 +20,35 @@ Enjoy your own agent with AI Manus!
 
 ## Demos
 
+<!-- demos:readme:en -->
 ### Basic Features
 
-https://github.com/user-attachments/assets/37060a09-c647-4bcb-920c-959f7fa73ebe
+* Task: Code Use, Browser Use, and multi-session switching
+
+https://github.com/user-attachments/assets/83d9549b-1a99-4c06-b39e-1bc0b48b3055
 
 ### Browser Use
 
-* Task: Latest LLM papers
+* Task: Find latest news
 
-<https://github.com/user-attachments/assets/4e35bc4d-024a-4617-8def-a537a94bd285>
+<https://github.com/user-attachments/assets/f7297f8f-51fd-44c0-9ff9-0b7fcfaabf0f>
 
 ### Code Use
 
 * Task: Write a complex Python example
 
-<https://github.com/user-attachments/assets/765ea387-bb1c-4dc2-b03e-716698feef77>
-
+<https://github.com/user-attachments/assets/7b39b828-ec27-4b8f-b5f7-527e29efbe48>
+<!-- /demos:readme:en -->
 
 ## Key Features
 
  * Deployment: Minimal deployment requires only an LLM service, with no dependency on other external services.
+ * Agent loop: Plan-and-execute flow with composable system prompts and native structured output tools (no fragile JSON-in-prompt protocol).
  * Tools: Supports Terminal, Browser, File, Web Search, and messaging tools with real-time viewing and takeover capabilities, supports external MCP tool integration.
  * Claw: Integrated [OpenClaw](https://github.com/anthropics/openclaw) AI assistant with one-click deployment, persistent per-user isolated containers, optional expiry policies, and full chat history.
  * Sandbox: Each task gets an isolated sandbox using local Docker or optional [Alibaba Cloud Wuying AgentBay](docs/en/agentbay.md).
  * Task Sessions: Session history is managed through MongoDB/Redis, supporting background tasks.
+ * Library: The sidebar Library aggregates attachments and artifacts across your sessions, with type filters, search, per-file favorites, preview, and jump-back to the source task.
  * Conversations: Supports stopping and interrupting, file upload and download.
  * Multilingual: Supports both Chinese and English.
  * Authentication: User login and authentication.
@@ -54,6 +59,8 @@ https://github.com/user-attachments/assets/37060a09-c647-4bcb-920c-959f7fa73ebe
  * Sandbox: Support for mobile and Windows computer access.
  * Deployment: Support for K8s and Docker Swarm multi-cluster deployment.
 
+See [docs/roadmap.md](docs/en/roadmap.md) for the full checklist (including completed items such as Docker Compose, Settings, Celery backend, and context engineering).
+
 ### Overall Design
 
 ![Image](https://github.com/user-attachments/assets/69775011-1eb7-452f-adaf-cd6603a4dde5)
@@ -63,8 +70,8 @@ https://github.com/user-attachments/assets/37060a09-c647-4bcb-920c-959f7fa73ebe
 1. Web sends a request to create an Agent to the Server, which creates a Sandbox through `/var/run/docker.sock` and returns a session ID.
 2. The Sandbox is an Ubuntu Docker environment that starts Chrome browser and API services for tools like File/Shell.
 3. Web sends user messages to the session ID, and when the Server receives user messages, it forwards them to the PlanAct Agent for processing.
-4. During processing, the PlanAct Agent calls relevant tools to complete tasks.
-5. All events generated during Agent processing are sent back to Web via SSE.
+4. During processing, the PlanAct Agent plans and executes steps: the planner/executor submit structured results through native tool calls, and call sandbox tools (Shell / Browser / File / Search / MCP) as needed.
+5. All events generated during Agent processing are sent back to Web via WebSocket.
 
 **When users browse tools:**
 
@@ -81,10 +88,9 @@ This project primarily relies on Docker for development and deployment, requirin
 
 Model capability requirements:
 - Supports LangChain chat model providers (default `openai`)
-- Support for FunctionCall
-- Support for Json Format output
+- Native **tool / function calling** (plans and step results are submitted via structured output tools such as `create_plan` / `complete_step`, not JSON-in-prompt)
 
-Deepseek and GPT models are recommended.
+Deepseek and GPT models with reliable tool calling are recommended.
 
 ## Deployment Guide
 

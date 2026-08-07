@@ -1,5 +1,19 @@
-"""Composable system prompt assembled from the capabilities actually bound."""
+"""Composable system prompt assembled from the capabilities actually bound.
 
+The system prompt is assembled at agent-construction time from:
+
+* a core identity/policy section shared by all agents,
+* one usage section per toolkit actually bound to the agent (taken from
+  ``BaseToolkit.instructions``), so prompt guidance always matches the tools
+  the model can really call,
+* an optional role-specific section supplied by the concrete agent,
+* an optional project-instructions section when the session belongs to a
+  project that defines ``instruction``.
+
+This replaces the previous monolithic hardcoded prompt, which shipped rules
+for tools that were not always available and could drift out of sync with the
+toolset.
+"""
 from typing import List, Optional
 
 from app.domain.services.tools.base import BaseToolkit
@@ -56,12 +70,36 @@ produce.
 """.strip()
 
 
+def format_project_instructions(instruction: Optional[str] = None) -> str:
+    """Wrap a project instruction string for injection into a system prompt."""
+    text = (instruction or "").strip()
+    if not text:
+        return ""
+    return (
+        "<project_instructions>\n"
+        "Follow these project-specific instructions for every task in this "
+        "project:\n\n"
+        f"{text}\n"
+        "</project_instructions>"
+    )
+
+
 def build_system_prompt(
     toolkits: Optional[List[BaseToolkit]] = None,
     role_prompt: str = "",
     runtime_prompt: str = "",
+    project_instruction: Optional[str] = None,
 ) -> str:
-    """Assemble core, safe runtime context, bound-tool, and role sections."""
+    """Assemble core, runtime, bound-tool, role, and project sections.
+
+    Args:
+        toolkits: Toolkits bound to the agent; each contributes its own usage
+            section only when it defines ``instructions``.
+        role_prompt: Role-specific guidance appended by the concrete agent.
+        runtime_prompt: Provider-derived, capability-safe runtime facts.
+        project_instruction: Optional per-project guidance from
+            ``Project.instruction``.
+    """
     sections = [CORE_PROMPT]
     if runtime_prompt.strip():
         sections.append(runtime_prompt.strip())
@@ -73,4 +111,7 @@ def build_system_prompt(
             )
     if role_prompt.strip():
         sections.append(role_prompt.strip())
+    project_section = format_project_instructions(project_instruction)
+    if project_section:
+        sections.append(project_section)
     return "\n\n".join(sections)

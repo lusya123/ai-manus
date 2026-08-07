@@ -1,6 +1,6 @@
 # 📅 Development Roadmap
 
-> Currently under development: Settings
+> Ongoing: Deploy & Expose, multi-cluster deployment, enterprise sandbox security
 
 ## Claw (Manus × Claw)
 
@@ -23,25 +23,32 @@
 
 ## Deployment
 
- * [ ] Support Docker Swarm deployment
- * [ ] Support Docker Compose deployment
+ * [x] Support Docker Compose deployment
+ * [ ] Support Docker Swarm / K8s multi-cluster deployment
 
 ## UI
 
- * [ ] Support settings
+ * [x] Support settings
+ * [x] Support Library (aggregate session files, type filter / search, file favorites and preview)
  * [ ] Support timeline playback
 
 ## Task Sessions
 
  * [x] Support sharing
 
+## Agent / Context Engineering
+
+ * [x] Native structured output tools (`create_plan` / `complete_step`, etc.)
+ * [x] Composable system prompts (assembled from bound toolkits)
+ * [x] Token-aware memory compaction
+
 ## Infrastructure
 
  * [ ] Support Windows & mobile access
- * [x] Support Bing, Google, Tavily and other search providers
+ * [x] Support Bing, Google, Tavily, Serper and other search providers
+ * [x] Support Celery task backend (`TASK_BACKEND=celery`)
  * [ ] Support Alibaba Cloud and other file storage providers
  * [x] Support Alibaba Cloud Wuying AgentBay sandboxes
  * [ ] Support e2b and more sandbox providers
  * [ ] Support mem0 memory providers
- * [ ] Replace background tasks with celery tasks
  * [ ] Enterprise-level security construction for sandbox

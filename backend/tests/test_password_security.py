@@ -26,6 +26,38 @@ class _Repo:
         return user
 
 
+class _SessionStore:
+    async def get_user_generation(self, user_id):
+        return 0
+
+    async def create(
+        self, session, ttl_seconds, *, expected_generation=None
+    ):
+        return True
+
+    async def get(self, session_id):
+        return None
+
+    async def touch(self, session_id, ttl_seconds):
+        return None
+
+    async def rotate(
+        self,
+        old_session_id,
+        session,
+        ttl_seconds,
+        *,
+        expected_generation,
+    ):
+        return False
+
+    async def delete(self, session_id):
+        return False
+
+    async def delete_all_for_user(self, user_id):
+        return 0
+
+
 @pytest.fixture(autouse=True)
 def password_settings(monkeypatch):
     monkeypatch.setenv("API_KEY", "test")
@@ -42,7 +74,7 @@ def password_settings(monkeypatch):
 
 
 def _service(repo=None):
-    return AuthService(repo or _Repo(), TokenService())
+    return AuthService(repo or _Repo(), TokenService(), _SessionStore())
 
 
 def test_password_hashes_use_random_salts_high_cost_and_constant_time_verification():

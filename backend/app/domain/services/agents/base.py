@@ -13,6 +13,7 @@ from app.domain.models.event import (
     MessageEvent,
     ToolEvent,
     ToolStatus,
+    TerminalUpdateEvent,
 )
 from app.domain.models.message import LLMMessage, Message, Role, ToolCall
 from app.domain.models.tool_result import ToolResult
@@ -77,6 +78,12 @@ class BaseAgent(ABC):
         self.memory = None
         self._output_tool: Optional[OutputTool] = None
         self._tool_call_timeout_seconds = get_settings().tool_call_timeout_seconds
+        self._project_instruction: Optional[str] = None
+
+    def set_project_instruction(self, instruction: Optional[str]) -> None:
+        """Bind project-level guidance used when assembling the system prompt."""
+        text = (instruction or "").strip()
+        self._project_instruction = text or None
 
     def build_system_prompt(self) -> str:
         """Return the current prompt; concrete agents assemble it dynamically."""
@@ -85,6 +92,19 @@ class BaseAgent(ABC):
     async def _parse_json(self, text: str) -> dict:
         """Legacy rolling-upgrade helper; the native output loop does not use it."""
         return await self._llm.parse_json(text)
+
+    async def sync_system_prompt(self) -> None:
+        """Insert or refresh the leading system message so project edits apply."""
+        await self._ensure_memory()
+        prompt = self.build_system_prompt()
+        if self.memory.empty:
+            self.memory.add_message(LLMMessage.system(prompt))
+            await self._repository.save_memory(self._agent_id, self.name, self.memory)
+            return
+        first = self.memory.messages[0]
+        if first.role == Role.SYSTEM and first.content != prompt:
+            first.content = prompt
+            await self._repository.save_memory(self._agent_id, self.name, self.memory)
 
     def get_tool(self, name: str) -> Optional[Tool]:
         """Return an invocable work tool by name."""
@@ -394,7 +414,76 @@ class BaseAgent(ABC):
                         function_name=function_name,
                         function_args=tool_call.args,
                     )
-                    tool_result = await self.invoke_tool(tool, tool_call)
+                    # Stream changed terminal output while a shell call runs. The
+                    # actual invocation still goes through ``invoke_tool``, so the
+                    # configured timeout, retry policy, result bound, and safe error
+                    # handling remain authoritative.
+                    function_args = tool_call.args
+                    shell_id = (
+                        function_args.get("id")
+                        if tool.toolkit.name == "shell" and isinstance(function_args, dict)
+                        else None
+                    )
+                    if shell_id and hasattr(tool.toolkit, "sandbox"):
+                        invoke_task = asyncio.create_task(self.invoke_tool(tool, tool_call))
+                        last_fingerprint: Optional[str] = None
+
+                        def _console_fingerprint(console: Any) -> str:
+                            """Cheap change detector — avoid repr() on large consoles."""
+                            if console is None:
+                                return "0:"
+                            if isinstance(console, str):
+                                return f"s:{len(console)}:{console[-80:]}"
+                            if isinstance(console, list):
+                                if not console:
+                                    return "0:"
+                                last = console[-1]
+                                if isinstance(last, dict):
+                                    tail = f"{last.get('command', '')}|{str(last.get('output', ''))[-60:]}"
+                                else:
+                                    tail = str(last)[-80:]
+                                return f"l:{len(console)}:{tail}"
+                            return f"o:{type(console).__name__}:{str(console)[-80:]}"
+
+                        try:
+                            while not invoke_task.done():
+                                done, _ = await asyncio.wait(
+                                    {invoke_task}, timeout=1.0
+                                )
+                                if done:
+                                    break
+                                try:
+                                    view = await tool.toolkit.sandbox.view_shell(
+                                        shell_id, console=True
+                                    )
+                                    console = (
+                                        view.data.get("console", [])
+                                        if view and getattr(view, "data", None)
+                                        else []
+                                    )
+                                    fingerprint = _console_fingerprint(console)
+                                    if fingerprint != last_fingerprint:
+                                        last_fingerprint = fingerprint
+                                        yield TerminalUpdateEvent(
+                                            shell_id=shell_id,
+                                            output=console,
+                                        )
+                                except Exception as exc:
+                                    logger.debug(
+                                        "Shell live poll failed: agent_id=%s "
+                                        "operation=view_shell error=%s",
+                                        self._agent_id,
+                                        safe_exception_summary(exc),
+                                    )
+                            tool_result = await invoke_task
+                        finally:
+                            if not invoke_task.done():
+                                invoke_task.cancel()
+                                await asyncio.gather(
+                                    invoke_task, return_exceptions=True
+                                )
+                    else:
+                        tool_result = await self.invoke_tool(tool, tool_call)
 
                     if is_ask_user_call:
                         # Persist a structurally valid placeholder *before* the

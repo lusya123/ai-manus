@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { defineComponent, nextTick } from 'vue';
 import { flushPromises, mount } from '@vue/test-utils';
 import HomePage from '../HomePage.vue';
@@ -12,12 +12,17 @@ import type { ClientConfigResponse } from '../../api/config';
 
 const { routerPush } = vi.hoisted(() => ({ routerPush: vi.fn() }));
 
-vi.mock('vue-router', () => ({
-  useRouter: () => ({ push: routerPush }),
-}));
+vi.mock('vue-router', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('vue-router')>();
+  return {
+    ...actual,
+    useRouter: () => ({ push: routerPush }),
+  };
+});
 
 vi.mock('../../api/agent', () => ({
   createSession: vi.fn(),
+  updateSessionTaskMode: vi.fn(),
 }));
 
 vi.mock('../../api/config', () => ({
@@ -59,9 +64,23 @@ describe('HomePage model settings synchronization', () => {
   beforeEach(() => {
     localStorage.clear();
     sessionStorage.clear();
+    vi.stubGlobal('matchMedia', (query: string) => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(() => false),
+    }));
     routerPush.mockReset();
     vi.mocked(createSession).mockReset();
     vi.mocked(getCachedClientConfig).mockResolvedValue(clientConfig);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it('uses model settings saved while the page remains mounted', async () => {

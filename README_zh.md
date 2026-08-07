@@ -20,30 +20,35 @@ AI Manus 是一个通用的 AI Agent 系统，支持在沙盒环境中运行各�
 
 ## 示例
 
+<!-- demos:readme:zh -->
 ### 基本功能
 
-https://github.com/user-attachments/assets/37060a09-c647-4bcb-920c-959f7fa73ebe
+* 任务: Code Use、Browser Use 与多会话切换
+
+https://github.com/user-attachments/assets/83d9549b-1a99-4c06-b39e-1bc0b48b3055
 
 ### Browser Use
 
-* 任务：llm 最新论文
+* 任务: 找一下最新新闻
 
-https://github.com/user-attachments/assets/8f7788a4-fbda-49f5-b836-949a607c64ac
+https://github.com/user-attachments/assets/f7297f8f-51fd-44c0-9ff9-0b7fcfaabf0f
 
 ### Code Use
 
-* 任务：写一个复杂的 python 示例
+* 任务: 写一个复杂的 python 示例
 
-https://github.com/user-attachments/assets/5cb2240b-0984-4db0-8818-a24f81624b04
-
+https://github.com/user-attachments/assets/7b39b828-ec27-4b8f-b5f7-527e29efbe48
+<!-- /demos:readme:zh -->
 
 ## 主要特性
 
  * 部署：最小只需要一个 LLM 服务即可完成部署，不需要依赖其它外部服务。
+ * Agent 循环：Plan-and-Execute，可组合 System Prompt，以及原生结构化输出工具（不再使用脆弱的 Prompt 内嵌 JSON 协议）。
  * 工具：支持 Terminal、Browser、File、Web Search、消息工具，并支持实时查看和接管，支持外部 MCP 工具集成。
  * Claw：集成 [OpenClaw](https://github.com/anthropics/openclaw) AI 助手，一键部署、用户隔离常驻容器、可选过期策略、完整聊天历史。
  * 沙盒：每个 Task 会分配独立沙盒，可使用本地 Docker 或可选的[阿里云无影 AgentBay](docs/agentbay.md)。
  * 任务会话：通过 Mongo/Redis 对会话历史进行管理，支持后台任务。
+ * 库：侧栏「库」聚合各会话产生的附件与产物，支持类型筛选、搜索、文件收藏与预览，并可定位回原任务。
  * 对话：支持停止与打断，支持文件上传与下载。
  * 多语言：支持中文与英文。
  * 认证：用户登录与认证。
@@ -54,6 +59,8 @@ https://github.com/user-attachments/assets/5cb2240b-0984-4db0-8818-a24f81624b04
  * 沙盒：支持手机与 Windows 电脑接入。
  * 部署：支持 K8s 和 Docker Swarm 多集群部署。
 
+完整清单见 [docs/roadmap.md](docs/roadmap.md)（含已完成的 Docker Compose、设置页、Celery 后端、上下文工程等）。
+
 ## 环境要求
 
 本项目主要依赖Docker进行开发与部署，需要安装较新版本的Docker：
@@ -62,10 +69,9 @@ https://github.com/user-attachments/assets/5cb2240b-0984-4db0-8818-a24f81624b04
 
 模型能力要求：
 - 支持 LangChain Chat Model（默认 `openai` 提供商）
-- 支持FunctionCall
-- 支持Json Format输出
+- 支持原生 **Tool / Function Calling**（计划与步骤结果通过 `create_plan` / `complete_step` 等结构化输出工具提交，不再依赖 Prompt 内嵌 JSON）
 
-推荐使用Deepseek与GPT模型。
+推荐使用具备稳定工具调用能力的 Deepseek 与 GPT 模型。
 
 
 ## 部署指南
@@ -218,8 +224,8 @@ docker compose up -d
 1. Web 向 Server 发送创建 Agent 请求，Server 通过`/var/run/docker.sock`创建出 Sandbox，并返回会话 ID。
 2. Sandbox 是一个 Ubuntu Docker 环境，里面会启动 chrome 浏览器及 File/Shell 等工具的 API 服务。
 3. Web 往会话 ID 中发送用户消息，Server 收到用户消息后，将消息发送给 PlanAct Agent 处理。
-4. PlanAct Agent 处理过程中会调用相关工具完成任务。
-5. Agent 处理过程中产生的所有事件通过 SSE 发回 Web。
+4. PlanAct Agent 进行规划与执行：规划器/执行器通过原生工具调用提交结构化结果，并按需调用沙盒工具（Shell / Browser / File / Search / MCP）。
+5. Agent 处理过程中产生的所有事件通过 WebSocket 发回 Web。
 
 **当用户浏览工具时：**
 

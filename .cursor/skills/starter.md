@@ -219,7 +219,7 @@ Dev uses the `ai-manus-dev` Compose project, `manus-network-dev` runtime network
 
 ### Session endpoints (`/api/v1/sessions/`)
 
-Create, list, delete sessions; send chat messages; subscribe to SSE events.
+Create, list, delete sessions; chat and list updates over WebSocket (`/ws/chat`, `/ws/sessions`). Auth for WS: Cookie or `Authorization: Bearer` (no `?token=`).
 
 ### File endpoints (`/api/v1/file/`)
 

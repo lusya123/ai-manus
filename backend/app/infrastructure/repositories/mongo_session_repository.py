@@ -2,7 +2,7 @@ from typing import Optional, List
 from datetime import datetime, UTC
 from bson import BSON
 from pymongo import ReturnDocument
-from app.domain.models.session import Session, SessionStatus, SessionSummary
+from app.domain.models.session import Session, SessionStatus, SessionSummary, TaskMode
 from app.domain.models.file import FileInfo
 from app.domain.repositories.session_repository import SessionRepository
 from app.domain.models.event import BaseEvent, ErrorEvent
@@ -11,6 +11,10 @@ from app.infrastructure.models.documents import (
     TurnOutputEventDocument,
 )
 from app.core.config import get_settings
+from app.infrastructure.external.session_list import (
+    publish_session_remove,
+    publish_session_upsert,
+)
 import logging
 import uuid
 
@@ -31,6 +35,10 @@ SESSION_LIST_PROJECTION = {
     "latest_message_at": 1,
     "status": 1,
     "is_shared": 1,
+    "is_favorite": 1,
+    "is_pinned": 1,
+    "project_id": 1,
+    "task_mode": 1,
 }
 
 class MongoSessionRepository(SessionRepository):
@@ -87,6 +95,7 @@ class MongoSessionRepository(SessionRepository):
                 )
             mongo_session = SessionDocument.from_domain(session)
             await mongo_session.save()
+            await publish_session_upsert(session.user_id, session.id)
             return
 
         raise RuntimeError(
@@ -311,6 +320,28 @@ class MongoSessionRepository(SessionRepository):
         )
         return bool(result.matched_count)
 
+    async def _notify_upsert(self, session_id: str) -> None:
+        mongo_session = await SessionDocument.find_one(
+            SessionDocument.session_id == session_id
+        )
+        if mongo_session:
+            await publish_session_upsert(mongo_session.user_id, session_id)
+
+    def _summary_from_doc(self, doc: dict) -> SessionSummary:
+        return SessionSummary(
+            id=doc["session_id"],
+            user_id=doc["user_id"],
+            title=doc.get("title"),
+            unread_message_count=doc.get("unread_message_count", 0),
+            latest_message=doc.get("latest_message"),
+            latest_message_at=doc.get("latest_message_at"),
+            status=doc.get("status", SessionStatus.PENDING),
+            is_shared=doc.get("is_shared", False),
+            is_favorite=doc.get("is_favorite", False),
+            is_pinned=doc.get("is_pinned", False),
+            project_id=doc.get("project_id"),
+            task_mode=doc.get("task_mode") or TaskMode.AGENT,
+        )
 
     async def find_by_id(self, session_id: str) -> Optional[Session]:
         """Find a session by its ID"""
@@ -342,17 +373,21 @@ class MongoSessionRepository(SessionRepository):
         ).sort("latest_message_at", -1)
         summaries = []
         async for doc in cursor:
-            summaries.append(SessionSummary(
-                id=doc["session_id"],
-                user_id=doc["user_id"],
-                title=doc.get("title"),
-                unread_message_count=doc.get("unread_message_count", 0),
-                latest_message=doc.get("latest_message"),
-                latest_message_at=doc.get("latest_message_at"),
-                status=doc.get("status", SessionStatus.PENDING),
-                is_shared=doc.get("is_shared", False),
-            ))
+            summaries.append(self._summary_from_doc(doc))
         return summaries
+
+    async def find_summary_by_id_and_user_id(
+        self, session_id: str, user_id: str
+    ) -> Optional[SessionSummary]:
+        """Find a lightweight session summary by ID for a specific user"""
+        collection = SessionDocument.get_pymongo_collection()
+        doc = await collection.find_one(
+            {"session_id": session_id, "user_id": user_id},
+            SESSION_LIST_PROJECTION,
+        )
+        if not doc:
+            return None
+        return self._summary_from_doc(doc)
     
     async def find_by_id_and_user_id(self, session_id: str, user_id: str) -> Optional[Session]:
         """Find a session by ID and user ID (for authorization)"""
@@ -375,6 +410,7 @@ class MongoSessionRepository(SessionRepository):
         )
         if not result:
             raise ValueError(f"Session {session_id} not found")
+        await self._notify_upsert(session_id)
 
     async def update_latest_message(self, session_id: str, message: str, timestamp: datetime) -> None:
         """Update the latest message of a session"""
@@ -385,6 +421,7 @@ class MongoSessionRepository(SessionRepository):
         )
         if not result:
             raise ValueError(f"Session {session_id} not found")
+        await self._notify_upsert(session_id)
 
     @staticmethod
     def _bounded_event(event: BaseEvent) -> BaseEvent:
@@ -742,7 +779,9 @@ class MongoSessionRepository(SessionRepository):
             SessionDocument.session_id == session_id
         )
         if mongo_session:
+            user_id = mongo_session.user_id
             await mongo_session.delete()
+            await publish_session_remove(user_id, session_id)
 
     async def get_all(self) -> List[Session]:
         """Get all sessions"""
@@ -761,6 +800,7 @@ class MongoSessionRepository(SessionRepository):
         )
         if not result:
             raise ValueError(f"Session {session_id} not found")
+        await self._notify_upsert(session_id)
 
     async def update_unread_message_count(self, session_id: str, count: int) -> None:
         """Update the unread message count of a session"""
@@ -771,6 +811,7 @@ class MongoSessionRepository(SessionRepository):
         )
         if not result:
             raise ValueError(f"Session {session_id} not found")
+        await self._notify_upsert(session_id)
 
     async def increment_unread_message_count(self, session_id: str) -> None:
         """Atomically increment the unread message count of a session"""
@@ -781,6 +822,7 @@ class MongoSessionRepository(SessionRepository):
         )
         if not result:
             raise ValueError(f"Session {session_id} not found")
+        await self._notify_upsert(session_id)
 
     async def decrement_unread_message_count(self, session_id: str) -> None:
         """Atomically decrement the unread message count of a session"""
@@ -791,6 +833,7 @@ class MongoSessionRepository(SessionRepository):
         )
         if not result:
             raise ValueError(f"Session {session_id} not found")
+        await self._notify_upsert(session_id)
 
     async def update_shared_status(self, session_id: str, is_shared: bool) -> str:
         """Update shared status and revoke every previously issued share URL."""
@@ -806,4 +849,62 @@ class MongoSessionRepository(SessionRepository):
         )
         if not result:
             raise ValueError(f"Session {session_id} not found")
+        await self._notify_upsert(session_id)
         return share_epoch
+
+    async def update_favorite_status(self, session_id: str, is_favorite: bool) -> None:
+        """Update the favorite status of a session"""
+        result = await SessionDocument.find_one(
+            SessionDocument.session_id == session_id
+        ).update(
+            {"$set": {"is_favorite": is_favorite, "updated_at": datetime.now(UTC)}}
+        )
+        if not result:
+            raise ValueError(f"Session {session_id} not found")
+        await self._notify_upsert(session_id)
+
+    async def update_pin_status(self, session_id: str, is_pinned: bool) -> None:
+        """Update the pin status of a session"""
+        result = await SessionDocument.find_one(
+            SessionDocument.session_id == session_id
+        ).update(
+            {"$set": {"is_pinned": is_pinned, "updated_at": datetime.now(UTC)}}
+        )
+        if not result:
+            raise ValueError(f"Session {session_id} not found")
+        await self._notify_upsert(session_id)
+
+    async def update_project_id(self, session_id: str, project_id: Optional[str]) -> None:
+        """Assign or clear project association for a session"""
+        result = await SessionDocument.find_one(
+            SessionDocument.session_id == session_id
+        ).update(
+            {"$set": {"project_id": project_id, "updated_at": datetime.now(UTC)}}
+        )
+        if not result:
+            raise ValueError(f"Session {session_id} not found")
+        await self._notify_upsert(session_id)
+
+    async def clear_project_id(self, project_id: str) -> None:
+        """Clear project_id from all sessions belonging to a project"""
+        affected = await SessionDocument.find(
+            SessionDocument.project_id == project_id
+        ).to_list()
+        await SessionDocument.find(
+            SessionDocument.project_id == project_id
+        ).update(
+            {"$set": {"project_id": None, "updated_at": datetime.now(UTC)}}
+        )
+        for mongo_session in affected:
+            await publish_session_upsert(mongo_session.user_id, mongo_session.session_id)
+
+    async def update_task_mode(self, session_id: str, task_mode: str) -> None:
+        """Update session task mode (agent | chat)"""
+        result = await SessionDocument.find_one(
+            SessionDocument.session_id == session_id
+        ).update(
+            {"$set": {"task_mode": task_mode, "updated_at": datetime.now(UTC)}}
+        )
+        if not result:
+            raise ValueError(f"Session {session_id} not found")
+        await self._notify_upsert(session_id)

@@ -21,6 +21,7 @@ from app.domain.external.search import SearchEngine
 from app.domain.external.llm import LLM
 from app.domain.repositories.agent_repository import AgentRepository
 from app.domain.repositories.session_repository import SessionRepository
+from app.domain.repositories.project_repository import ProjectRepository
 from app.domain.models.session import SessionStatus
 from app.domain.services.tools.mcp import MCPToolkit
 from app.domain.services.tools.shell import ShellToolkit
@@ -53,11 +54,13 @@ class PlanActFlow(BaseFlow):
         mcp_tool: MCPToolkit,
         llm: LLM,
         search_engine: Optional[SearchEngine] = None,
+        project_repository: Optional[ProjectRepository] = None,
     ):
         self._agent_id = agent_id
         self._repository = agent_repository
         self._session_id = session_id
         self._session_repository = session_repository
+        self._project_repository = project_repository
         self._llm = llm
         self.status = AgentStatus.IDLE
         self.plan = None
@@ -97,6 +100,21 @@ class PlanActFlow(BaseFlow):
         )
         logger.debug(f"Created execution agent for Agent {self._agent_id}")
 
+    async def _apply_project_instruction(self, project_id: Optional[str]) -> None:
+        instruction: Optional[str] = None
+        project_repository = getattr(self, "_project_repository", None)
+        if project_id and project_repository:
+            project = await project_repository.find_by_id(project_id)
+            if project and project.instruction:
+                instruction = project.instruction
+        for agent in (self.planner, self.executor):
+            set_instruction = getattr(agent, "set_project_instruction", None)
+            if callable(set_instruction):
+                set_instruction(instruction)
+            sync_prompt = getattr(agent, "sync_system_prompt", None)
+            if callable(sync_prompt) and hasattr(agent, "memory"):
+                await sync_prompt()
+
     async def run(
         self,
         message: Message,
@@ -107,7 +125,11 @@ class PlanActFlow(BaseFlow):
         session = await self._session_repository.find_by_id(self._session_id)
         if not session:
             raise ValueError(f"Session {self._session_id} not found")
-        
+
+        await self._apply_project_instruction(
+            getattr(session, "project_id", None)
+        )
+
         if resumes_waiting is not None:
             # Durable workers receive the intent captured at acceptance time.
             # Do not infer it from Session.status: the durable RUNNING
@@ -160,7 +182,8 @@ class PlanActFlow(BaseFlow):
                         plan_created = True
                         self.plan = event.plan
                         logger.info(f"Agent {self._agent_id} created plan successfully with {len(event.plan.steps)} steps")
-                        yield TitleEvent(title=event.plan.title)
+                        if event.plan.title and event.plan.title.strip():
+                            yield TitleEvent(title=event.plan.title)
                     elif isinstance(event, ErrorEvent):
                         planning_error_emitted = True
                     yield event

@@ -1,15 +1,85 @@
 import asyncio
+from http.cookies import SimpleCookie
 import pytest
 import httpx
 from types import SimpleNamespace
+from fastapi import Response
+from fastapi.security import HTTPAuthorizationCredentials
+from starlette.requests import Request
 
 from app.application.services.auth_service import AuthService
 from app.application.services.token_service import TokenService
 from app.core.config import get_settings
+from app.domain.models.auth_session import AuthClientType
+from app.interfaces.api.auth_routes import get_current_user_info, refresh_token
+from app.interfaces.schemas.auth import RefreshTokenRequest
 
 
 class _Repo:
     pass
+
+
+class _SessionStore:
+    def __init__(self):
+        self.sessions = {}
+        self.generations = {}
+
+    async def get_user_generation(self, user_id):
+        return self.generations.get(user_id, 0)
+
+    async def create(
+        self, session, ttl_seconds, *, expected_generation=None
+    ):
+        generation = (
+            session.revocation_generation
+            if expected_generation is None
+            else expected_generation
+        )
+        if self.generations.get(session.user_id, 0) != generation:
+            return False
+        self.sessions[session.session_id] = session
+        return True
+
+    async def get(self, session_id):
+        return self.sessions.get(session_id)
+
+    async def touch(self, session_id, ttl_seconds):
+        session = self.sessions.get(session_id)
+        if session and (
+            session.revocation_generation
+            == self.generations.get(session.user_id, 0)
+        ):
+            return session
+        return None
+
+    async def rotate(
+        self,
+        old_session_id,
+        session,
+        ttl_seconds,
+        *,
+        expected_generation,
+    ):
+        old = self.sessions.get(old_session_id)
+        if not old or self.generations.get(session.user_id, 0) != expected_generation:
+            return False
+        del self.sessions[old_session_id]
+        self.sessions[session.session_id] = session
+        return True
+
+    async def delete(self, session_id):
+        return self.sessions.pop(session_id, None) is not None
+
+    async def delete_all_for_user(self, user_id):
+        self.generations[user_id] = self.generations.get(user_id, 0) + 1
+        ids = [
+            session_id
+            for session_id, session in self.sessions.items()
+            if session.user_id == user_id
+        ]
+        for session_id in ids:
+            del self.sessions[session_id]
+        return len(ids)
 
 
 class _FakeAsyncClient:
@@ -110,9 +180,43 @@ def sub2api_settings(monkeypatch):
 
 
 @pytest.fixture
-def auth_service(monkeypatch):
+def session_store():
+    return _SessionStore()
+
+
+@pytest.fixture
+def auth_service(monkeypatch, session_store):
     monkeypatch.setattr("app.application.services.auth_service.httpx.AsyncClient", _FakeAsyncClient)
-    return AuthService(_Repo(), TokenService())
+    return AuthService(_Repo(), TokenService(), session_store)
+
+
+def _request(*, method="GET", cookie=None):
+    headers = []
+    if cookie:
+        headers.append((b"cookie", cookie.encode("ascii")))
+    return Request(
+        {
+            "type": "http",
+            "method": method,
+            "path": "/api/v1/auth/me",
+            "headers": headers,
+            "client": ("127.0.0.1", 12345),
+        }
+    )
+
+
+def _sub2api_user_payload(user_id=123):
+    return {
+        "code": 0,
+        "message": "success",
+        "data": {
+            "id": user_id,
+            "email": "Demo@Example.com",
+            "username": "Demo User",
+            "role": "admin",
+            "status": "active",
+        },
+    }
 
 
 @pytest.mark.asyncio
@@ -159,6 +263,89 @@ async def test_verify_sub2api_token_maps_complete_user(auth_service):
 
 
 @pytest.mark.asyncio
+async def test_auth_me_issues_local_cookie_without_provider_token(
+    auth_service, session_store
+):
+    user = auth_service._map_sub2api_user(_sub2api_user_payload()["data"])
+    response = Response()
+
+    result = await get_current_user_info(
+        response=response,
+        http_request=_request(),
+        current_user=user,
+        bearer_credentials=HTTPAuthorizationCredentials(
+            scheme="Bearer", credentials="provider-access-secret"
+        ),
+        auth_service=auth_service,
+    )
+
+    cookie = SimpleCookie()
+    cookie.load(response.headers["set-cookie"])
+    session_id = cookie[get_settings().session_cookie_name].value
+    assert session_id != "provider-access-secret"
+    assert "provider-access-secret" not in response.headers["set-cookie"]
+    assert "HttpOnly" in response.headers["set-cookie"]
+    assert session_store.sessions[session_id].user_snapshot["id"] == "sub2api:123"
+    assert "provider-access-secret" not in session_store.sessions[session_id].model_dump_json()
+    assert result.data.id == "sub2api:123"
+
+    # Native WebSockets resolve only the opaque Cookie session and do not need
+    # an Authorization header or another provider round-trip.
+    resolved_user = await auth_service.verify_token(session_id)
+    assert resolved_user is not None
+    assert resolved_user.id == "sub2api:123"
+
+
+@pytest.mark.asyncio
+async def test_sub2api_refresh_rotates_local_cookie_but_returns_provider_tokens(
+    auth_service, session_store
+):
+    user = auth_service._map_sub2api_user(_sub2api_user_payload()["data"])
+    old_session = await auth_service.create_auth_session(
+        user, client=AuthClientType.WEB
+    )
+    _FakeAsyncClient.responses.extend(
+        [
+            httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "access_token": "new-provider-access",
+                        "refresh_token": "new-provider-refresh",
+                        "token_type": "Bearer",
+                    },
+                },
+            ),
+            httpx.Response(200, json=_sub2api_user_payload()),
+        ]
+    )
+    response = Response()
+    cookie_name = get_settings().session_cookie_name
+
+    result = await refresh_token(
+        response=response,
+        http_request=_request(
+            method="POST", cookie=f"{cookie_name}={old_session.session_id}"
+        ),
+        request=RefreshTokenRequest(refresh_token="old-provider-refresh"),
+        bearer_credentials=None,
+        auth_service=auth_service,
+    )
+
+    cookie = SimpleCookie()
+    cookie.load(response.headers["set-cookie"])
+    new_session_id = cookie[cookie_name].value
+    assert result.data.access_token == "new-provider-access"
+    assert result.data.refresh_token == "new-provider-refresh"
+    assert new_session_id not in {old_session.session_id, "new-provider-access"}
+    assert old_session.session_id not in session_store.sessions
+    assert new_session_id in session_store.sessions
+    assert "new-provider-access" not in response.headers["set-cookie"]
+    assert "new-provider-refresh" not in response.headers["set-cookie"]
+
+
+@pytest.mark.asyncio
 async def test_verify_sub2api_token_rejects_inactive_user(auth_service):
     _FakeAsyncClient.responses.append(
         httpx.Response(
@@ -176,11 +363,7 @@ async def test_verify_sub2api_token_rejects_inactive_user(auth_service):
         )
     )
 
-    user = await auth_service.verify_token("sub2api-token")
-
-    assert user is not None
-    assert user.id == "sub2api:456"
-    assert user.is_active is False
+    assert await auth_service.verify_token("sub2api-token") is None
 
 
 @pytest.mark.asyncio
@@ -235,6 +418,21 @@ async def test_logout_revokes_sub2api_access_and_refresh_locally(auth_service):
         await auth_service.refresh_access_token("logged-out-refresh")
     assert _FakeAsyncClient.requests == []
     assert min(_FakeRedis.expirations.values()) >= 90 * 24 * 60 * 60
+
+
+@pytest.mark.asyncio
+async def test_logout_also_revokes_sub2api_opaque_cookie_session(
+    auth_service, session_store
+):
+    user = auth_service._map_sub2api_user(_sub2api_user_payload()["data"])
+    session = await auth_service.create_auth_session(user)
+
+    assert await auth_service.logout(
+        "access-token",
+        refresh_token="refresh-token",
+        cookie_session_id=session.session_id,
+    ) is True
+    assert session.session_id not in session_store.sessions
 
 
 @pytest.mark.asyncio

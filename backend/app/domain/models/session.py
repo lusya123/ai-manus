@@ -16,6 +16,12 @@ class SessionStatus(str, Enum):
     COMPLETED = "completed"
 
 
+class TaskMode(str, Enum):
+    """Manus-style task mode: agent (plan-act) vs chat (lightweight Q&A)"""
+    AGENT = "agent"
+    CHAT = "chat"
+
+
 class SessionSummary(BaseModel):
     """Lightweight session model for list views (excludes heavy events/files)"""
     id: str
@@ -26,6 +32,10 @@ class SessionSummary(BaseModel):
     latest_message_at: Optional[datetime] = None
     status: SessionStatus = SessionStatus.PENDING
     is_shared: bool = False
+    is_favorite: bool = False
+    is_pinned: bool = False
+    project_id: Optional[str] = None
+    task_mode: TaskMode = TaskMode.AGENT
 
 
 class Session(BaseModel):
@@ -60,6 +70,10 @@ class Session(BaseModel):
     # Rotated on every share/unshare transition so previously issued public
     # capabilities cannot revive if a session is shared again.
     share_epoch: str = Field(default_factory=lambda: uuid.uuid4().hex)
+    is_favorite: bool = False
+    is_pinned: bool = False
+    project_id: Optional[str] = None
+    task_mode: TaskMode = TaskMode.AGENT
 
     def get_last_plan(self) -> Optional[Plan]:
         """Get the last plan from the events"""

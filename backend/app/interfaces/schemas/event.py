@@ -22,6 +22,8 @@ from app.domain.models.event import (
     TitleEvent,
     ToolEvent,
     StepEvent,
+    FileUpdateEvent,
+    TerminalUpdateEvent,
 )
 
 
@@ -106,7 +108,7 @@ class CommonEventData(BaseEventData):
         }
         extra = "allow"
 
-class BaseSSEEvent(BaseModel):
+class BaseStreamEvent(BaseModel):
     event: str
     data: BaseEventData
 
@@ -123,7 +125,7 @@ class MessageEventData(BaseEventData):
     content: str
     attachments: Optional[List[FileInfoResponse]] = None
 
-class MessageSSEEvent(BaseSSEEvent):
+class MessageStreamEvent(BaseStreamEvent):
     event: Literal["message"] = "message"
     data: MessageEventData
 
@@ -147,7 +149,7 @@ class SharedMessageEventData(BaseEventData):
     attachments: Optional[List[SharedFileInfoResponse]] = None
 
 
-class SharedMessageSSEEvent(BaseSSEEvent):
+class SharedMessageStreamEvent(BaseStreamEvent):
     event: Literal["message"] = "message"
     data: SharedMessageEventData
 
@@ -159,7 +161,7 @@ class ToolEventData(BaseEventData):
     args: Dict[str, Any]
     content: Optional[ToolContent] = None
 
-class ToolSSEEvent(BaseSSEEvent):
+class ToolStreamEvent(BaseStreamEvent):
     event: Literal["tool"] = "tool"
     data: ToolEventData
 
@@ -185,16 +187,55 @@ class ToolSSEEvent(BaseSSEEvent):
             )
         )
 
-class DoneSSEEvent(BaseSSEEvent):
+class DoneStreamEvent(BaseStreamEvent):
     event: Literal["done"] = "done"
 
-class WaitSSEEvent(BaseSSEEvent):
+class WaitStreamEvent(BaseStreamEvent):
     event: Literal["wait"] = "wait"
+
+
+class TerminalUpdateEventData(BaseEventData):
+    shell_id: str
+    output: Any = None
+    description: Optional[str] = None
+
+
+class TerminalUpdateStreamEvent(BaseStreamEvent):
+    event: Literal["terminal_update"] = "terminal_update"
+    data: TerminalUpdateEventData
+
+
+class FileUpdateEventData(BaseEventData):
+    path: str
+    content: str = ""
+    old_content: Optional[str] = None
+    file: Optional[FileInfoResponse] = None
+
+
+class FileUpdateStreamEvent(BaseStreamEvent):
+    event: Literal["file_update"] = "file_update"
+    data: FileUpdateEventData
+
+    @classmethod
+    async def from_event_async(cls, event: FileUpdateEvent) -> Self:
+        file_resp = (
+            await FileInfoResponse.from_domain(event.file) if event.file else None
+        )
+        return cls(
+            data=FileUpdateEventData(
+                **BaseEventData.base_event_data(event),
+                path=event.path,
+                content=event.content,
+                old_content=event.old_content,
+                file=file_resp,
+            )
+        )
+
 
 class ErrorEventData(BaseEventData):
     error: str
 
-class ErrorSSEEvent(BaseSSEEvent):
+class ErrorStreamEvent(BaseStreamEvent):
     event: Literal["error"] = "error"
     data: ErrorEventData
 
@@ -203,7 +244,7 @@ class StepEventData(BaseEventData):
     id: str
     description: str
 
-class StepSSEEvent(BaseSSEEvent):
+class StepStreamEvent(BaseStreamEvent):
     event: Literal["step"] = "step"
     data: StepEventData
 
@@ -221,14 +262,14 @@ class StepSSEEvent(BaseSSEEvent):
 class TitleEventData(BaseEventData):
     title: str
 
-class TitleSSEEvent(BaseSSEEvent):
+class TitleStreamEvent(BaseStreamEvent):
     event: Literal["title"] = "title"
     data: TitleEventData
 
 class PlanEventData(BaseEventData):
     steps: List[StepEventData]
 
-class PlanSSEEvent(BaseSSEEvent):
+class PlanStreamEvent(BaseStreamEvent):
     event: Literal["plan"] = "plan"
     data: PlanEventData
 
@@ -246,101 +287,93 @@ class PlanSSEEvent(BaseSSEEvent):
             )
         )
 
-class CommonSSEEvent(BaseSSEEvent):
+class CommonStreamEvent(BaseStreamEvent):
     event: str
     data: CommonEventData
-
 
 class AcceptedEventData(BaseEventData):
     submission_id: str
     state: str
 
 
-class AcceptedSSEEvent(BaseSSEEvent):
+class AcceptedStreamEvent(BaseStreamEvent):
     event: Literal["accepted"] = "accepted"
     data: AcceptedEventData
 
-AgentSSEEvent = Union[
-    AcceptedSSEEvent,
-    PlanSSEEvent,
-    MessageSSEEvent,
-    TitleSSEEvent,
-    ToolSSEEvent,
-    StepSSEEvent,
-    DoneSSEEvent,
-    ErrorSSEEvent,
-    WaitSSEEvent,
-    CommonSSEEvent,
+AgentStreamEvent = Union[
+    AcceptedStreamEvent,
+    PlanStreamEvent,
+    MessageStreamEvent,
+    TitleStreamEvent,
+    ToolStreamEvent,
+    StepStreamEvent,
+    DoneStreamEvent,
+    ErrorStreamEvent,
+    WaitStreamEvent,
+    TerminalUpdateStreamEvent,
+    FileUpdateStreamEvent,
+    CommonStreamEvent,
 ]
 
-SharedAgentSSEEvent = Union[
-    AcceptedSSEEvent,
-    PlanSSEEvent,
-    SharedMessageSSEEvent,
-    TitleSSEEvent,
-    ToolSSEEvent,
-    StepSSEEvent,
-    DoneSSEEvent,
-    ErrorSSEEvent,
-    WaitSSEEvent,
-    CommonSSEEvent,
+SharedAgentStreamEvent = Union[
+    AcceptedStreamEvent,
+    PlanStreamEvent,
+    SharedMessageStreamEvent,
+    TitleStreamEvent,
+    ToolStreamEvent,
+    StepStreamEvent,
+    DoneStreamEvent,
+    ErrorStreamEvent,
+    WaitStreamEvent,
+    TerminalUpdateStreamEvent,
+    FileUpdateStreamEvent,
+    CommonStreamEvent,
 ]
 
-# Explicit registry: domain event type -> SSE event class.
+# Explicit registry: domain event type -> wire stream event class.
 # Register new event types here when adding them to AgentEvent.
-_EVENT_TYPE_TO_SSE_CLASS: Dict[str, Type[BaseSSEEvent]] = {
-    "accepted": AcceptedSSEEvent,
-    "plan": PlanSSEEvent,
-    "message": MessageSSEEvent,
-    "title": TitleSSEEvent,
-    "tool": ToolSSEEvent,
-    "step": StepSSEEvent,
-    "done": DoneSSEEvent,
-    "error": ErrorSSEEvent,
-    "wait": WaitSSEEvent,
+_EVENT_TYPE_TO_STREAM_CLASS: Dict[str, Type[BaseStreamEvent]] = {
+    "accepted": AcceptedStreamEvent,
+    "plan": PlanStreamEvent,
+    "message": MessageStreamEvent,
+    "title": TitleStreamEvent,
+    "tool": ToolStreamEvent,
+    "step": StepStreamEvent,
+    "done": DoneStreamEvent,
+    "error": ErrorStreamEvent,
+    "wait": WaitStreamEvent,
+    "terminal_update": TerminalUpdateStreamEvent,
+    "file_update": FileUpdateStreamEvent,
 }
 
 class EventMapper:
-    """Map AgentEvent (domain) to SSEEvent (wire format)"""
+    """Map AgentEvent (domain) to AgentStreamEvent (WS / REST wire format)"""
 
     @staticmethod
-    async def event_to_sse_event(event: AgentEvent) -> Optional[AgentSSEEvent]:
-        # Plans, steps, and notification tool calls are private execution
-        # progress. Persist them for recovery, but do not expose them as chat.
-        if isinstance(event, (PlanEvent, StepEvent)):
-            return None
-        if (
-            isinstance(event, ToolEvent)
-            and event.tool_name == "message"
-            and event.function_name == "message_notify_user"
-        ):
-            return None
-        sse_event_class = _EVENT_TYPE_TO_SSE_CLASS.get(event.type, CommonSSEEvent)
+    async def event_to_stream_event(event: AgentEvent) -> AgentStreamEvent:
+        stream_event_class = _EVENT_TYPE_TO_STREAM_CLASS.get(event.type, CommonStreamEvent)
         # Classes needing IO (e.g. signed URLs) define from_event_async
-        from_event_async = getattr(sse_event_class, "from_event_async", None)
+        from_event_async = getattr(stream_event_class, "from_event_async", None)
         if from_event_async is not None:
             return await from_event_async(event)
-        return sse_event_class.from_event(event)
+        return stream_event_class.from_event(event)
 
     @staticmethod
-    async def events_to_sse_events(events: List[AgentEvent]) -> List[AgentSSEEvent]:
-        """Create SSE event list from event list"""
+    async def events_to_stream_events(events: List[AgentEvent]) -> List[AgentStreamEvent]:
+        """Create wire event list from domain event list"""
         return [
-            mapped
-            for event in events
-            if event
-            if (mapped := await EventMapper.event_to_sse_event(event)) is not None
+            await EventMapper.event_to_stream_event(event) for event in events if event
         ]
 
     @staticmethod
-    async def event_to_shared_sse_event(
+    async def event_to_shared_stream_event(
         event: AgentEvent,
         *,
         session_id: str,
         share_epoch: str,
         shared_files: Dict[str, FileInfo],
         file_service,
-    ) -> Optional[SharedAgentSSEEvent]:
+    ) -> Optional[SharedAgentStreamEvent]:
         """Map an event for an unauthenticated public session view.
 
         Public capabilities must be scoped to the live share epoch.  Reusing
@@ -366,7 +399,7 @@ class EventMapper:
                         file_url,
                     )
                 )
-            return SharedMessageSSEEvent(
+            return SharedMessageStreamEvent(
                 data=SharedMessageEventData(
                     **BaseEventData.base_event_data(event),
                     role=event.role,
@@ -403,7 +436,7 @@ class EventMapper:
                     )
             elif isinstance(private_content, PreviewToolContent):
                 public_content = _shared_preview_content(private_content)
-            return ToolSSEEvent(
+            return ToolStreamEvent(
                 data=ToolEventData(
                     **BaseEventData.base_event_data(event),
                     tool_call_id=event.tool_call_id,
@@ -415,17 +448,37 @@ class EventMapper:
                 )
             )
 
-        return await EventMapper.event_to_sse_event(event)
+        # Fail closed for execution-only events. Terminal output and file
+        # updates can contain command output, source text, internal paths, and
+        # owner-scoped signed file URLs. Public shares expose only transcript
+        # events and explicitly sanitized tool summaries.
+        if isinstance(
+            event,
+            (AcceptedEvent, PlanEvent, StepEvent, TerminalUpdateEvent, FileUpdateEvent),
+        ):
+            return None
+        if isinstance(event, ErrorEvent):
+            return ErrorStreamEvent(
+                data=ErrorEventData(
+                    **BaseEventData.base_event_data(event),
+                    error="Agent execution failed",
+                )
+            )
+        if isinstance(event, TitleEvent) or event.type in {"done", "wait"}:
+            return await EventMapper.event_to_stream_event(event)
+        # Unknown event kinds must be reviewed before they cross the
+        # unauthenticated sharing boundary.
+        return None
 
     @staticmethod
-    async def events_to_shared_sse_events(
+    async def events_to_shared_stream_events(
         events: List[AgentEvent],
         *,
         session_id: str,
         share_epoch: str,
         shared_files: Dict[str, FileInfo],
         file_service,
-    ) -> List[SharedAgentSSEEvent]:
+    ) -> List[SharedAgentStreamEvent]:
         """Create a capability-safe event list for a public share."""
 
         return [
@@ -433,7 +486,7 @@ class EventMapper:
             for event in events
             if event
             if (
-                mapped := await EventMapper.event_to_shared_sse_event(
+                mapped := await EventMapper.event_to_shared_stream_event(
                     event,
                     session_id=session_id,
                     share_epoch=share_epoch,

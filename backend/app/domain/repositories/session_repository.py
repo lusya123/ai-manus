@@ -102,6 +102,12 @@ class SessionRepository(Protocol):
     async def find_summaries_by_user_id(self, user_id: str) -> List[SessionSummary]:
         """Find lightweight session summaries for a user (excludes events/files)"""
         ...
+
+    async def find_summary_by_id_and_user_id(
+        self, session_id: str, user_id: str
+    ) -> Optional[SessionSummary]:
+        """Find a lightweight session summary by ID for a specific user"""
+        ...
     
     async def find_by_id_and_user_id(self, session_id: str, user_id: str) -> Optional[Session]:
         """Find a session by ID and user ID (for authorization)"""
@@ -171,6 +177,25 @@ class SessionRepository(Protocol):
     
     async def update_shared_status(self, session_id: str, is_shared: bool) -> str:
         """Update shared status, rotate its capability epoch, and return it."""
+        ...
+
+    async def update_favorite_status(self, session_id: str, is_favorite: bool) -> None:
+        """Update the favorite status of a session"""
+        ...
+
+    async def update_pin_status(self, session_id: str, is_pinned: bool) -> None:
+        """Update the pin status of a session"""
+        ...
+
+    async def update_project_id(self, session_id: str, project_id: Optional[str]) -> None:
+        """Assign or clear project association for a session"""
+        ...
+
+    async def clear_project_id(self, project_id: str) -> None:
+        """Clear project_id from all sessions belonging to a project"""
+
+    async def update_task_mode(self, session_id: str, task_mode: str) -> None:
+        """Update session task mode (agent | chat)"""
         ...
     
     async def delete(self, session_id: str) -> None:

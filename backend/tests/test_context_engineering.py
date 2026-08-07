@@ -106,6 +106,15 @@ class TestSystemPromptBuilder:
         assert "<runtime_environment>safe</runtime_environment>" in prompt
         assert prompt.endswith("<role>planner</role>")
 
+    def test_project_instruction_section(self):
+        prompt = build_system_prompt(project_instruction="Always reply in Chinese.")
+        assert "<project_instructions>" in prompt
+        assert "Always reply in Chinese." in prompt
+
+    def test_blank_project_instruction_omitted(self):
+        prompt = build_system_prompt(project_instruction="   ")
+        assert "<project_instructions>" not in prompt
+
     def test_describe_toolkits_compact_overview(self):
         overview = describe_toolkits([EchoToolkit(), SilentToolkit()])
         assert overview == "- echo: echo\n- silent: noop"

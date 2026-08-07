@@ -71,6 +71,7 @@ class ExecutionAgent(BaseAgent):
             toolkits=self.toolkits,
             runtime_prompt=self._runtime_prompt,
             role_prompt=EXECUTION_ROLE_PROMPT,
+            project_instruction=self._project_instruction,
         )
 
     @staticmethod

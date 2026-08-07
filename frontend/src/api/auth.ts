@@ -97,8 +97,8 @@ export interface LogoutRequest {
  */
 export interface RefreshTokenResponse {
   access_token: string;
-  token_type: string;
   refresh_token?: string;
+  token_type: string;
 }
 
 /**

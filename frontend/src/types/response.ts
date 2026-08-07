@@ -1,4 +1,4 @@
-import { AgentSSEEvent } from "./event";
+import { AgentEvent } from "./event";
 
 export enum SessionStatus {
     PENDING = "pending",
@@ -15,8 +15,12 @@ export interface GetSessionResponse {
     session_id: string;
     title: string | null;
     status: SessionStatus;
-    events: AgentSSEEvent[];
+    events: AgentEvent[];
     is_shared: boolean;
+    is_favorite: boolean;
+    is_pinned: boolean;
+    project_id: string | null;
+    task_mode: 'agent' | 'chat';
     model_config?: SessionModelConfig | null;
 }
 
@@ -35,10 +39,45 @@ export interface ListSessionItem {
     status: SessionStatus;
     unread_message_count: number;
     is_shared: boolean;
+    is_favorite: boolean;
+    is_pinned: boolean;
+    project_id: string | null;
+    task_mode?: 'agent' | 'chat';
 }
 
 export interface ListSessionResponse {
     sessions: ListSessionItem[];
+}
+
+export interface ProjectItem {
+    project_id: string;
+    name: string;
+    instruction: string | null;
+    is_pinned: boolean;
+    sort_order: number;
+    created_at?: string | null;
+    updated_at?: string | null;
+}
+
+export interface ListProjectsResponse {
+    projects: ProjectItem[];
+}
+
+export interface LibraryFileItem {
+    session_id: string;
+    session_title: string | null;
+    file_id: string | null;
+    filename: string | null;
+    file_path: string | null;
+    content_type: string | null;
+    size: number | null;
+    upload_date: string | null;
+    is_favorite: boolean;
+    latest_message_at: number | null;
+}
+
+export interface LibraryResponse {
+    files: LibraryFileItem[];
 }
 
 export interface ConsoleRecord {
@@ -72,6 +111,6 @@ export interface SharedSessionResponse {
     session_id: string;
     title: string | null;
     status: SessionStatus;
-    events: AgentSSEEvent[];
+    events: AgentEvent[];
     is_shared: boolean;
 }

@@ -12,6 +12,7 @@ from app.domain.models.turn_submission import (
     TurnSubmissionConflictError,
     TurnSubmissionUnavailableError,
 )
+from app.domain.repositories.file_favorite_repository import FileFavoriteRepository
 
 from app.interfaces.schemas.session import ShellViewResponse
 from app.interfaces.schemas.file import FileViewResponse
@@ -44,6 +45,7 @@ from app.core.config import SUPPORTED_BYOK_PROVIDERS, get_settings
 from app.application.errors.exceptions import (
     BadRequestError,
     ConflictError,
+    NotFoundError,
     ServiceUnavailableError,
     TooManyRequestsError,
 )
@@ -106,11 +108,13 @@ class AgentService:
         session_lifecycle_lease: Optional[SessionLifecycleLease] = None,
         turn_submission_repository: Optional[TurnSubmissionRepository] = None,
         sandbox_provisioner: Optional[SandboxProvisioner] = None,
+        file_favorite_repository: Optional[FileFavoriteRepository] = None,
     ):
         logger.info("Initializing AgentService")
         self._agent_repository = agent_repository
         self._session_repository = session_repository
         self._file_storage = file_storage
+        self._file_favorite_repository = file_favorite_repository
         self._agent_domain_service = AgentDomainService(
             self._agent_repository,
             self._session_repository,
@@ -403,6 +407,14 @@ class AgentService:
         logger.info(f"Getting all sessions for user {user_id}")
         return await self._session_repository.find_summaries_by_user_id(user_id)
 
+    async def get_session_summary(
+        self, session_id: str, user_id: str
+    ) -> Optional[SessionSummary]:
+        """Get a lightweight session summary for list upsert"""
+        return await self._session_repository.find_summary_by_id_and_user_id(
+            session_id, user_id
+        )
+
     async def delete_session(self, session_id: str, user_id: str) -> None:
         """Cancel work, destroy the sandbox, then delete the session record.
 
@@ -480,6 +492,111 @@ class AgentService:
                 session_id, delete_locked
             )
         logger.info(f"Session {session_id} deleted successfully")
+
+    async def update_session_title(self, session_id: str, user_id: str, title: str) -> None:
+        """Update a session title, ensuring it belongs to the user"""
+        logger.info(f"Updating title for session {session_id} for user {user_id}")
+        session = await self._session_repository.find_by_id_and_user_id(session_id, user_id)
+        if not session:
+            logger.error(f"Session {session_id} not found for user {user_id}")
+            raise RuntimeError("Session not found")
+        await self._session_repository.update_title(session_id, title)
+        logger.info(f"Session {session_id} title updated successfully")
+
+    async def update_session_favorite(self, session_id: str, user_id: str, is_favorite: bool) -> None:
+        """Update favorite status of a session"""
+        session = await self._session_repository.find_by_id_and_user_id(session_id, user_id)
+        if not session:
+            raise RuntimeError("Session not found")
+        await self._session_repository.update_favorite_status(session_id, is_favorite)
+
+    async def update_session_pin(self, session_id: str, user_id: str, is_pinned: bool) -> None:
+        """Update pin status of a session"""
+        session = await self._session_repository.find_by_id_and_user_id(session_id, user_id)
+        if not session:
+            raise RuntimeError("Session not found")
+        await self._session_repository.update_pin_status(session_id, is_pinned)
+
+    async def update_session_project(
+        self,
+        session_id: str,
+        user_id: str,
+        project_id: Optional[str],
+    ) -> None:
+        """Move a session into a project or remove it from any project"""
+        session = await self._session_repository.find_by_id_and_user_id(session_id, user_id)
+        if not session:
+            raise RuntimeError("Session not found")
+        await self._session_repository.update_project_id(session_id, project_id)
+
+    async def update_session_task_mode(
+        self,
+        session_id: str,
+        user_id: str,
+        task_mode: str,
+    ) -> None:
+        """Update Manus-style task mode (agent | chat)"""
+        session = await self._session_repository.find_by_id_and_user_id(session_id, user_id)
+        if not session:
+            raise RuntimeError("Session not found")
+        await self._session_repository.update_task_mode(session_id, task_mode)
+
+    async def update_library_file_favorite(
+        self,
+        file_id: str,
+        user_id: str,
+        is_favorite: bool,
+    ) -> None:
+        """Update favorite status of a library file (per attachment, not session)."""
+        if not self._file_favorite_repository:
+            raise RuntimeError("File favorite repository not available")
+        if not await self._user_owns_library_file(user_id, file_id):
+            raise NotFoundError("File not found")
+        await self._file_favorite_repository.set_favorite(user_id, file_id, is_favorite)
+
+    async def _user_owns_library_file(self, user_id: str, file_id: str) -> bool:
+        sessions = await self._session_repository.find_by_user_id(user_id)
+        for session in sessions:
+            for file_info in session.files or []:
+                if file_info.file_id == file_id:
+                    return True
+        return False
+
+    async def get_library_files(self, user_id: str, limit: int = 100) -> List[dict]:
+        """Aggregate recent files across the user's sessions for Library view"""
+        sessions = await self._session_repository.find_by_user_id(user_id)
+        sessions = sorted(
+            sessions,
+            key=lambda s: s.latest_message_at or s.updated_at,
+            reverse=True,
+        )
+        favorite_ids: set[str] = set()
+        if self._file_favorite_repository:
+            favorite_ids = await self._file_favorite_repository.list_favorite_file_ids(user_id)
+        items: List[dict] = []
+        for session in sessions:
+            for file_info in session.files or []:
+                upload_date = getattr(file_info, "upload_date", None)
+                file_id = file_info.file_id
+                items.append({
+                    "session_id": session.id,
+                    "session_title": session.title,
+                    "file_id": file_id,
+                    "filename": file_info.filename,
+                    "file_path": getattr(file_info, "file_path", None),
+                    "content_type": getattr(file_info, "content_type", None),
+                    "size": getattr(file_info, "size", None),
+                    "upload_date": upload_date.isoformat() if upload_date else None,
+                    "is_favorite": bool(file_id and file_id in favorite_ids),
+                    "latest_message_at": (
+                        int(session.latest_message_at.timestamp())
+                        if session.latest_message_at
+                        else None
+                    ),
+                })
+                if len(items) >= limit:
+                    return items
+        return items
 
     async def stop_session(self, session_id: str, user_id: str) -> None:
         """Stop a session, ensuring it belongs to the user"""

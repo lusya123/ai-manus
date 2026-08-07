@@ -105,6 +105,7 @@ def _build_runner_factory(
     from app.infrastructure.repositories.mongo_agent_repository import MongoAgentRepository
     from app.infrastructure.repositories.mongo_session_repository import MongoSessionRepository
     from app.infrastructure.repositories.mongo_turn_submission_repository import MongoTurnSubmissionRepository
+    from app.infrastructure.repositories.mongo_project_repository import MongoProjectRepository
     from app.infrastructure.repositories.file_mcp_repository import FileMCPRepository
 
     repository = turn_submission_repository or MongoTurnSubmissionRepository()
@@ -117,6 +118,7 @@ def _build_runner_factory(
         mcp_repository=FileMCPRepository(),
         llm_factory=get_llm_factory(),
         search_engine=get_search_engine(),
+        project_repository=MongoProjectRepository(),
     )
 
 
@@ -136,6 +138,8 @@ async def _ensure_initialized() -> None:
         TurnSubmissionDocument,
         TurnQuotaDocument,
         TurnOutputEventDocument,
+        ProjectDocument,
+        FileFavoriteDocument,
     )
 
     settings = get_settings()
@@ -150,6 +154,8 @@ async def _ensure_initialized() -> None:
             TurnSubmissionDocument,
             TurnQuotaDocument,
             TurnOutputEventDocument,
+            ProjectDocument,
+            FileFavoriteDocument,
         ],
     )
     await get_redis().initialize()

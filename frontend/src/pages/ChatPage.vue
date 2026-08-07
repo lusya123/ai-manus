@@ -1,116 +1,174 @@
 <template>
   <SimpleBar ref="simpleBarRef" @scroll="handleScroll">
-    <div ref="chatContainerRef" class="relative flex flex-col h-full flex-1 min-w-0 px-5">
+    <!-- Chat column: full-bleed header (Manus) + centered message column -->
+    <div ref="chatContainerRef" class="relative flex flex-col h-full flex-1 min-w-0">
+      <!-- Official session chrome header bar (CDP: manus.im/app/…) -->
       <div ref="observerRef"
-        class="sm:min-w-[390px] flex flex-row items-center justify-between pt-3 pb-1 gap-1 sticky top-0 z-10 bg-[var(--background-gray-main)] flex-shrink-0">
-        <div class="flex items-center flex-1"></div>
-        <div class="max-w-full sm:max-w-[768px] sm:min-w-[390px] flex w-full flex-col gap-[4px] overflow-hidden">
-          <div
-            class="text-[var(--text-primary)] text-lg font-medium w-full flex flex-row items-center justify-between flex-1 min-w-0 gap-2">
-            <div class="flex flex-row items-center gap-[6px] flex-1 min-w-0">
-              <span class="whitespace-nowrap text-ellipsis overflow-hidden">
-                {{ title }}
+        class="flex h-[56px] w-full shrink-0 items-center justify-between py-[12px] md:px-[24px] ps-[16px] pe-[20px] md:ps-[16px] md:pe-[20px] gap-1 border-b sticky top-0 z-10 flex-shrink-0 [-webkit-app-region:drag] bg-[var(--background-gray-main)] border-[var(--border-main)]">
+        <div class="flex min-w-0 flex-1 items-center gap-1">
+          <div class="flex items-center pointer-events-auto relative" ref="modeMenuRef">
+            <button
+              type="button"
+              class="flex h-8 pt-[7px] md:pr-[6px] pr-[4px] pb-[7px] md:pl-[8px] pl-[6px] justify-center items-center gap-1 rounded-[8px] clickable hover:bg-[var(--fill-tsp-white-light)]"
+              :aria-expanded="showModeMenu"
+              aria-haspopup="menu"
+              @click="toggleModeMenu">
+              <span class="text-[var(--text-primary)] md:text-[18px] text-[16px] font-[500] md:leading-[22px] leading-[20px] truncate">Manus</span>
+              <span
+                v-if="taskMode === 'chat'"
+                class="text-[var(--text-tertiary)] text-xs flex h-5 py-0.5 px-1.5 items-center rounded-[6px] border border-[var(--border-dark)] flex-shrink-0">
+                Lite
               </span>
-            </div>
-            <div class="flex items-center gap-2 flex-shrink-0">
-              <span class="relative flex-shrink-0" aria-expanded="false" aria-haspopup="dialog">
-                <Popover>
-                  <PopoverTrigger>
-                    <button
-                      class="h-8 px-3 rounded-[100px] inline-flex items-center gap-1 clickable outline outline-1 outline-offset-[-1px] outline-[var(--border-btn-main)] hover:bg-[var(--fill-tsp-white-light)] me-1.5">
-                      <ShareIcon color="var(--icon-secondary)" />
-                      <span class="text-[var(--text-secondary)] text-sm font-medium">{{ t('Share') }}</span>
-                    </button>
-                  </PopoverTrigger>
-                  <PopoverContent>
-                    <div
-                      class="w-[400px] flex flex-col rounded-2xl bg-[var(--background-menu-white)] shadow-[0px_8px_32px_0px_var(--shadow-S),0px_0px_0px_1px_var(--border-light)]"
-                      style="max-width: calc(-16px + 100vw);">
-                      <div class="flex flex-col pt-[12px] px-[16px] pb-[16px]">
-                        <!-- Private mode option -->
-                        <div @click="handleShareModeChange('private')"
-                          :class="{'pointer-events-none opacity-50': sharingLoading}"
-                          class="flex items-center gap-[10px] px-[8px] -mx-[8px] py-[8px] rounded-[8px] clickable hover:bg-[var(--fill-tsp-white-main)]">
-                          <div
-                            :class="shareMode === 'private' ? 'bg-[var(--Button-primary-black)]' : 'bg-[var(--fill-tsp-white-dark)]'"
-                            class="w-[32px] h-[32px] rounded-[8px] flex items-center justify-center">
-                            <Lock :size="16" :stroke="shareMode === 'private' ? 'var(--text-onblack)' : 'var(--icon-primary)'" :stroke-width="2" /></div>
-                          <div class="flex flex-col flex-1 min-w-0">
-                            <div class="text-sm font-medium text-[var(--text-primary)]">{{ t('Private Only') }}</div>
-                            <div class="text-[13px] text-[var(--text-tertiary)]">{{ t('Only visible to you') }}</div>
-                          </div><Check :size="20" :class="shareMode === 'private' ? 'ml-auto' : 'ml-auto invisible'" :color="shareMode === 'private' ? 'var(--icon-primary)' : 'var(--icon-tertiary)'" />
-                        </div>
-                        <!-- Public mode option -->
-                        <div @click="handleShareModeChange('public')"
-                          :class="{'pointer-events-none opacity-50': sharingLoading}"
-                          class="flex items-center gap-[10px] px-[8px] -mx-[8px] py-[8px] rounded-[8px] clickable hover:bg-[var(--fill-tsp-white-main)]">
-                          <div
-                            :class="shareMode === 'public' ? 'bg-[var(--Button-primary-black)]' : 'bg-[var(--fill-tsp-white-dark)]'"
-                            class="w-[32px] h-[32px] rounded-[8px] flex items-center justify-center">
-                            <Globe :size="16" :stroke="shareMode === 'public' ? 'var(--text-onblack)' : 'var(--icon-primary)'" :stroke-width="2" /></div>
-                          <div class="flex flex-col flex-1 min-w-0">
-                            <div class="text-sm font-medium text-[var(--text-primary)]">{{ t('Public Access') }}</div>
-                            <div class="text-[13px] text-[var(--text-tertiary)]">{{ t('Anyone with the link can view') }}</div>
-                          </div><Check :size="20" :class="shareMode === 'public' ? 'ml-auto' : 'ml-auto invisible'" :color="shareMode === 'public' ? 'var(--icon-primary)' : 'var(--icon-tertiary)'" />
-                        </div>
-                        <div class="border-t border-[var(--border-main)] mt-[4px]"></div>
-                        
-                        <!-- Show instant share button when in private mode -->
-                        <div v-if="shareMode === 'private'">
-                          <button @click.stop="handleInstantShare"
-                            :disabled="sharingLoading"
-                            class="inline-flex items-center justify-center whitespace-nowrap font-medium transition-colors hover:opacity-90 active:opacity-80 bg-[var(--Button-primary-black)] text-[var(--text-onblack)] h-[36px] px-[12px] rounded-[10px] gap-[6px] text-sm min-w-16 mt-[16px] w-full disabled:opacity-50 disabled:cursor-not-allowed"
-                            data-tabindex="" tabindex="-1">
-                            <div v-if="sharingLoading" class="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
-                            <Link v-else :size="16" stroke="currentColor" :stroke-width="2" />
-                            {{ sharingLoading ? t('Sharing...') : t('Share Instantly') }}
-                          </button>
-                        </div>
-                        
-                        <!-- Show copy link button when in public mode -->
-                        <div v-else>
-                          <button @click.stop="handleCopyLink"
-                            :class="linkCopied ? 'inline-flex items-center justify-center whitespace-nowrap font-medium transition-colors active:opacity-80 bg-[var(--Button-primary-white)] text-[var(--text-primary)] hover:opacity-70 active:hover-60 h-[36px] px-[12px] rounded-[10px] gap-[6px] text-sm min-w-16 mt-[16px] w-full border border-[var(--border-btn-main)] shadow-none' : 'inline-flex items-center justify-center whitespace-nowrap font-medium transition-colors hover:opacity-90 active:opacity-80 bg-[var(--Button-primary-black)] text-[var(--text-onblack)] h-[36px] px-[12px] rounded-[10px] gap-[6px] text-sm min-w-16 mt-[16px] w-full'"
-                            data-tabindex="" tabindex="-1">
-                            <Link v-if="!linkCopied" :size="16" stroke="currentColor" :stroke-width="2" />
-                            <Check v-else :size="16" color="var(--text-primary)" />
-                            {{ linkCopied ? t('Link Copied') : t('Copy Link') }}
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-                  </PopoverContent>
-                </Popover>
-              </span>
-              <button @click="handleFileListShow"
-                class="p-[5px] flex items-center justify-center hover:bg-[var(--fill-tsp-white-dark)] rounded-lg cursor-pointer">
-                <FileSearch class="text-[var(--icon-secondary)]" :size="18" />
-              </button>
-              <button @click="handleWorkspaceShow"
-                class="h-8 px-2 sm:px-3 rounded-lg inline-flex items-center gap-1.5 hover:bg-[var(--fill-tsp-white-dark)] cursor-pointer border border-[var(--border-btn-main)] bg-[var(--background-white-main)]"
-                :title="t('Open Manus workspace')">
-                <Monitor class="text-[var(--icon-secondary)]" :size="18" />
-                <span class="hidden sm:inline text-[var(--text-secondary)] text-sm font-medium whitespace-nowrap">{{ t('Workspace') }}</span>
-              </button>
-            </div>
+              <ChevronDown class="size-3.5 text-[var(--icon-tertiary)] shrink-0" :size="14" />
+            </button>
           </div>
-          <div class="w-full flex justify-between items-center">
+          <Teleport to="body">
+            <div
+              v-if="showModeMenu"
+              ref="modeMenuPanelRef"
+              role="menu"
+              class="fixed z-[1100] min-w-[180px] rounded-[12px] border border-[var(--border-light)] bg-[var(--background-menu-white)] shadow-[0px_8px_32px_0px_var(--shadow-S)] p-1"
+              :style="{ top: `${modeMenuPos.top}px`, left: `${modeMenuPos.left}px` }">
+              <button
+                type="button"
+                role="menuitem"
+                class="flex w-full items-center justify-between gap-2 px-3 py-2 rounded-[8px] text-sm text-[var(--text-primary)] hover:bg-[var(--fill-tsp-white-main)]"
+                @click="setTaskMode('agent')">
+                <span>{{ t('Agent') }}</span>
+                <Check v-if="taskMode === 'agent'" :size="16" class="text-[var(--icon-primary)]" />
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                class="flex w-full items-center justify-between gap-2 px-3 py-2 rounded-[8px] text-sm text-[var(--text-primary)] hover:bg-[var(--fill-tsp-white-main)]"
+                @click="setTaskMode('chat')">
+                <span>{{ t('Chat') }} · Lite</span>
+                <Check v-if="taskMode === 'chat'" :size="16" class="text-[var(--icon-primary)]" />
+              </button>
+            </div>
+          </Teleport>
+          <div class="flex-1 min-w-[16px]"></div>
+        </div>
+
+        <div class="flex flex-shrink-0 items-center gap-1 pointer-events-auto">
+          <!-- Share — Manus SharePermission layout -->
+          <Popover>
+            <PopoverTrigger>
+              <button type="button"
+                class="inline-flex items-center justify-center whitespace-nowrap font-medium transition-colors active:opacity-80 bg-transparent text-[var(--text-primary)] hover:opacity-100 hover:bg-[var(--fill-tsp-white-main)] h-[32px] min-w-[64px] px-[8px] rounded-[8px] gap-[4px] text-[14px] leading-[18px]"
+                :class="shareMode === 'public' ? 'bg-[var(--fill-tsp-white-main)]' : ''">
+                <ShareIcon color="var(--icon-secondary)" />
+                <span class="text-[var(--text-secondary)]">{{ t('Share') }}</span>
+              </button>
+            </PopoverTrigger>
+            <PopoverContent align="end">
+              <div class="w-[400px] max-w-[calc(100vw-16px)] flex flex-col bg-[var(--background-menu-white)] rounded-2xl shadow-[0px_8px_32px_0px_var(--shadow-S),0px_0px_0px_1px_var(--border-light)]">
+                <div class="flex py-3 px-4 justify-between items-center border-b border-[var(--border-main)]">
+                  <h3 class="text-[var(--text-primary)] text-base font-medium leading-[22px]">{{ t('Share') }}</h3>
+                  <span class="inline-flex ml-auto cursor-help" :title="t('Share privacy tip')">
+                    <CircleHelp :size="16" class="text-[var(--icon-tertiary)]" />
+                  </span>
+                </div>
+                <div class="pt-[12px] px-[16px] pb-[16px]">
+                  <div @click="handleShareModeChange('private')"
+                    :class="{'pointer-events-none opacity-50': sharingLoading}"
+                    class="flex items-center gap-[10px] px-[8px] -mx-[8px] py-[8px] rounded-[8px] clickable hover:bg-[var(--fill-tsp-white-main)]">
+                    <div class="size-8 rounded-[8px] flex items-center justify-center bg-[var(--fill-tsp-white-dark)]">
+                      <Lock :size="16" color="var(--icon-primary)" :stroke-width="2" />
+                    </div>
+                    <div class="flex flex-col flex-1 min-w-0">
+                      <div class="text-[var(--text-primary)] text-sm font-medium">{{ t('Only me') }}</div>
+                      <div class="text-[var(--text-tertiary)] text-[13px]">{{ t('Viewable by yourself only') }}</div>
+                    </div>
+                    <Check :size="20" :class="shareMode === 'private' ? 'ml-auto' : 'ml-auto invisible'" color="var(--icon-primary)" />
+                  </div>
+                  <div @click="handleShareModeChange('public')"
+                    :class="{'pointer-events-none opacity-50': sharingLoading}"
+                    class="flex items-center gap-[10px] px-[8px] -mx-[8px] py-[8px] rounded-[8px] clickable hover:bg-[var(--fill-tsp-white-main)]">
+                    <div class="size-8 rounded-[8px] flex items-center justify-center bg-[var(--fill-tsp-white-dark)]">
+                      <Globe :size="16" color="var(--icon-primary)" :stroke-width="2" />
+                    </div>
+                    <div class="flex flex-col flex-1 min-w-0">
+                      <div class="text-[var(--text-primary)] text-sm font-medium">{{ t('Public access') }}</div>
+                      <div class="text-[var(--text-tertiary)] text-[13px]">{{ t('Anyone with a link can view') }}</div>
+                    </div>
+                    <Check :size="20" :class="shareMode === 'public' ? 'ml-auto' : 'ml-auto invisible'" color="var(--icon-primary)" />
+                  </div>
+
+                  <div v-if="shareMode === 'private'" class="mt-2">
+                    <button @click.stop="handleInstantShare" :disabled="sharingLoading"
+                      class="inline-flex items-center justify-center whitespace-nowrap font-medium transition-colors hover:opacity-90 active:opacity-80 bg-[var(--Button-primary-black)] text-[var(--text-onblack)] h-[36px] px-[12px] rounded-[10px] gap-[6px] text-sm w-full disabled:opacity-50">
+                      <div v-if="sharingLoading" class="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                      <Link v-else :size="16" stroke="currentColor" :stroke-width="2" />
+                      {{ sharingLoading ? t('Sharing...') : t('Share Instantly') }}
+                    </button>
+                  </div>
+                  <!-- Manus: SocialMediaShare left + Copy link right -->
+                  <div v-else class="mt-2 space-y-2">
+                    <div class="flex items-center justify-between gap-2">
+                      <div class="flex items-center gap-2">
+                        <button type="button" class="size-9 rounded-full bg-[var(--fill-tsp-white-dark)] flex items-center justify-center hover:opacity-80" title="X" @click="shareToSocial('x')">
+                          <span class="text-sm font-bold text-[var(--text-primary)]">𝕏</span>
+                        </button>
+                        <button type="button" class="size-9 rounded-full bg-[var(--fill-tsp-white-dark)] flex items-center justify-center hover:opacity-80 text-[12px] font-semibold text-[var(--text-primary)]" @click="shareToSocial('linkedin')">in</button>
+                        <button type="button" class="size-9 rounded-full bg-[var(--fill-tsp-white-dark)] flex items-center justify-center hover:opacity-80 text-[13px] font-semibold text-[var(--text-primary)]" @click="shareToSocial('facebook')">f</button>
+                        <button type="button" class="size-9 rounded-full bg-[var(--fill-tsp-white-dark)] flex items-center justify-center hover:opacity-80 text-[11px] font-semibold text-[var(--text-primary)]" @click="shareToSocial('reddit')">r/</button>
+                      </div>
+                      <button @click.stop="handleCopyLink"
+                        class="inline-flex items-center justify-center whitespace-nowrap font-medium transition-colors h-[36px] px-[12px] rounded-[10px] gap-[6px] text-sm shrink-0"
+                        :class="linkCopied
+                          ? 'bg-[var(--Button-primary-white)] text-[var(--text-primary)] border border-[var(--border-btn-main)]'
+                          : 'bg-[var(--Button-primary-black)] text-[var(--text-onblack)] hover:opacity-90'">
+                        <Link v-if="!linkCopied" :size="16" stroke="currentColor" :stroke-width="2" />
+                        <Check v-else :size="16" color="var(--text-primary)" />
+                        {{ linkCopied ? t('Link copied') : t('Copy link') }}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </PopoverContent>
+          </Popover>
+
+          <button type="button" @click="handleFileListShow"
+            class="flex items-center justify-center cursor-pointer rounded-md hover:bg-[var(--fill-tsp-white-light)] size-8"
+            :title="t('View all files in this task')">
+            <FileSearch class="size-[18px] text-[var(--icon-secondary)]" :size="18" />
+          </button>
+
+          <!-- Official session More (div.size-8 + Ellipsis) -->
+          <div
+            ref="moreBtnRef"
+            role="button"
+            tabindex="0"
+            class="flex items-center justify-center cursor-pointer rounded-md hover:bg-[var(--fill-tsp-white-light)] size-8"
+            :title="t('More options')"
+            @click="handleMoreClick"
+            @keydown.enter.prevent="handleMoreClick($event)">
+            <Ellipsis class="size-[18px] text-[var(--icon-secondary)]" :size="18" />
           </div>
         </div>
-        <div class="flex-1"></div>
       </div>
-      <div class="mx-auto w-full max-w-full sm:max-w-[768px] sm:min-w-[390px] flex flex-col flex-1">
+
+      <!-- Official message column (CDP session detail): px-[24px] sm:max-w-[810px] sm:min-w-[360px] -->
+      <div class="mx-auto w-full max-w-full px-[24px] sm:max-w-[810px] sm:min-w-[360px] flex flex-col flex-1">
         <div class="flex flex-col w-full gap-[12px] pb-[80px] pt-[12px] flex-1 overflow-y-auto">
           <ChatMessage v-for="(message, index) in messages" :key="index" :message="message"
             :hideHeader="isConsecutiveAssistant(messages, index)"
+            :showLiteBadge="taskMode === 'chat'"
+            :showCopyActions="shouldShowAssistantCopyActions(index)"
+            :isLastBeforeUser="isAssistantLastBeforeUser(index)"
             @toolClick="handleToolClick" />
-
-          <!-- Loading indicator -->
-          <LoadingIndicator v-if="isLoading && !streamStalled" :text="loadingText" />
-          <div v-if="streamStalled" role="alert"
-            class="rounded-xl border border-[var(--border-main)] bg-[var(--background-white-main)] px-4 py-3 text-sm text-[var(--text-secondary)]">
-            {{ t('Live updates stopped while the task may still be running. Refresh this page or stop the task.') }}
-          </div>
+          <ChatWaitingContinue
+            :visible="showWaitingContinue"
+            :copy-text="lastAssistantPlainText" />
+          <ChatTaskCompleted
+            :visible="showTaskCompleted"
+            :copy-text="lastAssistantPlainText" />
+          <!-- AgentIsTyping: only fill the empty gap before first visible turn output -->
+          <LoadingIndicator v-if="showThinking" :text="$t('{name} is thinking', { name: 'Manus' })" />
+          <!-- Official running spacer when work is already visible (tools/steps/messages) -->
+          <div v-else-if="isBusy" aria-hidden="true" class="h-5 invisible" />
         </div>
 
         <div class="flex flex-col bg-[var(--background-gray-main)] sticky bottom-0">
@@ -118,48 +176,55 @@
             class="flex items-center justify-center w-[36px] h-[36px] rounded-full bg-[var(--background-white-main)] hover:bg-[var(--background-gray-main)] clickable border border-[var(--border-main)] shadow-[0px_5px_16px_0px_var(--shadow-S),0px_0px_1.25px_0px_var(--shadow-S)] absolute -top-20 left-1/2 -translate-x-1/2">
             <ArrowDown class="text-[var(--icon-primary)]" :size="20" />
           </button>
-          <PlanPanel v-if="plan && plan.steps.length > 0" :plan="plan" />
-          <ChatBox v-model="inputMessage" v-model:attachments="attachments" :rows="1"
+          <TakeControlBanner
+            :visible="showTakeControlBanner"
+            @takeControl="handleTakeControl" />
+          <ChatBox v-model="inputMessage" v-model:attachments="attachments" :rows="1" dense @submit="handleSubmit"
+            :isRunning="isBusy" :isStopping="isStopping" @stop="handleStop" :placeholder="chatPlaceholder"
             :selected-model-id="selectedModelId" :model-options="modelOptions" show-model-picker
-            model-picker-disabled @submit="handleSubmit" :isRunning="isLoading"
-            :isStopping="isStopping" @stop="handleStop" />
+            model-picker-disabled />
         </div>
       </div>
     </div>
-    <ToolPanel ref="toolPanel" :size="toolPanelSize" :sessionId="sessionId" :realTime="realTime" 
-      :isShare="false"
-      @jumpToRealTime="jumpToRealTime" />
+    <ComputerPanel ref="computerPanel" :sessionId="sessionId" :realTime="realTime"
+      :isShare="false" :toolHistory="toolHistory" :plan="plan"
+      @jumpToRealTime="jumpToRealTime"
+      @selectTool="handleSelectTool"
+      @useComputer="handleTakeControl" />
   </SimpleBar>
 </template>
 
 <script setup lang="ts">
 import SimpleBar from '../components/SimpleBar.vue';
-import { computed, ref, onMounted, watch, nextTick, onUnmounted, reactive, toRefs } from 'vue';
+import { ref, onMounted, watch, nextTick, onUnmounted, reactive, toRefs, computed } from 'vue';
 import { useRouter, onBeforeRouteUpdate } from 'vue-router';
 import { useI18n } from 'vue-i18n';
 import ChatBox from '../components/ChatBox.vue';
 import ChatMessage from '../components/ChatMessage.vue';
+import ChatTaskCompleted from '../components/ChatTaskCompleted.vue';
+import ChatWaitingContinue from '../components/ChatWaitingContinue.vue';
+import TakeControlBanner from '../components/TakeControlBanner.vue';
 import * as agentApi from '../api/agent';
-import { Message, MessageContent, ToolContent, AttachmentsContent, isConsecutiveAssistant } from '../types/message';
-import { PlanEventData, AgentSSEEvent } from '../types/event';
-import {
-  getLatestTurnId,
-  hasTerminalEventForLatestTurn,
-  hasTerminalEventForTurn,
-  useAgentEvents,
-} from '../composables/useAgentEvents';
-import ToolPanel from '../components/ToolPanel.vue'
-import PlanPanel from '../components/PlanPanel.vue';
-import { ArrowDown, FileSearch, Lock, Globe, Link, Check, Monitor } from 'lucide-vue-next';
+import { ChatSubmissionError, createChatSubmissionId } from '../api/chatWs';
+import { Message, MessageContent, ToolContent, StepContent, isConsecutiveAssistant } from '../types/message';
+import { PlanEventData, AgentEvent, type TerminalUpdateEventData, type FileUpdateEventData } from '../types/event';
+import { useAgentEvents } from '../composables/useAgentEvents';
+import { useSessionPhase } from '../composables/useSessionPhase';
+import ComputerPanel from '../components/ComputerPanel.vue'
+import { ArrowDown, FileSearch, Lock, Globe, Link, Check, Ellipsis, Pencil, Star, Trash, FolderPlus, Folder, FolderSync, Pin, ChevronDown, CircleHelp } from 'lucide-vue-next';
 import ShareIcon from '@/components/icons/ShareIcon.vue';
-import { showErrorToast, showInfoToast, showSuccessToast } from '../utils/toast';
+import { showErrorToast, showSuccessToast } from '../utils/toast';
 import type { FileInfo } from '../api/file';
 import { useSessionFileList } from '../composables/useSessionFileList'
-import { useFilePanel } from '../composables/useFilePanel'
+import { useFilePreviewer } from '../composables/useFilePreviewer'
 import { copyToClipboard } from '../utils/dom'
-import { SessionStatus } from '../types/response';
+import { SessionStatus, type ProjectItem, type SessionModelConfig } from '../types/response';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import LoadingIndicator from '@/components/ui/LoadingIndicator.vue';
+import { useContextMenu, createMenuItem, createDangerMenuItem, createSeparator, createSubmenuItem } from '../composables/useContextMenu';
+import { useDialog } from '../composables/useDialog';
+import { getProjects, createProject } from '../api/project';
+import { eventBus } from '../utils/eventBus';
 import { getCachedClientConfig } from '@/api/config';
 import {
   buildChatModelOptions,
@@ -169,78 +234,19 @@ import {
   upsertCurrentSessionModelOption,
 } from '@/api/agentConfig';
 import type { ChatModelOption } from '@/api/agentConfig';
-import type { SessionModelConfig } from '@/types/response';
-import { createUuid } from '@/utils/uuid';
 
 const router = useRouter()
 const { t } = useI18n()
 const { showSessionFileList } = useSessionFileList()
-const { hideFilePanel } = useFilePanel()
-
-// Create initial state factory
-const createInitialState = () => ({
-  inputMessage: '',
-  isLoading: false,
-  isStopping: false,
-  streamStalled: false,
-  retryAttempt: 0,
-  sessionId: undefined as string | undefined,
-  messages: [] as Message[],
-  toolPanelSize: 0,
-  realTime: true,
-  follow: true,
-  title: t('New Chat'),
-  plan: undefined as PlanEventData | undefined,
-  lastNoMessageTool: undefined as ToolContent | undefined,
-  lastMessageTool: undefined as ToolContent | undefined,
-  lastTool: undefined as ToolContent | undefined,
-  lastEventId: undefined as string | undefined,
-  cancelCurrentChat: null as (() => void) | null,
-  attachments: [] as FileInfo[],
-  shareMode: 'private' as 'private' | 'public', // Default to private mode
-  linkCopied: false,
-  sharingLoading: false // Loading state for share operations
-});
-
-// Create reactive state
-const state = reactive(createInitialState());
-
-// Destructure refs from reactive state
-const {
-  inputMessage,
-  isLoading,
-  isStopping,
-  streamStalled,
-  retryAttempt,
-  sessionId,
-  messages,
-  toolPanelSize,
-  realTime,
-  follow,
-  title,
-  plan,
-  lastNoMessageTool,
-  lastTool,
-  lastEventId,
-  cancelCurrentChat,
-  attachments,
-  shareMode,
-  linkCopied,
-  sharingLoading
-} = toRefs(state);
-
-// Non-state refs that don't need reset
-const toolPanel = ref<InstanceType<typeof ToolPanel>>()
-const simpleBarRef = ref<InstanceType<typeof SimpleBar>>();
-const observerRef = ref<HTMLDivElement>();
-const chatContainerRef = ref<HTMLDivElement>();
+const { hideFilePreviewer } = useFilePreviewer()
+const { showConfirmDialog, showInputDialog } = useDialog();
+const projects = ref<ProjectItem[]>([]);
+const isFavorite = ref(false);
+const isPinned = ref(false);
+const projectId = ref<string | null>(null);
+const taskMode = ref<'agent' | 'chat'>('agent');
 const modelOptions = ref<ChatModelOption[]>([]);
 const selectedModelId = ref(SYSTEM_MODEL_ID);
-const loadingText = computed(() => (
-  retryAttempt.value > 0
-    ? `${t('Reconnecting')} (${retryAttempt.value})`
-    : t('Thinking')
-));
 
 const loadModelOptions = async () => {
   modelOptions.value = buildChatModelOptions(await getCachedClientConfig());
@@ -255,53 +261,212 @@ const syncSelectedSessionModel = (modelConfig?: SessionModelConfig | null) => {
   selectedModelId.value = nextModelId;
 };
 
-// Shared SSE event -> message list conversion
-const { handleEvent, resetEventHistory } = useAgentEvents(
-  { messages, title, plan, isLoading, lastEventId, lastTool, lastNoMessageTool },
+// Create initial state factory
+const createInitialState = () => ({
+  inputMessage: '',
+  sessionId: undefined as string | undefined,
+  messages: [] as Message[],
+  realTime: true,
+  follow: true,
+  title: t('New Chat'),
+  plan: undefined as PlanEventData | undefined,
+  lastNoMessageTool: undefined as ToolContent | undefined,
+  lastMessageTool: undefined as ToolContent | undefined,
+  lastTool: undefined as ToolContent | undefined,
+  lastEventId: undefined as string | undefined,
+  cancelCurrentChat: null as agentApi.ChatSessionConnection | null,
+  pendingSubmissionId: undefined as string | undefined,
+  attachments: [] as FileInfo[],
+  shareMode: 'private' as 'private' | 'public', // Default to private mode
+  linkCopied: false,
+  sharingLoading: false, // Loading state for share operations
+  isStopping: false,
+});
+
+// Create reactive state
+const state = reactive(createInitialState());
+
+// Destructure refs from reactive state
+const {
+  inputMessage,
+  sessionId,
+  messages,
+  realTime,
+  follow,
+  title,
+  plan,
+  lastNoMessageTool,
+  lastTool,
+  lastEventId,
+  cancelCurrentChat,
+  pendingSubmissionId,
+  attachments,
+  shareMode,
+  linkCopied,
+  sharingLoading,
+  isStopping,
+} = toRefs(state);
+
+const {
+  phase,
+  isBusy,
+  hydrateFromSessionStatus,
+  applyStatusUpdate,
+  noteOptimisticRun,
+  noteDomainEvent,
+  reset: resetPhase,
+  showWaitingContinue,
+  showTaskCompleted,
+  showThinking,
+} = useSessionPhase({ messages });
+
+// Non-state refs that don't need reset
+const computerPanel = ref<InstanceType<typeof ComputerPanel>>()
+const simpleBarRef = ref<InstanceType<typeof SimpleBar>>();
+const observerRef = ref<HTMLDivElement>();
+const chatContainerRef = ref<HTMLDivElement>();
+const moreBtnRef = ref<HTMLElement | null>(null);
+const modeMenuRef = ref<HTMLElement | null>(null);
+const modeMenuPanelRef = ref<HTMLElement | null>(null);
+const modeMenuPos = ref({ top: 0, left: 0 });
+const showModeMenu = ref(false);
+const { showContextMenu } = useContextMenu();
+
+const toggleModeMenu = () => {
+  if (!showModeMenu.value && modeMenuRef.value) {
+    const r = modeMenuRef.value.getBoundingClientRect();
+    modeMenuPos.value = { top: r.bottom + 6, left: r.left };
+  }
+  showModeMenu.value = !showModeMenu.value;
+};
+
+const toolHistory = computed(() => {
+  const tools: ToolContent[] = [];
+  for (const message of messages.value) {
+    if (message.type === 'tool') {
+      tools.push(message.content as ToolContent);
+    } else if (message.type === 'step') {
+      const step = message.content as StepContent;
+      if (step.tools?.length) tools.push(...step.tools);
+    }
+  }
+  return tools;
+});
+
+const hasBrowserTool = computed(() =>
+  toolHistory.value.some((t) => t.name === 'browser'),
+);
+
+/** Official suggest-takeover banner: waiting + browser tool available */
+const showTakeControlBanner = computed(() =>
+  phase.value === 'waiting' && !isBusy.value && hasBrowserTool.value,
+);
+
+const chatPlaceholder = computed(() => t('Send message to Manus'));
+
+const setTaskMode = async (mode: 'agent' | 'chat') => {
+  showModeMenu.value = false;
+  if (!sessionId.value || taskMode.value === mode) return;
+  const prev = taskMode.value;
+  taskMode.value = mode;
+  try {
+    await agentApi.updateSessionTaskMode(sessionId.value, mode);
+  } catch (e) {
+    taskMode.value = prev;
+    console.error('Failed to update task mode', e);
+    showErrorToast(t('Failed to update mode'));
+  }
+};
+
+const handleModeMenuOutside = (e: MouseEvent) => {
+  if (!showModeMenu.value) return;
+  const t = e.target as Node;
+  if (modeMenuRef.value?.contains(t) || modeMenuPanelRef.value?.contains(t)) return;
+  showModeMenu.value = false;
+};
+
+const handleModeMenuScroll = () => {
+  if (showModeMenu.value) showModeMenu.value = false;
+};
+
+const lastAssistantIndex = computed(() => {
+  for (let i = messages.value.length - 1; i >= 0; i--) {
+    if (messages.value[i].type === 'assistant') return i;
+  }
+  return -1;
+});
+
+const lastAssistantPlainText = computed(() => {
+  const i = lastAssistantIndex.value;
+  if (i < 0) return '';
+  return ((messages.value[i].content as MessageContent).content || '').trim();
+});
+
+/**
+ * Official ChatReplyActions: show Copy under assistant replies that are not the
+ * live last message (TaskCompleted footer owns copy when task is done).
+ */
+const shouldShowAssistantCopyActions = (index: number) => {
+  const m = messages.value[index];
+  if (m?.type !== 'assistant') return false;
+  if (!((m.content as MessageContent).content || '').trim()) return false;
+  if (isBusy.value || phase.value === 'running' || phase.value === 'pending') {
+    return index !== lastAssistantIndex.value;
+  }
+  if (showTaskCompleted.value || showWaitingContinue.value) {
+    return index !== lastAssistantIndex.value;
+  }
+  return true;
+};
+
+const isAssistantLastBeforeUser = (index: number) => {
+  if (messages.value[index]?.type !== 'assistant') return false;
+  for (let i = index + 1; i < messages.value.length; i++) {
+    const t = messages.value[i].type;
+    if (t === 'user') return true;
+    if (t === 'assistant') return false;
+  }
+  return false;
+};
+
+// Shared agent event -> message list conversion
+const { handleEvent: handleAgentEvent, resetEventHistory } = useAgentEvents(
+  { messages, title, plan, lastEventId, lastTool, lastNoMessageTool },
   {
     onToolActivity: (tool: ToolContent) => {
       if (realTime.value) {
-        toolPanel.value?.showToolPanel(tool, true);
+        computerPanel.value?.showComputerPanel(tool, true);
       }
     },
   }
 );
 
-let sessionGeneration = 0;
-let activeChatToken: symbol | null = null;
-let chatWatchdogTimer: number | undefined;
-let rearmCurrentChatWatchdog: (() => void) | null = null;
-let componentUnmounted = false;
-
-const CHAT_NO_PROGRESS_TIMEOUT_MS = 120_000;
-const CHAT_MAX_STALLED_RECONNECTS = 3;
-
-const clearChatWatchdog = () => {
-  if (chatWatchdogTimer !== undefined) {
-    window.clearTimeout(chatWatchdogTimer);
-    chatWatchdogTimer = undefined;
-  }
+const handleEvent = (event: AgentEvent) => {
+  handleAgentEvent(event);
+  // Live phase authority is status_update only (backend-status-channel design).
 };
-
-const isCurrentSession = (targetSessionId: string, generation: number) => (
-  sessionGeneration === generation && sessionId.value === targetSessionId
-);
 
 // Reset all refs to their initial values
 const resetState = () => {
-  sessionGeneration += 1;
-  activeChatToken = null;
-  rearmCurrentChatWatchdog = null;
-  clearChatWatchdog();
-  // Cancel any existing chat connection
+  const prevSessionId = sessionId.value;
+  // Drop local stream handlers; leave WS subscription for previous session
   if (cancelCurrentChat.value) {
     cancelCurrentChat.value();
+    cancelCurrentChat.value = null;
   }
-
+  if (prevSessionId) {
+    void agentApi.leaveChatSession(prevSessionId);
+  }
   resetEventHistory();
 
   // Reset reactive state to initial values
   Object.assign(state, createInitialState());
+  resetPhase();
+  isFavorite.value = false;
+  isPinned.value = false;
+  projectId.value = null;
+  taskMode.value = 'agent';
+  projects.value = [];
 };
 
 // Watch message changes and automatically scroll to bottom
@@ -314,326 +479,113 @@ watch(messages, async () => {
 
 
 
+const chatStreamCallbacks = (targetSessionId: string): agentApi.ChatStreamCallbacks => ({
+  onOpen: () => {
+    // Keep loading only when we already marked a turn in flight (chat send)
+  },
+  onMessage: ({ event, data }) => {
+    if (sessionId.value !== targetSessionId) return;
+    if (event === 'terminal_update') {
+      const d = data as TerminalUpdateEventData;
+      eventBus.emit('tool:terminal_update', {
+        sessionId: targetSessionId,
+        shellId: d.shell_id,
+        output: d.output,
+      });
+      return;
+    }
+    if (event === 'file_update') {
+      const d = data as FileUpdateEventData;
+      eventBus.emit('tool:file_update', {
+        sessionId: targetSessionId,
+        path: d.path,
+        content: d.content,
+        oldContent: d.old_content,
+        file: d.file ?? null,
+      });
+      return;
+    }
+    handleEvent({
+      event: event as AgentEvent['event'],
+      data: data as AgentEvent['data'],
+    });
+  },
+  onStatusUpdate: (agentStatus) => {
+    if (sessionId.value !== targetSessionId) return;
+    applyStatusUpdate(agentStatus);
+    if (agentStatus !== 'running') pendingSubmissionId.value = undefined;
+  },
+  onClose: () => {
+    if (sessionId.value !== targetSessionId) return;
+    // Loading is driven by status_update (follows stream_end). Do not clear here.
+    if (cancelCurrentChat.value) {
+      cancelCurrentChat.value = null;
+    }
+  },
+  onError: (error) => {
+    if (sessionId.value !== targetSessionId) return;
+    console.error('Chat error:', error);
+    // A socket error is not proof that a durable turn failed. Keep the busy
+    // phase until REST/status_update gives us an authoritative terminal state.
+    void reconcileSessionPhase(targetSessionId);
+  },
+  onSubmissionAck: ({ submissionId }) => {
+    if (sessionId.value === targetSessionId) pendingSubmissionId.value = submissionId;
+  },
+});
+
+const reconcileSessionPhase = async (targetSessionId: string) => {
+  try {
+    const session = await agentApi.getSession(targetSessionId);
+    if (sessionId.value !== targetSessionId) return;
+    const activeSubmissionId = pendingSubmissionId.value;
+    const hasMatchingTerminalEvent = activeSubmissionId
+      ? session.events.some((event) => (
+          (event.event === 'done' || event.event === 'wait' || event.event === 'error')
+          && event.data.turn_id === activeSubmissionId
+        ))
+      : false;
+    if (
+      activeSubmissionId
+      && session.status !== SessionStatus.RUNNING
+      && !hasMatchingTerminalEvent
+    ) {
+      // A just-submitted turn may not have changed the session document yet;
+      // an older COMPLETED value is not proof that this submission finished.
+      return;
+    }
+    hydrateFromSessionStatus(session.status);
+    if (session.status !== SessionStatus.RUNNING) pendingSubmissionId.value = undefined;
+  } catch (error) {
+    // Preserve the optimistic running phase while delivery remains uncertain.
+    console.error('Failed to reconcile session status:', error);
+  }
+};
+
 const handleSubmit = () => {
-  if (isLoading.value || isStopping.value) return;
+  if (isBusy.value || isStopping.value) return;
   void chat(inputMessage.value, attachments.value);
 }
 
-const chat = async (
-  message: string = '',
-  files: FileInfo[] = [],
-  resumedSubmissionId?: string,
-) => {
+const chat = async (message: string = '', files: FileInfo[] = []) => {
   const targetSessionId = sessionId.value;
   if (!targetSessionId || isStopping.value) return;
-  const generation = sessionGeneration;
-  const chatToken = Symbol(targetSessionId);
-  const hasNewSubmission = Boolean(message.trim()) || files.length > 0;
-  const submissionId = resumedSubmissionId ?? (hasNewSubmission ? createUuid() : undefined);
-  const attachmentPayload = files.map((file: FileInfo) => ({
-    file_id: file.file_id,
-    filename: file.filename,
-  }));
 
   // Cancel any existing chat connection before starting a new one
-  clearChatWatchdog();
-  rearmCurrentChatWatchdog = null;
   if (cancelCurrentChat.value) {
     cancelCurrentChat.value();
     cancelCurrentChat.value = null;
   }
-  activeChatToken = chatToken;
 
-  const isActiveChat = () => (
-    activeChatToken === chatToken
-    && isCurrentSession(targetSessionId, generation)
-  );
-
-  let connectionSequence = 0;
-  let progressVersion = 0;
-  let stalledReconnects = 0;
-  let lastProgressAt = Date.now();
-
-  const isActiveConnection = (sequence: number) => (
-    isActiveChat() && connectionSequence === sequence
-  );
-
-  const finishChat = (cancelTransport: boolean) => {
-    if (!isActiveChat()) return;
-    clearChatWatchdog();
-    rearmCurrentChatWatchdog = null;
-    const cancel = cancelCurrentChat.value;
-    cancelCurrentChat.value = null;
-    activeChatToken = null;
-    isLoading.value = false;
-    streamStalled.value = false;
-    retryAttempt.value = 0;
-    if (cancelTransport) {
-      cancel?.();
-    }
-  };
-
-  const failChatBeforeStreaming = (error: unknown) => {
-    if (!isActiveChat()) return;
-    console.error('Chat error:', error);
-    clearChatWatchdog();
-    rearmCurrentChatWatchdog = null;
-    cancelCurrentChat.value = null;
-    activeChatToken = null;
-    isLoading.value = false;
-    streamStalled.value = false;
-    retryAttempt.value = 0;
-    showErrorToast(t('Connection lost. Please retry.'));
-  };
-
-  const markStreamStalled = () => {
-    if (!isActiveChat()) return;
-    clearChatWatchdog();
-    rearmCurrentChatWatchdog = null;
-    const cancel = cancelCurrentChat.value;
-    cancelCurrentChat.value = null;
-    activeChatToken = null;
-    // The durable task is still active. Keep submission blocked and the stop
-    // control available, but remove the indefinite thinking animation.
-    isLoading.value = true;
-    streamStalled.value = true;
-    retryAttempt.value = 0;
-    cancel?.();
-    showErrorToast(t(
-      'Live updates stopped while the task may still be running. Refresh this page or stop the task.',
-    ));
-  };
-
-  const isTerminalSnapshot = (events: AgentSSEEvent[]) => (
-    submissionId
-      ? hasTerminalEventForTurn(events, submissionId)
-      : hasTerminalEventForLatestTurn(events)
-  );
-
-  const applyDurableSnapshot = (events: AgentSSEEvent[]): boolean => {
-    let snapshotMadeProgress = false;
-    for (const event of events) {
-      const isCurrentUserInput = (
-        submissionId
-        && event.event === 'message'
-        && (event.data as { role?: string }).role === 'user'
-        && event.data.turn_id === submissionId
-      );
-      // A newly submitted turn is already rendered optimistically. The live
-      // durable stream intentionally skips this event, so reconciliation must
-      // not append a second copy from full session history.
-      if (isCurrentUserInput) continue;
-      if (handleEvent(event)) {
-        snapshotMadeProgress = true;
-        progressVersion += 1;
-      }
-    }
-    return snapshotMadeProgress;
-  };
-
-  const reconcileTransportFailure = async (
-    sequence: number,
-    error: unknown,
-  ) => {
-    if (!isActiveConnection(sequence) || isStopping.value) return;
-    console.error('Chat stream retries exhausted:', error);
-    clearChatWatchdog();
-    retryAttempt.value = 0;
-
-    try {
-      const latest = await agentApi.getSession(targetSessionId);
-      if (!isActiveConnection(sequence) || isStopping.value) return;
-      applyDurableSnapshot(latest.events);
-      const isActiveStatus = (
-        latest.status === SessionStatus.RUNNING
-        || latest.status === SessionStatus.PENDING
-      );
-      if (isTerminalSnapshot(latest.events) || !isActiveStatus) {
-        finishChat(true);
-        return;
-      }
-    } catch (reconcileError) {
-      console.error(
-        'Failed to reconcile session after chat stream failure:',
-        reconcileError,
-      );
-      if (!isActiveConnection(sequence) || isStopping.value) return;
-    }
-
-    // A POST may already have been durably accepted even when its stream can
-    // no longer reconnect. Never unlock another submission without proving
-    // the current turn terminal; keep the explicit stop control available.
-    markStreamStalled();
-  };
-
-  const connectStream = async (includeSubmission: boolean): Promise<void> => {
-    if (!isActiveChat() || isStopping.value) return;
-
-    clearChatWatchdog();
-    if (cancelCurrentChat.value) {
-      cancelCurrentChat.value();
-      cancelCurrentChat.value = null;
-    }
-
-    const sequence = ++connectionSequence;
-    const armWatchdog = () => {
-      if (
-        !isActiveConnection(sequence)
-        || isStopping.value
-        || streamStalled.value
-      ) {
-        return;
-      }
-      clearChatWatchdog();
-      const elapsed = Date.now() - lastProgressAt;
-      const remaining = Math.max(0, CHAT_NO_PROGRESS_TIMEOUT_MS - elapsed);
-      chatWatchdogTimer = window.setTimeout(() => {
-        chatWatchdogTimer = undefined;
-        void reconcileNoProgress(sequence, progressVersion);
-      }, remaining);
-    };
-    rearmCurrentChatWatchdog = armWatchdog;
-
-    try {
-      const cancel = await agentApi.chatWithSession(
-        targetSessionId,
-        includeSubmission ? message : '',
-        lastEventId.value,
-        includeSubmission ? attachmentPayload : [],
-        {
-          onOpen: () => {
-            if (!isActiveConnection(sequence)) return;
-            retryAttempt.value = 0;
-            armWatchdog();
-          },
-          onMessage: ({ event, data }) => {
-            if (!isActiveConnection(sequence)) return false;
-            const madeProgress = handleEvent({
-              event: event as AgentSSEEvent['event'],
-              data: data as AgentSSEEvent['data'],
-            });
-            if (madeProgress) {
-              progressVersion += 1;
-              stalledReconnects = 0;
-              lastProgressAt = Date.now();
-              streamStalled.value = false;
-              armWatchdog();
-            }
-            return madeProgress;
-          },
-          onClose: () => {
-            if (!isActiveConnection(sequence)) return;
-            finishChat(false);
-          },
-          onError: (error) => {
-            if (!isActiveConnection(sequence)) return;
-            void reconcileTransportFailure(sequence, error);
-          },
-          onRetry: ({ attempt }) => {
-            if (!isActiveConnection(sequence)) return;
-            clearChatWatchdog();
-            retryAttempt.value = attempt;
-          },
-        },
-        submissionId,
-      );
-      if (!isActiveConnection(sequence)) {
-        cancel();
-        return;
-      }
-      cancelCurrentChat.value = cancel;
-      armWatchdog();
-    } catch (error) {
-      if (!isActiveConnection(sequence)) return;
-      failChatBeforeStreaming(error);
-    }
-  };
-
-  const recoverActiveStream = async (sequence: number, madeProgress: boolean) => {
-    if (!isActiveConnection(sequence) || isStopping.value) return;
-    if (madeProgress) {
-      stalledReconnects = 0;
-    } else {
-      stalledReconnects += 1;
-    }
-    if (stalledReconnects > CHAT_MAX_STALLED_RECONNECTS) {
-      markStreamStalled();
-      return;
-    }
-    isLoading.value = true;
-    streamStalled.value = false;
-    retryAttempt.value = stalledReconnects;
-    // Give the next connection a full observation window. This is recovery
-    // progress, not task progress, so it does not reset stalledReconnects.
-    lastProgressAt = Date.now();
-    await connectStream(false);
-  };
-
-  const reconcileNoProgress = async (
-    sequence: number,
-    observedProgressVersion: number,
-  ) => {
-    if (!isActiveConnection(sequence) || isStopping.value) return;
-
-    try {
-      const latest = await agentApi.getSession(targetSessionId);
-      if (
-        !isActiveConnection(sequence)
-        || isStopping.value
-        || progressVersion !== observedProgressVersion
-      ) {
-        return;
-      }
-
-      const snapshotMadeProgress = applyDurableSnapshot(latest.events);
-
-      const isActiveStatus = (
-        latest.status === SessionStatus.RUNNING
-        || latest.status === SessionStatus.PENDING
-      );
-      if (isTerminalSnapshot(latest.events) || !isActiveStatus) {
-        finishChat(true);
-        return;
-      }
-
-      // Older terminal events in full session history are not terminal for the
-      // active durable turn.
-      isLoading.value = true;
-      if (snapshotMadeProgress) {
-        lastProgressAt = Date.now();
-      }
-      await recoverActiveStream(sequence, snapshotMadeProgress);
-    } catch (error) {
-      console.error('Failed to reconcile stalled chat stream:', error);
-      if (
-        !isActiveConnection(sequence)
-        || isStopping.value
-        || progressVersion !== observedProgressVersion
-      ) {
-        return;
-      }
-      await recoverActiveStream(sequence, false);
-    }
-  };
-
-  if (message.trim()) {
-    // Add user message to conversation list
+  if (message.trim() || files.length > 0) {
+    // Official ChatQuestion: attachments + text in one right-aligned group
     messages.value.push({
       type: 'user',
       content: {
         content: message,
-        timestamp: Math.floor(Date.now() / 1000)
+        timestamp: Math.floor(Date.now() / 1000),
+        attachments: files.length > 0 ? files : undefined,
       } as MessageContent,
-    });
-  }
-
-  if (files.length > 0) {
-    messages.value.push({
-      type: 'attachments',
-      content: {
-        role: 'user',
-        attachments: files
-      } as AttachmentsContent,
     });
   }
 
@@ -643,10 +595,46 @@ const chat = async (
   // Clear input field and attachments
   inputMessage.value = '';
   attachments.value = [];
-  isLoading.value = true;
-  streamStalled.value = false;
-  retryAttempt.value = 0;
-  await connectStream(hasNewSubmission);
+  noteOptimisticRun();
+  const submissionId = createChatSubmissionId();
+  pendingSubmissionId.value = submissionId;
+
+  try {
+    const cancel = await agentApi.chatWithSession(
+      targetSessionId,
+      message,
+      lastEventId.value,
+      files.map((file: FileInfo) => ({
+        file_id: file.file_id,
+        filename: file.filename,
+      })),
+      {
+        ...chatStreamCallbacks(targetSessionId),
+        onOpen: () => {
+          if (sessionId.value !== targetSessionId) return;
+          noteOptimisticRun();
+        },
+      },
+      submissionId,
+    );
+    if (sessionId.value !== targetSessionId) {
+      cancel();
+      return;
+    }
+    cancelCurrentChat.value = cancel;
+  } catch (error) {
+    if (sessionId.value !== targetSessionId) return;
+    console.error('Chat error:', error);
+    if (error instanceof ChatSubmissionError && error.deliveryUncertain) {
+      pendingSubmissionId.value = error.submissionId;
+      void reconcileSessionPhase(targetSessionId);
+      return;
+    }
+    // A correlated server rejection is definitive: no durable turn was
+    // accepted, so it is safe to unlock. Transport uncertainty stays busy.
+    pendingSubmissionId.value = undefined;
+    noteDomainEvent('error');
+  }
 }
 
 const restoreSession = async () => {
@@ -655,37 +643,60 @@ const restoreSession = async () => {
     showErrorToast(t('Session not found'));
     return;
   }
-  const generation = sessionGeneration;
   try {
     const session = await agentApi.getSession(targetSessionId);
-    if (!isCurrentSession(targetSessionId, generation)) return;
-    syncSelectedSessionModel(session.model_config);
-    // Initialize share mode based on session state
-    shareMode.value = session.is_shared ? 'public' : 'private';
+    if (sessionId.value !== targetSessionId) return;
+    applySessionMeta(session);
     realTime.value = false;
+    hydrateFromSessionStatus(session.status);
     for (const event of session.events) {
-      handleEvent(event);
+      handleAgentEvent(event);
     }
     realTime.value = true;
-    const hasTerminalEvent = hasTerminalEventForLatestTurn(session.events);
-    if (
-      (session.status === SessionStatus.RUNNING || session.status === SessionStatus.PENDING)
-      && !hasTerminalEvent
-    ) {
-      await chat('', [], getLatestTurnId(session.events));
-    } else {
-      isLoading.value = false;
-      streamStalled.value = false;
+
+    // Always join the chat channel (status_update + idle Mongo catch-up).
+    // Only resume the live Redis stream while the agent is running.
+    cancelCurrentChat.value?.();
+    cancelCurrentChat.value = null;
+    try {
+      if (session.status === SessionStatus.RUNNING) {
+        noteOptimisticRun();
+        cancelCurrentChat.value = await agentApi.chatWithSession(
+          targetSessionId,
+          '',
+          lastEventId.value,
+          undefined,
+          {
+            ...chatStreamCallbacks(targetSessionId),
+            onOpen: () => {
+              if (sessionId.value === targetSessionId) noteOptimisticRun();
+            },
+          },
+        );
+      } else {
+        cancelCurrentChat.value = await agentApi.chatWithSession(
+          targetSessionId,
+          '',
+          lastEventId.value,
+          undefined,
+          chatStreamCallbacks(targetSessionId),
+        );
+      }
+    } catch (error) {
+      if (sessionId.value !== targetSessionId) return;
+      console.error('Failed to join chat session:', error);
+      cancelCurrentChat.value = null;
+      if (session.status === SessionStatus.RUNNING) {
+        void reconcileSessionPhase(targetSessionId);
+      }
     }
     void agentApi.clearUnreadMessageCount(targetSessionId).catch((error) => {
       console.error('Failed to clear unread message count:', error);
     });
   } catch (error) {
-    if (!isCurrentSession(targetSessionId, generation)) return;
+    if (sessionId.value !== targetSessionId) return;
     console.error('Failed to restore session:', error);
-    isLoading.value = false;
-    streamStalled.value = false;
-    retryAttempt.value = 0;
+    noteDomainEvent('error');
     showErrorToast(t('Failed to restore session. Please retry.'));
   }
 }
@@ -693,8 +704,8 @@ const restoreSession = async () => {
 
 
 onBeforeRouteUpdate((to, _, next) => {
-  toolPanel.value?.hideToolPanel();
-  hideFilePanel();
+  computerPanel.value?.hideComputerPanel();
+  hideFilePreviewer();
   resetState();
   if (to.params.sessionId) {
     messages.value = [];
@@ -704,43 +715,61 @@ onBeforeRouteUpdate((to, _, next) => {
   next();
 })
 
+const applySessionMeta = (session: Awaited<ReturnType<typeof agentApi.getSession>>) => {
+  shareMode.value = session.is_shared ? 'public' : 'private';
+  isFavorite.value = !!session.is_favorite;
+  isPinned.value = !!session.is_pinned;
+  projectId.value = session.project_id ?? null;
+  taskMode.value = session.task_mode === 'chat' ? 'chat' : 'agent';
+  syncSelectedSessionModel(session.model_config);
+};
+
 // Initialize active conversation
 onMounted(async () => {
-  const initializationGeneration = sessionGeneration;
-  hideFilePanel();
-  const initialModelId = history.state?.modelId;
+  document.addEventListener('mousedown', handleModeMenuOutside);
+  window.addEventListener('scroll', handleModeMenuScroll, true);
+  hideFilePreviewer();
   await loadModelOptions();
-  if (componentUnmounted || sessionGeneration !== initializationGeneration) return;
-  if (typeof initialModelId === 'string') {
-    selectedModelId.value = initialModelId;
-  }
   const routeParams = router.currentRoute.value.params;
   if (routeParams.sessionId) {
     // If sessionId is included in URL, use it directly
     sessionId.value = String(routeParams.sessionId) as string;
-    // Get initial message from history.state
-    const message = history.state?.message;
-    const files: FileInfo[] = history.state?.files ?? [];
+    // Get initial message / mode from history.state (HomePage → new chat)
+    const message = history.state?.message as string | undefined;
+    const files = history.state?.files as FileInfo[] | undefined;
+    const seededMode = history.state?.taskMode as 'agent' | 'chat' | undefined;
     history.replaceState({}, document.title);
-    if (message || files.length > 0) {
-      chat(message ?? '', files);
+    if (seededMode === 'chat' || seededMode === 'agent') {
+      taskMode.value = seededMode;
+    }
+    if (message || (files && files.length > 0)) {
+      // Initial-message path used to skip restoreSession(), so taskMode never
+      // left the default 'agent'. Load session meta first, then send.
+      void (async () => {
+        try {
+          const session = await agentApi.getSession(sessionId.value!);
+          applySessionMeta(session);
+        } catch (e) {
+          console.error('Failed to load session meta before initial chat', e);
+        }
+        await chat(message || '', files || []);
+      })();
     } else {
       restoreSession();
     }
   }
-
-
 });
 
 onUnmounted(() => {
-  componentUnmounted = true;
-  sessionGeneration += 1;
-  activeChatToken = null;
-  rearmCurrentChatWatchdog = null;
-  clearChatWatchdog();
+  document.removeEventListener('mousedown', handleModeMenuOutside);
+  window.removeEventListener('scroll', handleModeMenuScroll, true);
+  const prevSessionId = sessionId.value;
   if (cancelCurrentChat.value) {
     cancelCurrentChat.value();
     cancelCurrentChat.value = null;
+  }
+  if (prevSessionId) {
+    void agentApi.leaveChatSession(prevSessionId);
   }
 })
 
@@ -755,6 +784,7 @@ const isLiveTool = (tool: ToolContent) => {
   if (!isLastNoMessageTool(tool)) {
     return false;
   }
+  // tool.timestamp is Unix seconds (see backend event serializers)
   if (tool.timestamp > Math.floor(Date.now() / 1000) - 5 * 60) {
     return true;
   }
@@ -764,14 +794,14 @@ const isLiveTool = (tool: ToolContent) => {
 const handleToolClick = (tool: ToolContent) => {
   realTime.value = false;
   if (sessionId.value) {
-    toolPanel.value?.showToolPanel(tool, isLiveTool(tool));
+    computerPanel.value?.showComputerPanel(tool, isLiveTool(tool));
   }
 }
 
 const jumpToRealTime = () => {
   realTime.value = true;
   if (lastNoMessageTool.value) {
-    toolPanel.value?.showToolPanel(lastNoMessageTool.value, isLiveTool(lastNoMessageTool.value));
+    computerPanel.value?.showComputerPanel(lastNoMessageTool.value, isLiveTool(lastNoMessageTool.value));
   }
 }
 
@@ -786,58 +816,25 @@ const handleScroll = (_: Event) => {
 
 const handleStop = async () => {
   const targetSessionId = sessionId.value;
-  if (targetSessionId && !isStopping.value) {
-    const generation = sessionGeneration;
-    isStopping.value = true;
-    clearChatWatchdog();
-    try {
-      await agentApi.stopSession(targetSessionId);
-      if (!isCurrentSession(targetSessionId, generation)) return;
-      activeChatToken = null;
-      rearmCurrentChatWatchdog = null;
-      cancelCurrentChat.value?.();
-      cancelCurrentChat.value = null;
-      isLoading.value = false;
-      streamStalled.value = false;
-      retryAttempt.value = 0;
-    } catch (error) {
-      console.error('Failed to stop session:', error);
-      if (!isCurrentSession(targetSessionId, generation)) return;
-      // The backend intentionally returns 409/503 when task cancellation may
-      // have succeeded but sandbox process cleanup was not confirmed. Session
-      // status or a terminal turn cannot prove that shell descendants are
-      // gone, so every failed stop remains explicitly retryable.
-      activeChatToken = null;
-      rearmCurrentChatWatchdog = null;
-      cancelCurrentChat.value?.();
-      cancelCurrentChat.value = null;
-      isLoading.value = true;
-      streamStalled.value = true;
-      retryAttempt.value = 0;
-      showErrorToast(t('Failed to stop task. It may still be running; please try again.'));
-    } finally {
-      if (isCurrentSession(targetSessionId, generation)) {
-        isStopping.value = false;
-        if (isLoading.value && !streamStalled.value) {
-          rearmCurrentChatWatchdog?.();
-        }
-      }
-    }
+  if (!targetSessionId || isStopping.value) return;
+  isStopping.value = true;
+  try {
+    await agentApi.stopSession(targetSessionId);
+    if (sessionId.value !== targetSessionId) return;
+    cancelCurrentChat.value?.();
+    cancelCurrentChat.value = null;
+    noteDomainEvent('done');
+  } catch (error) {
+    if (sessionId.value !== targetSessionId) return;
+    console.error('Failed to stop session:', error);
+    showErrorToast(t('Failed to stop task. It may still be running; please try again.'));
+  } finally {
+    if (sessionId.value === targetSessionId) isStopping.value = false;
   }
 }
 
 const handleFileListShow = () => {
   showSessionFileList()
-}
-
-const handleWorkspaceShow = () => {
-  if (!lastNoMessageTool.value) {
-    showInfoToast(t('No Manus workspace yet'));
-    return;
-  }
-  const live = isLiveTool(lastNoMessageTool.value);
-  realTime.value = live;
-  toolPanel.value?.showToolPanel(lastNoMessageTool.value, live);
 }
 
 // Share functionality handlers
@@ -906,5 +903,195 @@ const handleCopyLink = async () => {
     console.error('Error copying share link:', error);
     showErrorToast(t('Failed to copy link'));
   }
+}
+
+const handleTakeControl = () => {
+  if (!sessionId.value) return;
+  // Prefer opening computer panel on latest browser tool, then enter takeover
+  const browserTool = [...toolHistory.value].reverse().find((t) => t.name === 'browser');
+  if (browserTool) {
+    realTime.value = true;
+    computerPanel.value?.showComputerPanel(browserTool, true);
+  }
+  eventBus.emit('ui:takeover', {
+    sessionId: sessionId.value,
+    active: true,
+  });
+}
+
+const handleSelectTool = (tool: ToolContent) => {
+  realTime.value = false;
+  computerPanel.value?.showComputerPanel(tool, false);
+}
+
+const getShareUrl = () => {
+  if (!sessionId.value) return '';
+  return `${window.location.origin}/share/${sessionId.value}`;
+}
+
+const shareToSocial = async (network: 'x' | 'linkedin' | 'facebook' | 'reddit') => {
+  if (!sessionId.value) return;
+  if (shareMode.value !== 'public') {
+    try {
+      sharingLoading.value = true;
+      await agentApi.shareSession(sessionId.value);
+      shareMode.value = 'public';
+    } catch {
+      showErrorToast(t('Failed to share session'));
+      return;
+    } finally {
+      sharingLoading.value = false;
+    }
+  }
+  const url = encodeURIComponent(getShareUrl());
+  const text = encodeURIComponent(title.value || 'Manus');
+  const targets: Record<string, string> = {
+    x: `https://twitter.com/intent/tweet?url=${url}&text=${text}`,
+    linkedin: `https://www.linkedin.com/sharing/share-offsite/?url=${url}`,
+    facebook: `https://www.facebook.com/sharer/sharer.php?u=${url}`,
+    reddit: `https://www.reddit.com/submit?url=${url}&title=${text}`,
+  };
+  window.open(targets[network], '_blank', 'noopener,noreferrer');
+}
+
+const handleMoreClick = async (event: MouseEvent | KeyboardEvent) => {
+  event.stopPropagation();
+  const target = (moreBtnRef.value || event.currentTarget) as HTMLElement;
+  if (!sessionId.value) return;
+
+  // Official session-detail … menu: Rename / Move to project / — / Pin / Favorite / Delete
+  // (skip scheduled / archive — no local product support)
+  try {
+    const res = await getProjects();
+    projects.value = res.projects ?? [];
+  } catch {
+    projects.value = [];
+  }
+
+  const favoritedNow = isFavorite.value;
+  const pinnedNow = isPinned.value;
+  const items = [
+    createMenuItem('rename', t('Rename'), { icon: Pencil }),
+  ];
+
+  // Official:「移动到项目」+ chevron → submenu (新项目 / — / projects)
+  const moveChildren = [
+    createMenuItem('new_project', t('New project'), { icon: FolderPlus }),
+    createSeparator(),
+    ...projects.value.map((project) =>
+      createMenuItem(`move:${project.project_id}`, project.name, {
+        icon: Folder,
+        checked: project.project_id === projectId.value,
+      }),
+    ),
+  ];
+  if (projectId.value) {
+    moveChildren.push(createSeparator());
+    moveChildren.push(createMenuItem('remove_project', t('Remove from project'), { icon: Folder }));
+  }
+  items.push(createSubmenuItem('move_project', t('Move to project'), moveChildren, { icon: FolderSync }));
+
+  items.push(createSeparator());
+  items.push(createMenuItem('pin', pinnedNow ? t('Unpin') : t('Pin'), { icon: Pin }));
+  items.push(createMenuItem('favorite', favoritedNow ? t('Unfavorite') : t('Add to favorites'), { icon: Star }));
+  items.push(createDangerMenuItem('delete', t('Delete'), { icon: Trash }));
+
+  showContextMenu(sessionId.value, target, items, async (key: string) => {
+    if (key === 'rename') {
+      showInputDialog({
+        title: t('Rename'),
+        initialValue: title.value || '',
+        placeholder: t('Enter task name'),
+        confirmText: t('Save'),
+        onConfirm: async (value: string) => {
+          if (!value || !sessionId.value) return;
+          try {
+            const result = await agentApi.updateSessionTitle(sessionId.value, value);
+            title.value = result.title;
+            showSuccessToast(t('Renamed successfully'));
+          } catch {
+            showErrorToast(t('Failed to rename session'));
+          }
+        },
+      });
+    } else if (key === 'pin') {
+      if (!sessionId.value) return;
+      try {
+        const result = await agentApi.pinSession(sessionId.value, !pinnedNow);
+        isPinned.value = result.is_pinned;
+        showSuccessToast(result.is_pinned ? t('Task pinned') : t('Task unpinned'));
+      } catch {
+        showErrorToast(t('Failed to update pin'));
+      }
+    } else if (key === 'favorite') {
+      if (!sessionId.value) return;
+      try {
+        const result = favoritedNow
+          ? await agentApi.unfavoriteSession(sessionId.value)
+          : await agentApi.favoriteSession(sessionId.value);
+        isFavorite.value = result.is_favorite;
+        showSuccessToast(result.is_favorite ? t('Added to favorite') : t('Removed from favorite'));
+      } catch {
+        showErrorToast(t('Failed to update favorite'));
+      }
+    } else if (key === 'new_project') {
+      if (!sessionId.value) return;
+      showInputDialog({
+        title: t('New project'),
+        placeholder: t('Enter project name'),
+        confirmText: t('Create'),
+        onConfirm: async (value: string) => {
+          if (!value || !sessionId.value) return;
+          try {
+            const project = await createProject(value);
+            await agentApi.moveSessionProject(sessionId.value, project.project_id);
+            projectId.value = project.project_id;
+            projects.value = [project, ...projects.value];
+            eventBus.emit('projects:changed');
+            showSuccessToast(t('Moved to project'));
+          } catch {
+            showErrorToast(t('Failed to create project'));
+          }
+        },
+      });
+    } else if (key.startsWith('move:')) {
+      if (!sessionId.value) return;
+      const nextProjectId = key.slice(5);
+      if (nextProjectId === projectId.value) return;
+      try {
+        await agentApi.moveSessionProject(sessionId.value, nextProjectId);
+        projectId.value = nextProjectId;
+        showSuccessToast(t('Moved to project'));
+      } catch {
+        showErrorToast(t('Failed to move session'));
+      }
+    } else if (key === 'remove_project') {
+      if (!sessionId.value) return;
+      try {
+        await agentApi.moveSessionProject(sessionId.value, null);
+        projectId.value = null;
+        showSuccessToast(t('Removed from project'));
+      } catch {
+        showErrorToast(t('Failed to move session'));
+      }
+    } else if (key === 'delete') {
+      showConfirmDialog({
+        title: t('Delete this task?'),
+        content: t('The chat history of this session cannot be recovered after deletion.'),
+        confirmText: t('Delete'),
+        cancelText: t('Cancel'),
+        confirmType: 'danger',
+        onConfirm: () => {
+          if (!sessionId.value) return;
+          agentApi.deleteSession(sessionId.value).then(() => {
+            showSuccessToast(t('Deleted successfully'));
+            router.push('/');
+          }).catch(() => {
+            showErrorToast(t('Failed to delete session'));
+          });
+        },
+      });
+    }
+  });
 }
 </script>

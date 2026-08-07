@@ -1,4 +1,4 @@
-from app.application.services.claw_service import ClawService, _ChatState
+from app.application.services.claw_service import ClawService
 from app.domain.models.claw import ClawMessage
 from app.domain.services.claw_domain_service import ClawDomainService
 
@@ -22,7 +22,7 @@ class FakeDomain:
         yield {"type": "done", "stop_reason": "end_turn"}
 
 
-async def test_claw_stream_sends_temporary_thinking_then_visible_text():
+async def test_claw_stream_discards_private_thinking_and_sends_visible_text():
     service = ClawService(FakeDomain())
     event_bus = FakeEventBus()
     service.event_bus = event_bus
@@ -30,22 +30,10 @@ async def test_claw_stream_sends_temporary_thinking_then_visible_text():
     await service._process_chat("user-1", "http://claw", "hello", "default")
 
     assert [event for _, event in event_bus.events] == [
-        {"type": "thinking", "content": "private"},
         {"type": "text", "content": "visible"},
         {"type": "text", "content": " answer"},
         {"type": "done", "stop_reason": "end_turn"},
     ]
-
-
-def test_claw_service_exposes_pending_thinking_before_visible_answer():
-    service = ClawService(FakeDomain())
-    state = service._chat_states[("user-1", "default")] = _ChatState()
-    state.pending_thinking = "private"
-
-    assert service.get_pending_thinking_content("user-1") == "private"
-
-    state.pending_text = "visible"
-    assert service.get_pending_thinking_content("user-1") is None
 
 
 def test_claw_history_sanitizes_stored_thinking_messages():

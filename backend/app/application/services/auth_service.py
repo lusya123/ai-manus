@@ -5,10 +5,17 @@ import binascii
 import hmac
 import secrets
 from typing import Any, Optional
-from datetime import datetime, UTC
+from datetime import datetime, timedelta, UTC
 import httpx
 from app.domain.models.user import User, UserRole
 from app.domain.repositories.user_repository import UserRepository
+from app.domain.external.session_store import SessionStore
+from app.domain.models.auth_session import (
+    AuthSession,
+    AuthClientType,
+    CredentialSource,
+    ResolvedCredentials,
+)
 from app.application.errors.exceptions import (
     UnauthorizedError,
     ValidationError,
@@ -31,12 +38,18 @@ class AuthService:
     _PASSWORD_SCHEME = "pbkdf2_sha256"
     _MIN_PASSWORD_HASH_ROUNDS = 600_000
     _MAX_ACCEPTED_PASSWORD_HASH_ROUNDS = 10_000_000
-    
-    def __init__(self, user_repository: UserRepository, token_service: TokenService):
+
+    def __init__(
+        self,
+        user_repository: UserRepository,
+        token_service: TokenService,
+        session_store: SessionStore,
+    ):
         self.user_repository = user_repository
         self.settings = get_settings()
         self.token_service = token_service
-    
+        self.session_store = session_store
+
     def _hash_password(self, password: str) -> str:
         """Create a self-describing hash with a fresh per-user salt."""
 
@@ -75,12 +88,10 @@ class AuthService:
             rounds,
         )
         return salt + digest.hex()
-    
+
     def _verify_password(self, password: str, password_hash: str) -> bool:
-        """Verify password against hash"""
         if not password_hash:
             return False
-        
         try:
             parts = password_hash.split("$")
             if len(parts) == 4 and parts[0] == self._PASSWORD_SCHEME:
@@ -115,9 +126,8 @@ class AuthService:
             return scheme != self._PASSWORD_SCHEME or int(rounds) < configured_rounds
         except (ValueError, TypeError):
             return True
-    
+
     def _generate_user_id(self) -> str:
-        """Generate unique user ID"""
         return secrets.token_urlsafe(16)
 
     def _sub2api_auth_url(self, path: str) -> str:
@@ -155,6 +165,10 @@ class AuthService:
     @staticmethod
     def _jwt_family_revocation_key(session_id: str) -> str:
         return f"auth:jwt:family-revoked:{session_id}"
+
+    @staticmethod
+    def _jwt_migrated_session_key(session_id: str) -> str:
+        return f"auth:jwt:migrated-session:{session_id}"
 
     @staticmethod
     def _jwt_jti_revocation_key(jti: str) -> str:
@@ -418,6 +432,160 @@ class AuthService:
         if not consumed:
             raise UnauthorizedError("Refresh token has already been used")
 
+    async def _commit_jwt_session_migration(
+        self,
+        family_id: str,
+        session_id: str,
+        ttl_seconds: int,
+    ) -> tuple[bool, Optional[str]]:
+        """Atomically replace a JWT family's migrated opaque session.
+
+        The displaced opaque key is removed in the same Redis script as the
+        mapping replacement.  Returning its id lets the caller perform an
+        idempotent SessionStore cleanup as well, while the Lua deletion closes
+        the process-crash gap between publishing the winner and revoking the
+        previous browser session.
+        """
+
+        from app.infrastructure.storage.redis import get_redis
+
+        script = """
+        -- jwt-migration-commit-v2
+        if redis.call('EXISTS', KEYS[1]) == 1 then
+          return {0, ''}
+        end
+        local previous = redis.call('GET', KEYS[2])
+        redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[2])
+        if previous and previous ~= ARGV[1] then
+          local previous_key = ARGV[3] .. previous
+          local raw = redis.call('GET', previous_key)
+          redis.call('DEL', previous_key)
+          if raw then
+            local ok, payload = pcall(cjson.decode, raw)
+            if ok and type(payload) == 'table'
+              and payload['session_id'] == previous
+              and type(payload['user_id']) == 'string' then
+              redis.call(
+                'SREM', ARGV[4] .. payload['user_id'], previous
+              )
+            end
+          end
+        end
+        return {1, previous or ''}
+        """
+        result = await get_redis().client.eval(
+            script,
+            2,
+            self._jwt_family_revocation_key(family_id),
+            self._jwt_migrated_session_key(family_id),
+            session_id,
+            str(max(1, ttl_seconds)),
+            "session:",
+            "user_sessions:",
+        )
+        if not isinstance(result, (list, tuple)) or len(result) != 2:
+            raise RuntimeError("Invalid JWT migration commit response")
+        committed = bool(result[0])
+        displaced = result[1]
+        if isinstance(displaced, bytes):
+            displaced = displaced.decode("utf-8")
+        displaced_session_id = str(displaced) if displaced else None
+        if displaced_session_id == session_id:
+            displaced_session_id = None
+        return committed, displaced_session_id
+
+    async def _cleanup_displaced_jwt_session(
+        self,
+        displaced_session_id: Optional[str],
+    ) -> None:
+        """Finish an idempotent cleanup already made authoritative by Lua."""
+
+        if not displaced_session_id:
+            return
+        try:
+            await self.session_store.delete(displaced_session_id)
+        except Exception as exc:
+            # The commit Lua has already deleted the production Redis key and
+            # user index member atomically.  A redundant adapter cleanup must
+            # not turn that safe commit into a stale mapped-session failure.
+            logger.warning(
+                "Displaced JWT migration session cleanup failed: %s",
+                safe_exception_summary(exc),
+            )
+
+    async def claim_jwt_session_migration(
+        self,
+        family_id: str,
+        session_id: str,
+        ttl_seconds: int,
+        *,
+        replace_session_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Claim one opaque browser session for a legacy JWT family.
+
+        Access JWTs are reusable until they expire, so ``/auth/me`` exchanges
+        can race across tabs or replicas.  This differs from refresh-token
+        migration, where the refresh credential is consumed exactly once and a
+        later opaque rotation intentionally replaces the family mapping.
+
+        Return the winning opaque session id, or ``None`` when the family was
+        revoked.  ``replace_session_id`` permits a caller to replace a mapping
+        only after it proved that exact winner is stale; a concurrent healthy
+        winner is never overwritten.
+        """
+
+        from app.infrastructure.storage.redis import get_redis
+
+        script = """
+        -- jwt-browser-session-claim-v1
+        if redis.call('EXISTS', KEYS[1]) == 1 then
+          return ''
+        end
+        local current = redis.call('GET', KEYS[2])
+        if current then
+          if ARGV[3] ~= '' and current == ARGV[3] then
+            redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[2])
+            return ARGV[1]
+          end
+          return current
+        end
+        redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[2], 'NX')
+        return redis.call('GET', KEYS[2]) or ''
+        """
+        winner = await get_redis().client.eval(
+            script,
+            2,
+            self._jwt_family_revocation_key(family_id),
+            self._jwt_migrated_session_key(family_id),
+            session_id,
+            str(max(1, ttl_seconds)),
+            replace_session_id or "",
+        )
+        return str(winner) if winner else None
+
+    async def _revoke_jwt_family(
+        self, family_id: str, *, ttl_seconds: int
+    ) -> Optional[str]:
+        """Revoke a JWT family and atomically detach its migrated Redis session."""
+
+        from app.infrastructure.storage.redis import get_redis
+
+        script = """
+        -- jwt-family-revoke-v1
+        redis.call('SET', KEYS[1], '1', 'EX', ARGV[1])
+        local session_id = redis.call('GET', KEYS[2])
+        redis.call('DEL', KEYS[2])
+        return session_id or ''
+        """
+        session_id = await get_redis().client.eval(
+            script,
+            2,
+            self._jwt_family_revocation_key(family_id),
+            self._jwt_migrated_session_key(family_id),
+            str(ttl_seconds),
+        )
+        return str(session_id) if session_id else None
+
     async def revoke_user_tokens(self, user_id: str) -> None:
         """Invalidate every token issued before a credential/state change."""
 
@@ -429,6 +597,23 @@ class AuthService:
             str(cutoff_ms),
             ex=self._maximum_revocation_ttl(),
         )
+        # Publish the cutoff before deleting sessions so a concurrent JWT
+        # migration cannot create a session in the delete/set race window.
+        await self.session_store.delete_all_for_user(user_id)
+
+    async def _is_jwt_user_migration_revoked(self, marker: str) -> bool:
+        """Check the cutoff embedded in a legacy no-family JWT migration marker."""
+
+        from app.infrastructure.storage.redis import get_redis
+
+        try:
+            _prefix, user_id, issued_ms = marker.split(":", 2)
+            cutoff = await get_redis().client.get(
+                self._jwt_user_cutoff_key(user_id)
+            )
+            return cutoff is not None and int(issued_ms) <= int(cutoff)
+        except (TypeError, ValueError):
+            return True
 
     async def enforce_rate_limit(
         self,
@@ -620,33 +805,231 @@ class AuthService:
                     refresh_token, reservation_owner
                 )
     
-    async def register_user(self, fullname: str, password: str, email: str, role: UserRole = UserRole.USER) -> User:
-        """Register a new user"""
+    def _generate_session_id(self) -> str:
+        return secrets.token_urlsafe(32)
+
+    def _ttl_seconds_for_client(self, client: AuthClientType) -> int:
+        if client in (AuthClientType.IOS, AuthClientType.ANDROID):
+            return max(1, self.settings.session_app_ttl_days * 24 * 3600)
+        return max(1, self.settings.session_web_ttl_days * 24 * 3600)
+
+    def parse_client(self, raw: Optional[str]) -> AuthClientType:
+        if not raw:
+            return AuthClientType.UNKNOWN
+        try:
+            return AuthClientType(raw.lower())
+        except ValueError:
+            return AuthClientType.UNKNOWN
+
+    def _build_auth_session(
+        self,
+        user: User,
+        *,
+        client: AuthClientType,
+        ip: Optional[str],
+        user_agent: Optional[str],
+        rotated_from: Optional[str],
+        revocation_generation: int,
+    ) -> tuple[AuthSession, int]:
+        now = datetime.now(UTC)
+        ttl = self._ttl_seconds_for_client(client)
+        return AuthSession(
+            session_id=self._generate_session_id(),
+            user_id=user.id,
+            client=client,
+            created_at=now,
+            expires_at=now + timedelta(seconds=ttl),
+            last_seen_at=now,
+            ip=ip,
+            user_agent=user_agent,
+            rotated_from=rotated_from,
+            revocation_generation=revocation_generation,
+            user_snapshot=(
+                user.model_dump(mode="json")
+                if self.settings.auth_provider == "sub2api"
+                else None
+            ),
+        ), ttl
+
+    async def create_auth_session(
+        self,
+        user: User,
+        client: AuthClientType = AuthClientType.WEB,
+        ip: Optional[str] = None,
+        user_agent: Optional[str] = None,
+        rotated_from: Optional[str] = None,
+        expected_generation: Optional[int] = None,
+    ) -> AuthSession:
+        if expected_generation is None:
+            expected_generation = await self.session_store.get_user_generation(
+                user.id
+            )
+        session, ttl = self._build_auth_session(
+            user,
+            client=client,
+            ip=ip,
+            user_agent=user_agent,
+            rotated_from=rotated_from,
+            revocation_generation=expected_generation,
+        )
+        created = await self.session_store.create(
+            session,
+            ttl,
+            expected_generation=expected_generation,
+        )
+        if not created:
+            raise UnauthorizedError("Login was revoked during session creation")
+        return session
+
+    async def _rotate_auth_session(
+        self,
+        old_session: AuthSession,
+        user: User,
+        *,
+        rotated_from: Optional[str],
+    ) -> AuthSession:
+        generation = old_session.revocation_generation
+        session, ttl = self._build_auth_session(
+            user,
+            client=old_session.client,
+            ip=old_session.ip,
+            user_agent=old_session.user_agent,
+            rotated_from=rotated_from,
+            revocation_generation=generation,
+        )
+        rotated = await self.session_store.rotate(
+            old_session.session_id,
+            session,
+            ttl,
+            expected_generation=generation,
+        )
+        if not rotated:
+            raise UnauthorizedError("Session was logged out during refresh")
+        return session
+
+    async def _user_from_id(self, user_id: str) -> Optional[User]:
+        if self.settings.auth_provider == "password":
+            user = await self.user_repository.get_user_by_id(user_id)
+            if not user or not user.is_active:
+                return None
+            return user
+        if self.settings.auth_provider == "local" and user_id == "local_admin":
+            return User(
+                id="local_admin",
+                fullname="Local Admin",
+                email=self.settings.local_auth_email,
+                role=UserRole.ADMIN,
+                is_active=True,
+                auth_provider="local",
+            )
+        return None
+
+    async def resolve_session_token(self, token: str) -> Optional[ResolvedCredentials]:
+        session = await self.session_store.get(token)
+        if not session:
+            return None
+        ttl = self._ttl_seconds_for_client(session.client)
+        session = await self.session_store.touch(token, ttl)
+        if not session:
+            return None
+        return ResolvedCredentials(
+            session_id=session.session_id,
+            user_id=session.user_id,
+            source=CredentialSource.BEARER,
+            jwt_payload=session.user_snapshot,
+        )
+
+    async def resolve_jwt_grace(self, token: str) -> Optional[ResolvedCredentials]:
+        if self.settings.auth_provider == "sub2api":
+            if await self._is_token_revoked(token):
+                return None
+            user = await self._verify_sub2api_token(token)
+            if not user or not user.is_active:
+                return None
+            return ResolvedCredentials(
+                session_id=None,
+                user_id=user.id,
+                source=CredentialSource.JWT_GRACE,
+                jwt_payload=user.model_dump(mode="json"),
+            )
+        if not self.settings.session_jwt_grace_enabled:
+            return None
+        payload = self.token_service.verify_token(token)
+        if not payload or await self._is_token_revoked(token):
+            return None
+        if payload.get("type", "access") != "access":
+            return None
+        user_id = payload.get("sub")
+        if not user_id:
+            return None
+        return ResolvedCredentials(
+            session_id=None,
+            user_id=user_id,
+            source=CredentialSource.JWT_GRACE,
+            jwt_payload=payload,
+        )
+
+    async def resolve_credentials(
+        self,
+        bearer_token: Optional[str] = None,
+        cookie_session_id: Optional[str] = None,
+    ) -> Optional[ResolvedCredentials]:
+        """Resolve credentials: Bearer session/JWT → Cookie session_id."""
+        if bearer_token:
+            resolved = await self.resolve_session_token(bearer_token)
+            if resolved:
+                resolved.source = CredentialSource.BEARER
+                return resolved
+            resolved = await self.resolve_jwt_grace(bearer_token)
+            if resolved:
+                return resolved
+
+        if cookie_session_id:
+            resolved = await self.resolve_session_token(cookie_session_id)
+            if resolved:
+                resolved.source = CredentialSource.COOKIE
+                return resolved
+
+        return None
+
+    async def user_from_resolved(self, resolved: ResolvedCredentials) -> Optional[User]:
+        if self.settings.auth_provider == "sub2api" and resolved.jwt_payload:
+            try:
+                user = User.model_validate(resolved.jwt_payload)
+            except (TypeError, ValueError):
+                return None
+            return user if user.is_active else None
+        if resolved.source == CredentialSource.JWT_GRACE and resolved.jwt_payload:
+            if self.settings.auth_provider == "password":
+                return await self._user_from_id(resolved.user_id)
+            return User(
+                id=resolved.jwt_payload.get("sub"),
+                fullname=resolved.jwt_payload.get("fullname") or "user",
+                email=resolved.jwt_payload.get("email"),
+                role=UserRole(resolved.jwt_payload.get("role", "user")),
+                is_active=resolved.jwt_payload.get("is_active", True),
+            )
+        return await self._user_from_id(resolved.user_id)
+
+    async def register_user(
+        self, fullname: str, password: str, email: str, role: UserRole = UserRole.USER
+    ) -> User:
         logger.info("Registering user")
 
         if self.settings.auth_provider != "password":
             raise BadRequestError("Registration is not allowed")
         if not self.settings.registration_enabled:
             raise BadRequestError("Public registration is disabled")
-        
-        # Validate input
         if not fullname or len(fullname.strip()) < 2:
             raise ValidationError("Full name must be at least 2 characters long")
-        
         if not email or '@' not in email:
             raise ValidationError("Valid email is required")
-        
         if not password or len(password) < 6:
             raise ValidationError("Password must be at least 6 characters long")
-        
-        # Check if email already exists
         if await self.user_repository.email_exists(email):
             raise ValidationError("Email already exists")
-        
-        # Hash password
+
         password_hash = await asyncio.to_thread(self._hash_password, password)
-        
-        # Create user
         user = User(
             id=self._generate_user_id(),
             fullname=fullname.strip(),
@@ -655,67 +1038,70 @@ class AuthService:
             role=role,
             is_active=True,
             created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow()
+            updated_at=datetime.utcnow(),
         )
-        
-        # Save to database
         created_user = await self.user_repository.create_user(user)
-        
         logger.info(f"User registered successfully: {created_user.id}")
         return created_user
-    
-    async def authenticate_user(self, email: str, password: str) -> Optional[User]:
-        """Authenticate user by email and password"""
+
+    async def _authenticate_user_with_generation(
+        self, email: str, password: str
+    ) -> tuple[Optional[User], Optional[int]]:
+        """Authenticate and capture the user's session fence before validation."""
+
         logger.debug("Authenticating user")
-        
-        # Handle different auth providers
+
         if self.settings.auth_provider == "none":
-            # No authentication required - return a default user
-            return User(
+            user = User(
                 id="anonymous",
                 fullname="anonymous",
                 email="anonymous@localhost",
                 role=UserRole.USER,
-                is_active=True
+                is_active=True,
             )
-        
-        elif self.settings.auth_provider == "local":
-            # Local authentication using configured credentials
-            if (email == self.settings.local_auth_email and 
-                password == self.settings.local_auth_password):
+            generation = await self.session_store.get_user_generation(user.id)
+            return user, generation
+
+        if self.settings.auth_provider == "local":
+            generation = await self.session_store.get_user_generation("local_admin")
+            if (
+                email == self.settings.local_auth_email
+                and password == self.settings.local_auth_password
+            ):
                 return User(
                     id="local_admin",
                     fullname="Local Admin",
                     email=email,
                     role=UserRole.ADMIN,
-                    is_active=True
-                )
-            else:
-                logger.warning("Local authentication failed")
-                return None
-        
-        elif self.settings.auth_provider == "password":
-            # Database password authentication
+                    is_active=True,
+                    auth_provider="local",
+                ), generation
+            logger.warning("Local authentication failed")
+            return None, None
+
+        if self.settings.auth_provider == "password":
             user = await self.user_repository.get_user_by_email(email)
             if not user:
                 logger.warning("Password authentication failed: user not found")
-                return None
-            
+                return None, None
             if not user.is_active:
                 logger.warning(
                     "Password authentication failed: inactive user_id=%s",
                     user.id,
                 )
-                return None
-            
+                return None, None
             if not user.password_hash:
                 logger.warning(
                     "Password authentication failed: missing hash for user_id=%s",
                     user.id,
                 )
-                return None
-            
-            # Verify password
+                return None, None
+
+            # Capture before the expensive password verification.  A
+            # concurrent password change/logout-all advances this generation;
+            # the later session create then fails its Redis CAS instead of
+            # resurrecting a credential that was verified before revocation.
+            generation = await self.session_store.get_user_generation(user.id)
             password_valid = await asyncio.to_thread(
                 self._verify_password, password, user.password_hash
             )
@@ -725,7 +1111,7 @@ class AuthService:
                     "user_id=%s",
                     user.id,
                 )
-                return None
+                return None, None
 
             if self._password_needs_rehash(user.password_hash):
                 user.password_hash = await asyncio.to_thread(
@@ -735,125 +1121,290 @@ class AuthService:
             # Update last login
             user.update_last_login()
             await self.user_repository.update_user(user)
-            
-            logger.info("User authenticated successfully: user_id=%s", user.id)
-            return user
 
-        elif self.settings.auth_provider == "sub2api":
+            logger.info("User authenticated successfully: user_id=%s", user.id)
+            return user, generation
+
+        if self.settings.auth_provider == "sub2api":
             raise BadRequestError("Use Sub2API authentication token")
-        
-        else:
-            raise ValueError(f"Unsupported auth provider: {self.settings.auth_provider}")
-    
-    async def login_with_tokens(self, email: str, password: str) -> AuthToken:
-        """Authenticate user and return JWT tokens"""
-        user = await self.authenticate_user(email, password)
-        
+
+        raise ValueError(f"Unsupported auth provider: {self.settings.auth_provider}")
+
+    async def authenticate_user(self, email: str, password: str) -> Optional[User]:
+        """Authenticate user by email and password."""
+
+        user, _generation = await self._authenticate_user_with_generation(
+            email, password
+        )
+        return user
+
+    async def login_with_session(
+        self,
+        email: str,
+        password: str,
+        client: AuthClientType = AuthClientType.WEB,
+        ip: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ) -> AuthToken:
+        user, generation = await self._authenticate_user_with_generation(
+            email, password
+        )
         if not user:
             raise UnauthorizedError("Invalid email or password")
-        
-        # Generate a pair in one revocable token family.
-        access_token, refresh_token = self.token_service.create_token_pair(user)
-        
+
+        session = await self.create_auth_session(
+            user,
+            client=client,
+            ip=ip,
+            user_agent=user_agent,
+            expected_generation=generation,
+        )
         return AuthToken(
-            access_token=access_token,
-            refresh_token=refresh_token,
+            access_token=session.session_id,
+            refresh_token=session.session_id,
             token_type="bearer",
-            user=user
+            user=user,
         )
-    
-    async def refresh_access_token(self, refresh_token: str) -> AuthToken:
-        """Refresh access token using refresh token"""
+
+    async def login_with_tokens(self, email: str, password: str) -> AuthToken:
+        """Backward-compatible alias — issues Redis sessions, not JWTs."""
+        return await self.login_with_session(email, password, client=AuthClientType.WEB)
+
+    async def establish_sub2api_session(
+        self,
+        access_token: str,
+        *,
+        client: AuthClientType = AuthClientType.WEB,
+        ip: Optional[str] = None,
+        user_agent: Optional[str] = None,
+        rotated_from: Optional[str] = None,
+    ) -> tuple[User, AuthSession]:
+        """Exchange a verified external credential for a local opaque session."""
+
+        if self.settings.auth_provider != "sub2api":
+            raise BadRequestError("External session exchange is not available")
+        if not access_token or await self._is_token_revoked(access_token):
+            raise UnauthorizedError("Invalid access token")
+        user = await self._verify_sub2api_token(access_token)
+        if not user or not user.is_active:
+            raise UnauthorizedError("Invalid access token")
+        session = await self.create_auth_session(
+            user,
+            client=client,
+            ip=ip,
+            user_agent=user_agent,
+            rotated_from=rotated_from,
+        )
+        return user, session
+
+    async def refresh_access_token(
+        self,
+        refresh_token: Optional[str] = None,
+        cookie_session_id: Optional[str] = None,
+        rotate: bool = False,
+    ) -> AuthToken:
+        token = refresh_token or cookie_session_id
+        if not token:
+            raise UnauthorizedError("Missing session credentials")
+
         if self.settings.auth_provider == "sub2api":
+            if not refresh_token:
+                raise UnauthorizedError("Missing refresh token")
             return await self._refresh_sub2api_access_token(refresh_token)
-        payload = self.token_service.verify_token(
-            refresh_token, expected_type="refresh"
-        )
-        
-        if not payload or await self._is_token_revoked(refresh_token):
+
+        session = await self.session_store.get(token)
+        if session:
+            user = await self._user_from_id(session.user_id)
+            if not user or not user.is_active:
+                raise UnauthorizedError("User not found or inactive")
+
+            if rotate:
+                migrated_from = (
+                    session.rotated_from
+                    if (session.rotated_from or "").startswith("jwt-")
+                    else token
+                )
+                new_session = await self._rotate_auth_session(
+                    session,
+                    user,
+                    rotated_from=migrated_from,
+                )
+                try:
+                    if migrated_from.startswith("jwt-family:"):
+                        family_id = migrated_from.removeprefix("jwt-family:")
+                        (
+                            committed,
+                            displaced_session_id,
+                        ) = await self._commit_jwt_session_migration(
+                            family_id,
+                            new_session.session_id,
+                            self._maximum_revocation_ttl(),
+                        )
+                        if committed:
+                            await self._cleanup_displaced_jwt_session(
+                                displaced_session_id
+                            )
+                    elif migrated_from.startswith("jwt-user:"):
+                        committed = not await self._is_jwt_user_migration_revoked(
+                            migrated_from
+                        )
+                    else:
+                        committed = True
+                except Exception as exc:
+                    await self.session_store.delete(new_session.session_id)
+                    logger.warning(
+                        "Opaque session rotation authority failed: %s",
+                        safe_exception_summary(exc),
+                    )
+                    raise UnauthorizedError("Token refresh failed") from exc
+                if not committed:
+                    await self.session_store.delete(new_session.session_id)
+                    raise UnauthorizedError("Invalid refresh token")
+                return AuthToken(
+                    access_token=new_session.session_id,
+                    refresh_token=new_session.session_id,
+                    token_type="bearer",
+                )
+
+            ttl = self._ttl_seconds_for_client(session.client)
+            if not await self.session_store.touch(token, ttl):
+                raise UnauthorizedError("Session was logged out during refresh")
+            return AuthToken(
+                access_token=token,
+                refresh_token=token,
+                token_type="bearer",
+            )
+
+        if not self.settings.session_jwt_grace_enabled:
             raise UnauthorizedError("Invalid refresh token")
 
-        # SET NX closes the two-replica refresh race. Only the first caller may
-        # mint a replacement pair from this token.
-        await self._consume_jwt_refresh(refresh_token, payload)
-        
-        # Get user from database
+        payload = self.token_service.verify_token(token, expected_type="refresh")
+        if not payload:
+            raise UnauthorizedError("Invalid refresh token")
         user_id = payload.get("sub")
-        if self.settings.auth_provider == "password":
-            user = await self.user_repository.get_user_by_id(user_id)
-        else:
-            try:
+        session_generation = (
+            await self.session_store.get_user_generation(str(user_id))
+            if user_id
+            else None
+        )
+        if await self._is_token_revoked(token):
+            raise UnauthorizedError("Invalid refresh token")
+        await self._consume_jwt_refresh(token, payload)
+
+        user = await self._user_from_id(str(user_id)) if user_id else None
+        if not user or not user.is_active:
+            if self.settings.auth_provider == "local" and user_id:
                 user = User(
                     id=str(user_id),
                     fullname=str(payload.get("fullname") or "Local User"),
                     email=str(payload.get("email") or "local@localhost"),
                     role=UserRole(payload.get("role", "user")),
-                    is_active=bool(payload.get("is_active", True)),
-                    auth_provider=self.settings.auth_provider,
+                    is_active=True,
+                    auth_provider="local",
                 )
-            except (TypeError, ValueError):
-                user = None
-        
-        if not user or not user.is_active:
-            raise UnauthorizedError("User not found or inactive")
-        
-        session_id = str(payload.get("sid") or self.token_service.new_session_id())
-        new_access_token = self.token_service.create_access_token(
-            user, session_id=session_id
+            else:
+                raise UnauthorizedError("User not found or inactive")
+
+        family_id = payload.get("sid")
+        issued_ms = payload.get("iat_ms")
+        if not isinstance(issued_ms, (int, float)):
+            issued_ms = int(float(payload.get("iat") or 0) * 1000)
+        migrated_from = (
+            f"jwt-family:{family_id}"
+            if family_id
+            else f"jwt-user:{user.id}:{int(issued_ms)}"
         )
-        new_refresh_token = self.token_service.create_refresh_token(
-            user, session_id=session_id
+        new_session = await self.create_auth_session(
+            user,
+            client=AuthClientType.UNKNOWN,
+            rotated_from=migrated_from,
+            expected_generation=session_generation,
         )
-        
+        try:
+            if family_id:
+                (
+                    committed,
+                    displaced_session_id,
+                ) = await self._commit_jwt_session_migration(
+                    str(family_id),
+                    new_session.session_id,
+                    self._payload_ttl(payload),
+                )
+                if committed:
+                    await self._cleanup_displaced_jwt_session(
+                        displaced_session_id
+                    )
+            else:
+                # Legacy JWTs without a family id are governed by the per-user
+                # cutoff. Re-check after session creation to close the refresh /
+                # logout race without weakening the fail-closed revocation path.
+                committed = not await self._is_token_revoked(token)
+        except Exception as exc:
+            await self.session_store.delete(new_session.session_id)
+            logger.warning(
+                "JWT session migration authority failed: %s",
+                safe_exception_summary(exc),
+            )
+            raise UnauthorizedError("Token refresh failed") from exc
+        if not committed:
+            await self.session_store.delete(new_session.session_id)
+            raise UnauthorizedError("Invalid refresh token")
         return AuthToken(
-            access_token=new_access_token,
-            refresh_token=new_refresh_token,
+            access_token=new_session.session_id,
+            refresh_token=new_session.session_id,
             token_type="bearer",
         )
-    
     async def verify_token(self, token: str) -> Optional[User]:
-        """Verify JWT token and return user"""
-        if not token or await self._is_token_revoked(token):
+        if not token:
             return None
-        if self.settings.auth_provider == "sub2api":
-            return await self._verify_sub2api_token(token)
-        user_info = self.token_service.get_user_from_token(token)
-        
-        if not user_info:
-            return None
-        
-        # For database users, verify user still exists and is active
-        if self.settings.auth_provider == "password":
-            user = await self.user_repository.get_user_by_id(user_info["id"])
-            if not user or not user.is_active:
-                return None
-            return user
-        
-        # For local/none authentication, create user from token info
-        return User(
-            id=user_info["id"],
-            fullname=user_info["fullname"],
-            email=user_info.get("email"),
-            role=UserRole(user_info.get("role", "user")),
-            is_active=user_info.get("is_active", True)
-        )
-    
+        resolved = await self.resolve_session_token(token)
+        if resolved:
+            return await self.user_from_resolved(resolved)
+        resolved = await self.resolve_jwt_grace(token)
+        if resolved:
+            return await self.user_from_resolved(resolved)
+        return None
+
     async def logout(
-        self, token: Optional[str], *, refresh_token: Optional[str] = None
+        self,
+        token: Optional[str],
+        *,
+        refresh_token: Optional[str] = None,
+        cookie_session_id: Optional[str] = None,
     ) -> bool:
         """Logout by revoking the whole local family or both external tokens."""
         if self.settings.auth_provider == "none":
             raise BadRequestError("Logout is not allowed")
-        from app.infrastructure.storage.redis import get_redis
-
-        redis = get_redis().client
         if self.settings.auth_provider == "sub2api":
             if not refresh_token:
                 raise BadRequestError(
                     "refresh_token is required to fully revoke Sub2API login"
                 )
             await self._revoke_sub2api_family(token, refresh_token)
+            if cookie_session_id:
+                await self.session_store.delete(cookie_session_id)
             return True
+
+        if token:
+            session = await self.session_store.get(token)
+            if session:
+                migrated_from = session.rotated_from or ""
+                if migrated_from.startswith("jwt-family:"):
+                    family_id = migrated_from.removeprefix("jwt-family:")
+                    linked_session_id = await self._revoke_jwt_family(
+                        family_id,
+                        ttl_seconds=self._maximum_revocation_ttl(),
+                    )
+                    if linked_session_id and linked_session_id != token:
+                        await self.session_store.delete(linked_session_id)
+                elif migrated_from.startswith("jwt-user:"):
+                    await self.revoke_user_tokens(session.user_id)
+                    return True
+                return await self.session_store.delete(token)
+
+        from app.infrastructure.storage.redis import get_redis
+
+        redis = get_redis().client
 
         access_payload = (
             self.token_service.verify_token(token, expected_type="access")
@@ -878,11 +1429,11 @@ class AuthService:
         payload = access_payload or refresh_payload
         ttl_seconds = self._maximum_revocation_ttl()
         if payload.get("sid"):
-            await redis.set(
-                self._jwt_family_revocation_key(str(payload["sid"])),
-                "1",
-                ex=ttl_seconds,
+            linked_session_id = await self._revoke_jwt_family(
+                str(payload["sid"]), ttl_seconds=ttl_seconds
             )
+            if linked_session_id:
+                await self.session_store.delete(linked_session_id)
         else:
             # Legacy access tokens predate session-family IDs. Revoke this
             # exact token and all older tokens for the account so their paired
@@ -905,133 +1456,108 @@ class AuthService:
             if payload.get("sub"):
                 await self.revoke_user_tokens(str(payload["sub"]))
         return True
-    
+
+    async def logout_all(self, user_id: str) -> int:
+        if self.settings.auth_provider == "none":
+            raise BadRequestError("Logout is not allowed")
+        count = await self.session_store.delete_all_for_user(user_id)
+        if self.settings.auth_provider != "sub2api":
+            from app.infrastructure.storage.redis import get_redis
+
+            cutoff_ms = int(datetime.now(UTC).timestamp() * 1000)
+            await get_redis().client.set(
+                self._jwt_user_cutoff_key(user_id),
+                str(cutoff_ms),
+                ex=self._maximum_revocation_ttl(),
+            )
+        return count
+
     async def change_password(self, user_id: str, old_password: str, new_password: str) -> bool:
-        """Change user password"""
         logger.info(f"Changing password for user: {user_id}")
-        
-        # Get user
         user = await self.user_repository.get_user_by_id(user_id)
         if not user:
             raise ValidationError("User not found")
-        
         if not user.is_active:
             raise UnauthorizedError("User account is inactive")
-        
-        # Verify old password
+
         password_valid = bool(user.password_hash) and await asyncio.to_thread(
             self._verify_password, old_password, user.password_hash
         )
         if not password_valid:
             raise UnauthorizedError("Invalid old password")
-        
-        # Validate new password
         if not new_password or len(new_password) < 6:
             raise ValidationError("New password must be at least 6 characters long")
-        
-        # Hash new password
+
         new_password_hash = await asyncio.to_thread(
             self._hash_password, new_password
         )
-        
-        # Update user password
         user.password_hash = new_password_hash
         user.updated_at = datetime.utcnow()
-        
         await self.user_repository.update_user(user)
         await self.revoke_user_tokens(user_id)
-        
         logger.info(f"Password changed successfully for user: {user_id}")
         return True
-    
+
     async def change_fullname(self, user_id: str, new_fullname: str) -> User:
-        """Change user fullname"""
         logger.info(f"Changing fullname for user: {user_id}")
-        
-        # Get user
         user = await self.user_repository.get_user_by_id(user_id)
         if not user:
             raise ValidationError("User not found")
-        
         if not user.is_active:
             raise UnauthorizedError("User account is inactive")
-        
-        # Validate new fullname
         if not new_fullname or len(new_fullname.strip()) < 2:
             raise ValidationError("Full name must be at least 2 characters long")
-        
-        # Update user fullname
         user.fullname = new_fullname.strip()
         user.updated_at = datetime.utcnow()
-        
         updated_user = await self.user_repository.update_user(user)
-        
         logger.info(f"Fullname changed successfully for user: {user_id}")
         return updated_user
-    
+
     async def get_user_by_id(self, user_id: str) -> Optional[User]:
-        """Get user by ID"""
         return await self.user_repository.get_user_by_id(user_id)
-    
+
     async def deactivate_user(self, user_id: str) -> bool:
-        """Deactivate user account"""
         logger.info(f"Deactivating user: {user_id}")
-        
         user = await self.user_repository.get_user_by_id(user_id)
         if not user:
             raise ValidationError("User not found")
-        
         user.deactivate()
         await self.user_repository.update_user(user)
         await self.revoke_user_tokens(user_id)
-        
         logger.info(f"User deactivated successfully: {user_id}")
         return True
-    
+
     async def activate_user(self, user_id: str) -> bool:
-        """Activate user account"""
         logger.info(f"Activating user: {user_id}")
-        
         user = await self.user_repository.get_user_by_id(user_id)
         if not user:
             raise ValidationError("User not found")
-        
         user.activate()
         await self.user_repository.update_user(user)
-        
         logger.info(f"User activated successfully: {user_id}")
         return True
-    
+
     async def reset_password(self, email: str, new_password: str) -> bool:
         """Reset user password with email"""
         logger.info("Resetting user password")
-        
+
         if self.settings.auth_provider != "password":
             raise BadRequestError("Password reset is not allowed")
-        
-        # Get user by email
         user = await self.user_repository.get_user_by_email(email)
         if not user:
             raise ValidationError("User not found")
-        
         if not user.is_active:
             raise UnauthorizedError("User account is inactive")
-        
-        # Validate new password
         if not new_password or len(new_password) < 6:
             raise ValidationError("New password must be at least 6 characters long")
-        
-        # Hash new password
+
         new_password_hash = await asyncio.to_thread(
             self._hash_password, new_password
         )
-        
-        # Update user password
         user.password_hash = new_password_hash
         user.updated_at = datetime.utcnow()
-        
         await self.user_repository.update_user(user)
         await self.revoke_user_tokens(user.id)
-        
+
         logger.info("Password reset successfully for user_id=%s", user.id)
         return True

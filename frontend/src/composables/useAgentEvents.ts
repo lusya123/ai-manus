@@ -13,12 +13,12 @@ import {
   ErrorEventData,
   TitleEventData,
   PlanEventData,
-  AgentSSEEvent,
+  AgentEvent,
 } from '../types/event';
 
-const TERMINAL_EVENTS = new Set<AgentSSEEvent['event']>(['done', 'error', 'wait']);
+const TERMINAL_EVENTS = new Set<AgentEvent['event']>(['done', 'error', 'wait']);
 
-export function getLatestTurnId(events: AgentSSEEvent[]): string | undefined {
+export function getLatestTurnId(events: AgentEvent[]): string | undefined {
   let latestTurnId: string | undefined;
   for (const event of events) {
     const role = (event.data as { role?: string }).role;
@@ -29,20 +29,13 @@ export function getLatestTurnId(events: AgentSSEEvent[]): string | undefined {
   return latestTurnId;
 }
 
-export function hasTerminalEventForTurn(
-  events: AgentSSEEvent[],
-  turnId: string,
-): boolean {
+export function hasTerminalEventForTurn(events: AgentEvent[], turnId: string): boolean {
   return events.some(
-    event => TERMINAL_EVENTS.has(event.event) && event.data.turn_id === turnId,
+    (event) => TERMINAL_EVENTS.has(event.event) && event.data.turn_id === turnId,
   );
 }
 
-/**
- * A session contains every historical turn. Terminal events from an older
- * turn must not prevent reconnecting to a newer running turn.
- */
-export function hasTerminalEventForLatestTurn(events: AgentSSEEvent[]): boolean {
+export function hasTerminalEventForLatestTurn(events: AgentEvent[]): boolean {
   let latestTurnStart = -1;
   events.forEach((event, index) => {
     const role = (event.data as { role?: string }).role;
@@ -52,11 +45,7 @@ export function hasTerminalEventForLatestTurn(events: AgentSSEEvent[]): boolean 
   });
   if (latestTurnStart < 0) return false;
   const latestTurnId = getLatestTurnId(events);
-  if (latestTurnId) {
-    return hasTerminalEventForTurn(events, latestTurnId);
-  }
-  // Legacy history predates stable turn IDs. Retain its ordered fallback while
-  // new durable turns use an exact logical-turn match above.
+  if (latestTurnId) return hasTerminalEventForTurn(events, latestTurnId);
   return events.slice(latestTurnStart).some((event) => TERMINAL_EVENTS.has(event.event));
 }
 
@@ -64,7 +53,6 @@ export interface AgentEventState {
   messages: Ref<Message[]>;
   title: Ref<string>;
   plan: Ref<PlanEventData | undefined>;
-  isLoading: Ref<boolean>;
   lastEventId: Ref<string | undefined>;
   lastTool: Ref<ToolContent | undefined>;
   lastNoMessageTool: Ref<ToolContent | undefined>;
@@ -73,14 +61,16 @@ export interface AgentEventState {
 export interface AgentEventOptions {
   /** Called when a non-message tool is created or updated, so the page can surface it (e.g. in the tool panel). */
   onToolActivity?: (tool: ToolContent) => void;
+  /** Fired when stream shows an error assistant bubble or step failed — page maps to phase. */
+  onStreamError?: () => void;
 }
 
 /**
- * Shared conversion of agent SSE events into the UI message list.
+ * Shared conversion of agent stream events into the UI message list.
  * Used by both ChatPage (live chat) and SharePage (replay).
  */
 export function useAgentEvents(state: AgentEventState, options: AgentEventOptions = {}) {
-  const { messages, title, plan, isLoading, lastEventId, lastTool, lastNoMessageTool } = state;
+  const { messages, title, plan, lastEventId, lastTool, lastNoMessageTool } = state;
   const seenEventIds = new Set<string>();
 
   const resetEventHistory = () => {
@@ -92,6 +82,32 @@ export function useAgentEvents(state: AgentEventState, options: AgentEventOption
   };
 
   const handleMessageEvent = (messageData: MessageEventData) => {
+    // Skip blank assistant bubbles (e.g. empty create_plan.message from LLM)
+    const text = (messageData.content ?? '').trim();
+    if (messageData.role === 'assistant' && !text) {
+      if (messageData.attachments && messageData.attachments.length > 0) {
+        messages.value.push({
+          type: 'attachments',
+          content: {
+            ...messageData
+          } as AttachmentsContent,
+        });
+      }
+      return;
+    }
+
+    // User turn: keep attachments on the same ChatQuestion shell (images above bubble).
+    if (messageData.role === 'user') {
+      messages.value.push({
+        type: 'user',
+        content: {
+          ...messageData,
+          attachments: messageData.attachments?.length ? messageData.attachments : undefined,
+        } as MessageContent,
+      });
+      return;
+    }
+
     messages.value.push({
       type: messageData.role,
       content: {
@@ -148,12 +164,12 @@ export function useAgentEvents(state: AgentEventState, options: AgentEventOption
         lastStep.status = stepData.status;
       }
     } else if (stepData.status === 'failed') {
-      isLoading.value = false;
+      options.onStreamError?.();
     }
   };
 
   const handleErrorEvent = (errorData: ErrorEventData) => {
-    isLoading.value = false;
+    options.onStreamError?.();
     messages.value.push({
       type: 'assistant',
       content: {
@@ -171,17 +187,10 @@ export function useAgentEvents(state: AgentEventState, options: AgentEventOption
     plan.value = planData;
   };
 
-  const handleEvent = (event: AgentSSEEvent): boolean => {
-    // Terminal state transitions are idempotent control-plane effects. Apply
-    // them before content deduplication so a terminal event replayed after an
-    // SSE reconnect can never leave the page stuck in a loading state.
-    if (TERMINAL_EVENTS.has(event.event)) {
-      isLoading.value = false;
-    }
-
-    // Mongo history replay and Redis live delivery can overlap. Stable logical
-    // event IDs make that overlap harmless while transport cursors remain
-    // independently usable for reconnects.
+  const handleEvent = (event: AgentEvent): boolean => {
+    // REST history replay and live WS catch-up can overlap. Logical event IDs
+    // make the overlap harmless while transport cursors remain independently
+    // usable for reconnecting.
     if (event.data.event_id && seenEventIds.has(event.data.event_id)) {
       lastEventId.value = event.data.transport_cursor ?? lastEventId.value;
       return false;
@@ -189,12 +198,26 @@ export function useAgentEvents(state: AgentEventState, options: AgentEventOption
     if (event.data.event_id) {
       seenEventIds.add(event.data.event_id);
     }
+
+    // Control / live computer-panel events — not part of the chat message list
+    if (
+      event.event === 'status_update'
+      || event.event === 'terminal_update'
+      || event.event === 'file_update'
+    ) {
+      lastEventId.value = event.data.transport_cursor ?? event.data.event_id;
+      return true;
+    }
     if (event.event === 'message') {
       handleMessageEvent(event.data as MessageEventData);
     } else if (event.event === 'tool') {
       handleToolEvent(event.data as ToolEventData);
     } else if (event.event === 'step') {
       handleStepEvent(event.data as StepEventData);
+    } else if (event.event === 'done') {
+      // Loading state is cleared when the stream ends / status_update arrives
+    } else if (event.event === 'wait') {
+      // TODO: handle wait event
     } else if (event.event === 'error') {
       handleErrorEvent(event.data as ErrorEventData);
     } else if (event.event === 'title') {
@@ -202,7 +225,7 @@ export function useAgentEvents(state: AgentEventState, options: AgentEventOption
     } else if (event.event === 'plan') {
       handlePlanEvent(event.data as PlanEventData);
     }
-    lastEventId.value = event.data.transport_cursor ?? lastEventId.value;
+    lastEventId.value = event.data.transport_cursor ?? event.data.event_id;
     return true;
   };
 

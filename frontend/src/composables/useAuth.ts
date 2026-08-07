@@ -1,4 +1,4 @@
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { 
   login as apiLogin, 
   register as apiRegister, 
@@ -21,6 +21,7 @@ import {
   type RegisterResponse
 } from '../api/auth'
 import { getCachedAuthProvider } from '../api/config'
+import { eventBus } from '../utils/eventBus'
 
 // Global auth state
 const currentUser = ref<User | null>(null)
@@ -226,10 +227,14 @@ export function useAuth() {
   }
 
   // Listen for logout events from token refresh interceptor
+  const onAuthLogout = () => {
+    logout(true) // Silent logout
+  }
   onMounted(() => {
-    window.addEventListener('auth:logout', () => {
-      logout(true) // Silent logout
-    })
+    eventBus.on('auth:logout', onAuthLogout)
+  })
+  onUnmounted(() => {
+    eventBus.off('auth:logout', onAuthLogout)
   })
 
   // Auto-initialize auth state when composable is first used

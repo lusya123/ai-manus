@@ -7,32 +7,36 @@ import {
   useAgentEvents,
 } from '../useAgentEvents';
 import type { Message, ToolContent } from '../../types/message';
-import type { AgentSSEEvent, PlanEventData } from '../../types/event';
+import type { AgentEvent, PlanEventData } from '../../types/event';
 
 const createHarness = () => {
   const state = {
     messages: ref<Message[]>([]),
     title: ref('New Chat'),
     plan: ref<PlanEventData>(),
-    isLoading: ref(true),
     lastEventId: ref<string>(),
     lastTool: ref<ToolContent>(),
     lastNoMessageTool: ref<ToolContent>(),
   };
   const onToolActivity = vi.fn();
+  const onStreamError = vi.fn();
   return {
     state,
     onToolActivity,
-    ...useAgentEvents(state, { onToolActivity }),
+    onStreamError,
+    ...useAgentEvents(state, { onToolActivity, onStreamError }),
   };
 };
 
-describe('useAgentEvents terminal state', () => {
-  it.each(['done', 'wait'] as const)('clears loading on %s before SSE closes', (event) => {
+describe('useAgentEvents timeline projection', () => {
+  it.each(['done', 'wait'] as const)('records the %s cursor without owning session phase', (event) => {
     const { state, handleEvent } = createHarness();
-    handleEvent({ event, data: { event_id: `${event}-id` } } as AgentSSEEvent);
-    expect(state.isLoading.value).toBe(false);
-    expect(state.lastEventId.value).toBeUndefined();
+    expect(handleEvent({
+      event,
+      data: { event_id: `${event}-id`, timestamp: 1 },
+    } as AgentEvent)).toBe(true);
+    expect(state.lastEventId.value).toBe(`${event}-id`);
+    expect(state.messages.value).toEqual([]);
   });
 
   it('uses only the Redis transport cursor for reconnect state', () => {
@@ -43,7 +47,7 @@ describe('useAgentEvents terminal state', () => {
         event_id: 'stable-logical-event',
         transport_cursor: '1782506372223-0',
       },
-    } as AgentSSEEvent);
+    } as AgentEvent);
     expect(state.lastEventId.value).toBe('1782506372223-0');
   });
 
@@ -58,36 +62,35 @@ describe('useAgentEvents terminal state', () => {
         attachments: [],
         timestamp: 1,
       },
-    } as AgentSSEEvent;
+    } as AgentEvent;
     expect(handleEvent(event)).toBe(true);
     expect(handleEvent({
       ...event,
       data: { ...event.data, transport_cursor: '1-0' },
-    } as AgentSSEEvent)).toBe(false);
+    } as AgentEvent)).toBe(false);
     expect(state.messages.value).toHaveLength(1);
     expect(state.lastEventId.value).toBe('1-0');
   });
 
-  it('reapplies terminal loading state even when the terminal event is a duplicate', () => {
+  it('advances the transport cursor when a terminal event is duplicated', () => {
     const { state, handleEvent } = createHarness();
     const terminal = {
       event: 'done',
-      data: { event_id: 'stable-done', transport_cursor: '1-0' },
-    } as AgentSSEEvent;
+      data: { event_id: 'stable-done', transport_cursor: '1-0', timestamp: 1 },
+    } as AgentEvent;
 
-    handleEvent(terminal);
-    state.isLoading.value = true;
-    handleEvent({
+    expect(handleEvent(terminal)).toBe(true);
+    expect(handleEvent({
       ...terminal,
       data: { ...terminal.data, transport_cursor: '2-0' },
-    } as AgentSSEEvent);
+    } as AgentEvent)).toBe(false);
 
-    expect(state.isLoading.value).toBe(false);
     expect(state.lastEventId.value).toBe('2-0');
+    expect(state.messages.value).toEqual([]);
   });
 
   it('does not duplicate an error message when a terminal error is replayed', () => {
-    const { state, handleEvent } = createHarness();
+    const { state, handleEvent, onStreamError } = createHarness();
     const terminal = {
       event: 'error',
       data: {
@@ -95,14 +98,13 @@ describe('useAgentEvents terminal state', () => {
         error: 'failed safely',
         timestamp: 1,
       },
-    } as AgentSSEEvent;
+    } as AgentEvent;
 
     handleEvent(terminal);
-    state.isLoading.value = true;
     handleEvent(terminal);
 
-    expect(state.isLoading.value).toBe(false);
     expect(state.messages.value).toHaveLength(1);
+    expect(onStreamError).toHaveBeenCalledOnce();
   });
 
   it('resets logical event deduplication when the page changes sessions', () => {
@@ -116,7 +118,7 @@ describe('useAgentEvents terminal state', () => {
         attachments: [],
         timestamp: 1,
       },
-    } as AgentSSEEvent;
+    } as AgentEvent;
 
     handleEvent(event);
     resetEventHistory();
@@ -132,7 +134,7 @@ describe('useAgentEvents terminal state', () => {
       { event: 'done', data: { event_id: 'd1' } },
       { event: 'message', data: { role: 'user', event_id: 'u2' } },
       { event: 'step', data: { event_id: 's2' } },
-    ] as AgentSSEEvent[];
+    ] as AgentEvent[];
 
     expect(hasTerminalEventForLatestTurn(events)).toBe(false);
   });
@@ -140,7 +142,7 @@ describe('useAgentEvents terminal state', () => {
   it('reconnects an active session when history has no user turn to identify', () => {
     const events = [
       { event: 'done', data: { event_id: 'orphan-terminal' } },
-    ] as AgentSSEEvent[];
+    ] as AgentEvent[];
 
     expect(hasTerminalEventForLatestTurn(events)).toBe(false);
   });
@@ -151,7 +153,7 @@ describe('useAgentEvents terminal state', () => {
       { event: 'message', data: { role: 'user', event_id: 'u2' } },
       { event: 'done', data: { event_id: 'd2' } },
       { event: 'title', data: { event_id: 'title2' } },
-    ] as AgentSSEEvent[];
+    ] as AgentEvent[];
 
     expect(hasTerminalEventForLatestTurn(events)).toBe(true);
   });
@@ -161,7 +163,7 @@ describe('useAgentEvents terminal state', () => {
       { event: 'message', data: { role: 'user', event_id: 'u1', turn_id: 'turn-1' } },
       { event: 'message', data: { role: 'user', event_id: 'u2', turn_id: 'turn-2' } },
       { event: 'done', data: { event_id: 'd1', turn_id: 'turn-1' } },
-    ] as AgentSSEEvent[];
+    ] as AgentEvent[];
 
     expect(hasTerminalEventForLatestTurn(events)).toBe(false);
   });
@@ -172,7 +174,7 @@ describe('useAgentEvents terminal state', () => {
       { event: 'message', data: { role: 'user', event_id: 'u2', turn_id: 'turn-2' } },
       { event: 'done', data: { event_id: 'd1', turn_id: 'turn-1' } },
       { event: 'done', data: { event_id: 'd2', turn_id: 'turn-2' } },
-    ] as AgentSSEEvent[];
+    ] as AgentEvent[];
 
     expect(hasTerminalEventForLatestTurn(events)).toBe(true);
     expect(getLatestTurnId(events)).toBe('turn-2');
@@ -191,7 +193,7 @@ describe('useAgentEvents terminal state', () => {
       status: 'calling',
       timestamp: 1,
     };
-    handleEvent({ event: 'tool', data: tool } as AgentSSEEvent);
+    handleEvent({ event: 'tool', data: tool } as AgentEvent);
     expect(state.lastNoMessageTool.value?.tool_call_id).toBe('call-1');
     expect(onToolActivity).toHaveBeenCalledOnce();
   });

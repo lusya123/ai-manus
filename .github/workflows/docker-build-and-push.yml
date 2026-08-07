@@ -281,7 +281,7 @@ jobs:
           fi
 
           docker exec "$container" openclaw --version |
-            grep -Fx 'OpenClaw 2026.6.34'
+            grep -Fx 'OpenClaw 2026.7.1'
           docker exec "$container" \
             openclaw plugins inspect manus-claw --runtime --json > "$report"
           python3 - "$report" <<'PY'

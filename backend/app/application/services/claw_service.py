@@ -71,7 +71,7 @@ class _ClawResponseDeadlineError(RuntimeError):
 
 
 _TERMINAL_CLAW_EVENT_TYPES = frozenset({"done", "error"})
-_COALESCIBLE_CLAW_EVENT_TYPES = frozenset({"text", "thinking"})
+_COALESCIBLE_CLAW_EVENT_TYPES = frozenset({"text"})
 
 
 class _QueuedClawEvent:
@@ -131,7 +131,7 @@ class _ClawSubscriberQueue(asyncio.Queue):
 
     ``asyncio.Queue(maxsize=N)`` drops the very event that lets a WebSocket
     stop its spinner when a slow client fills the queue.  This queue instead
-    coalesces adjacent text/thinking chunks, evicts only old non-terminal
+    coalesces adjacent text chunks, evicts only old non-terminal
     events at the ordinary-event cap, and always retains ``error``/``done``.
     """
 
@@ -647,12 +647,11 @@ class _IncrementalClawOutputFilter:
 
 
 class _ChatState:
-    """Tracks an in-progress response so new SSE clients can catch up."""
-    __slots__ = ("_pending_text", "_pending_thinking", "_terminal_event")
+    """Tracks an in-progress response so new WebSocket clients can catch up."""
+    __slots__ = ("_pending_text", "_terminal_event")
 
     def __init__(self):
         self._pending_text: list[str] = []
-        self._pending_thinking: list[str] = []
         self._terminal_event: Optional[dict] = None
 
     @property
@@ -663,25 +662,9 @@ class _ChatState:
     def pending_text(self, value: str) -> None:
         self._pending_text = [value] if value else []
 
-    @property
-    def pending_thinking(self) -> str:
-        return "".join(self._pending_thinking)
-
-    @pending_thinking.setter
-    def pending_thinking(self, value: str) -> None:
-        self._pending_thinking = [value] if value else []
-
     def append_text(self, value: str) -> None:
         if value:
             self._pending_text.append(value)
-
-    def append_thinking(self, value: str) -> None:
-        if value:
-            self._pending_thinking.append(value)
-
-    @property
-    def has_text(self) -> bool:
-        return bool(self._pending_text)
 
     @property
     def terminal_event(self) -> Optional[dict]:
@@ -699,7 +682,7 @@ class ClawService:
 
     Thin orchestration layer: delegates core business logic to
     ``ClawDomainService`` and adds application-level concerns such as
-    the SSE event bus, background task scheduling, and chat state tracking.
+    the WebSocket event bus, background task scheduling, and chat state tracking.
     """
 
     def __init__(self, claw_domain_service: ClawDomainService):
@@ -1480,18 +1463,11 @@ class ClawService:
 
             async def _publish_filtered(
                 visible_delta: str,
-                thinking_delta: str,
+                _thinking_delta: str,
                 source_chunk: Optional[dict] = None,
             ) -> None:
-                if thinking_delta:
-                    state.append_thinking(thinking_delta)
-                    # Match the existing UI contract: temporary thinking is
-                    # shown only until the first visible answer arrives.
-                    if not state.has_text and not visible_delta:
-                        await self.event_bus.publish(
-                            user_id,
-                            {"type": "thinking", "content": thinking_delta},
-                        )
+                # Private model reasoning is deliberately discarded. The
+                # integrated upstream Claw UX exposes only visible answer text.
                 if visible_delta:
                     state.append_text(visible_delta)
                     outbound = {
@@ -1640,23 +1616,12 @@ class ClawService:
     def get_pending_content(
         self, user_id: str, session_id: str = "default"
     ) -> Optional[str]:
-        """Return accumulated text for an in-progress response (for SSE catch-up)."""
+        """Return accumulated text for an in-progress response (for WS catch-up)."""
         state = self._chat_states.get((user_id, session_id))
         if state:
             pending_text = state.pending_text
             if pending_text:
                 return pending_text
-        return None
-
-    def get_pending_thinking_content(
-        self, user_id: str, session_id: str = "default"
-    ) -> Optional[str]:
-        """Return thinking catch-up until visible answer text begins."""
-        state = self._chat_states.get((user_id, session_id))
-        if state and not state.has_text:
-            pending_thinking = state.pending_thinking
-            if pending_thinking:
-                return pending_thinking
         return None
 
     def is_processing(self, user_id: str, session_id: str = "default") -> bool:

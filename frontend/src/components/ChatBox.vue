@@ -1,135 +1,378 @@
 <template>
-    <div class="pb-3 relative bg-[var(--background-gray-main)]">
-        <!-- 结构复刻自 manus.im 首页输入框 -->
-        <div
-            class="flex flex-col gap-3 rounded-[22px] transition-all relative bg-[var(--background-menu-white)] py-3 max-h-[300px] shadow-[0px_12px_32px_0px_rgba(0,0,0,0.02)] border border-black/8 dark:border-[var(--border-main)] focus-within:border-black/20 dark:focus-within:border-[var(--border-dark)]">
-            <ChatBoxFiles ref="chatBoxFileListRef" :attachments="attachments"
-                @update:attachments="emit('update:attachments', $event)" />
-            <div class="overflow-auto ps-4 pe-2 min-h-[46px] w-full text-[15px] leading-[24px]">
-                <textarea
-                    class="flex rounded-md border-input focus-visible:outline-none focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50 overflow-hidden flex-1 bg-transparent p-0 pt-[1px] border-0 focus-visible:ring-0 focus-visible:ring-offset-0 w-full placeholder:text-[var(--text-disable)] text-[15px] leading-[24px] shadow-none resize-none min-h-[40px]"
-                    :rows="rows" :value="modelValue"
-                    @input="$emit('update:modelValue', ($event.target as HTMLTextAreaElement).value)"
-                    @compositionstart="isComposing = true" @compositionend="isComposing = false"
-                    @keydown.enter.exact="handleEnterKeydown" :placeholder="t('Give Manus a task to work on...')"
-                    :style="{ height: '46px' }"></textarea>
-            </div>
-            <div class="px-3"></div>
-            <footer class="flex gap-2 px-3 items-center">
-                <div class="flex items-center gap-2 min-w-0">
-                    <button @click="uploadFile"
-                        class="rounded-full border border-[var(--border-main)] inline-flex items-center justify-center gap-1 clickable cursor-pointer text-xs text-[var(--text-secondary)] hover:bg-[var(--fill-tsp-white-light)] w-8 h-8 p-0 shrink-0"
-                        aria-expanded="false" aria-haspopup="dialog">
-                        <Paperclip :size="16" />
-                    </button>
-                    <ModelPicker v-if="showModelPicker && modelOptions.length > 0" :options="modelOptions"
-                        :selected-model-id="selectedModelId" :disabled="modelPickerDisabled"
-                        @update:selectedModelId="emit('update:selectedModelId', $event)" />
-                </div>
-                <div class="flex gap-2 ml-auto">
-                    <button v-if="!isRunning || hideStopButton"
-                        class="inline-flex items-center justify-center whitespace-nowrap font-medium transition-colors text-sm rounded-full p-0 w-8 h-8 min-w-0 hover:opacity-90"
-                        :class="!sendEnabled ? 'cursor-not-allowed bg-[var(--fill-tsp-white-dark)] hover:opacity-100' : 'cursor-pointer bg-[var(--Button-primary-black)]'"
-                        @click="handleSubmit()">
-                        <SendIcon :disabled="!sendEnabled" />
-                    </button>
-                    <button v-else-if="!hideStopButton" @click="handleStop" :disabled="isStopping"
-                        :aria-label="isStopping ? t('Stopping task') : t('Stop task')"
-                        class="inline-flex items-center justify-center whitespace-nowrap text-sm font-medium transition-colors bg-[var(--Button-primary-black)] text-[var(--text-onblack)] gap-[4px] hover:opacity-90 rounded-full p-0 w-8 h-8 disabled:cursor-wait disabled:opacity-70">
-                        <div v-if="isStopping"
-                            class="w-[12px] h-[12px] border-2 border-[var(--icon-onblack)] border-t-transparent rounded-full animate-spin">
-                        </div>
-                        <div v-else class="w-[10px] h-[10px] bg-[var(--icon-onblack)] rounded-[2px]">
-                        </div>
-                    </button>
-                </div>
-            </footer>
+  <div class="pb-3 relative bg-[var(--background-gray-main)]">
+    <div
+      class="flex flex-col rounded-[22px] relative bg-[var(--background-menu-white)] py-3 w-full z-[2] gap-3 shadow-[0px_12px_32px_0px_rgba(0,0,0,0.02)] border border-black/8 dark:border-[var(--border-main)] focus-within:border focus-within:border-black/20 focus-within:dark:border-[var(--border-dark)]"
+    >
+      <ChatBoxFiles ref="chatBoxFileListRef" :attachments="attachments"
+        @update:attachments="emit('update:attachments', $event)" />
+      <div
+        class="chat-input-editor overflow-auto ps-4 pe-2 bg-transparent pt-[1px] border-0 focus-visible:ring-0 focus-visible:ring-offset-0 w-full placeholder:text-[var(--text-disable)] text-[15px] leading-[24px] max-h-[216px]"
+        :class="dense ? 'min-h-[28px]' : 'min-h-[50px]'"
+      >
+        <EditorContent :editor="editor" />
+      </div>
+      <div class="flex gap-1.5 px-3 items-center">
+        <div class="flex items-center gap-2 min-w-0">
+          <div class="relative" ref="plusMenuRef">
+            <button type="button" @click="showPlusMenu = !showPlusMenu"
+              class="rounded-full border border-[var(--border-main)] inline-flex items-center justify-center gap-1 clickable cursor-pointer text-xs text-[var(--text-secondary)] hover:bg-[var(--fill-tsp-white-light)] w-8 h-8 p-0"
+              :title="t('Add files and more')"
+              aria-expanded="false" aria-haspopup="dialog">
+              <Plus :size="17" />
+            </button>
+            <ChatBoxSlashMenu
+              :open="showPlusMenu"
+              :items="plusMenuItems"
+              :position-style="plusMenuPositionStyle"
+              variant="plus"
+              test-id="chatbox-plus-menu"
+              @select="handlePlusSelect"
+            />
+          </div>
+          <ModelPicker v-if="showModelPicker && modelOptions.length > 0" :options="modelOptions"
+            :selected-model-id="selectedModelId" :disabled="modelPickerDisabled"
+            @update:selectedModelId="emit('update:selectedModelId', $event)" />
         </div>
+        <div class="flex gap-1.5 ml-auto items-center">
+          <button v-if="!isRunning || hideStopButton"
+            class="inline-flex items-center justify-center whitespace-nowrap font-medium transition-colors text-sm rounded-full p-0 w-8 h-8 min-w-0 hover:opacity-90"
+            :class="!sendEnabled ? 'cursor-not-allowed bg-[var(--fill-tsp-white-dark)] hover:opacity-100' : 'cursor-pointer bg-[var(--Button-primary-black)]'"
+            @click="handleSubmit">
+            <SendIcon :disabled="!sendEnabled" />
+          </button>
+          <button v-else-if="!hideStopButton" @click="handleStop" :disabled="isStopping"
+            :aria-label="isStopping ? t('Stopping task') : t('Stop task')"
+            class="inline-flex items-center justify-center whitespace-nowrap text-sm font-medium transition-colors bg-[var(--Button-primary-black)] text-[var(--text-onblack)] gap-[4px] hover:opacity-90 rounded-full p-0 w-8 h-8 disabled:cursor-wait disabled:opacity-70">
+            <div v-if="isStopping"
+              class="w-[12px] h-[12px] border-2 border-[var(--icon-onblack)] border-t-transparent rounded-full animate-spin">
+            </div>
+            <div v-else class="w-[10px] h-[10px] bg-[var(--icon-onblack)] rounded-[2px]">
+            </div>
+          </button>
+        </div>
+      </div>
     </div>
+    <ChatBoxSlashMenu
+      :open="slashMenuOpen"
+      :items="slashMenuItems"
+      :position-style="slashPositionStyle"
+      :active-index="slashActiveIndex"
+      test-id="chatbox-slash-menu"
+      @select="handleSlashSelect"
+    />
+  </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue';
-import SendIcon from './icons/SendIcon.vue';
-import { useI18n } from 'vue-i18n';
-import ChatBoxFiles from './ChatBoxFiles.vue';
-import ModelPicker from './ModelPicker.vue';
-import { Paperclip } from 'lucide-vue-next';
-import type { FileInfo } from '../api/file';
-import type { ChatModelOption } from '../api/agentConfig';
-import { SYSTEM_MODEL_ID } from '../api/agentConfig';
+import { ref, watch, computed, onMounted, onUnmounted, onBeforeUnmount } from 'vue'
+import { useEditor, EditorContent } from '@tiptap/vue-3'
+import StarterKit from '@tiptap/starter-kit'
+import Placeholder from '@tiptap/extension-placeholder'
+import type { SuggestionProps } from '@tiptap/suggestion'
+import SendIcon from './icons/SendIcon.vue'
+import { useI18n } from 'vue-i18n'
+import ChatBoxFiles from './ChatBoxFiles.vue'
+import ModelPicker from './ModelPicker.vue'
+import ChatBoxSlashMenu from './chatbox/ChatBoxSlashMenu.vue'
+import type { SlashMenuItem } from './chatbox/ChatBoxSlashMenu.vue'
+import {
+  applySlashSelection,
+  buildSlashItems,
+  createSlashSuggestion,
+  type SlashItem,
+} from './chatbox/slashSuggestion'
+import { Plus } from 'lucide-vue-next'
+import type { FileInfo } from '../api/file'
+import type { ChatModelOption } from '../api/agentConfig'
+import { SYSTEM_MODEL_ID } from '../api/agentConfig'
+import type { Range } from '@tiptap/core'
 
-const { t } = useI18n();
-const isComposing = ref(false);
-const chatBoxFileListRef = ref();
+const { t } = useI18n()
+const hasTextInput = ref(false)
+const chatBoxFileListRef = ref()
+const showPlusMenu = ref(false)
+const plusMenuRef = ref<HTMLElement | null>(null)
+
+const slashMenuOpen = ref(false)
+const slashMenuItems = ref<SlashItem[]>([])
+const slashActiveIndex = ref(0)
+const slashPositionStyle = ref<Record<string, string>>({})
+let slashCommand: ((item: SlashItem) => void) | null = null
+let slashRange: Range | null = null
+
+const plusMenuItems: SlashMenuItem[] = [
+  { id: 'add_local_files', titleKey: 'Add local files' },
+]
+const plusMenuPositionStyle = {
+  position: 'absolute',
+  bottom: 'calc(100% + 8px)',
+  left: '0',
+}
 
 const props = withDefaults(defineProps<{
-    modelValue: string;
-    rows: number;
-    isRunning: boolean;
-    isStopping?: boolean;
-    attachments: FileInfo[];
-    hideStopButton?: boolean;
-    allowSendFilesOnly?: boolean;
-    showModelPicker?: boolean;
-    modelOptions?: ChatModelOption[];
-    selectedModelId?: string;
-    modelPickerDisabled?: boolean;
+  modelValue: string
+  rows: number
+  isRunning: boolean
+  isStopping?: boolean
+  attachments: FileInfo[]
+  hideStopButton?: boolean
+  allowSendFilesOnly?: boolean
+  /** Manus session detail uses "Send message to Manus"; home keeps the task prompt. */
+  placeholder?: string
+  dense?: boolean
+  showModelPicker?: boolean
+  modelOptions?: ChatModelOption[]
+  selectedModelId?: string
+  modelPickerDisabled?: boolean
 }>(), {
-    showModelPicker: false,
-    modelOptions: () => [],
-    selectedModelId: SYSTEM_MODEL_ID,
-    modelPickerDisabled: false,
-    isStopping: false,
-});
+  placeholder: undefined,
+  dense: false,
+  hideStopButton: false,
+  allowSendFilesOnly: false,
+  isStopping: false,
+  showModelPicker: false,
+  modelOptions: () => [],
+  selectedModelId: SYSTEM_MODEL_ID,
+  modelPickerDisabled: false,
+})
 
-const canSubmit = (draftValue = props.modelValue) => {
-    const hasTextInput = draftValue.trim() !== '';
-    const hasFiles = (props.attachments?.length ?? 0) > 0;
-    const allUploaded = chatBoxFileListRef.value?.isAllUploaded ?? true;
-    if (props.allowSendFilesOnly) {
-        return (hasTextInput || hasFiles) && (!hasFiles || allUploaded);
-    }
-    return hasTextInput && (!hasFiles || allUploaded);
-};
+const placeholderText = computed(() => props.placeholder || t('Assign a task or type / to see more'))
 
-const sendEnabled = computed(() => canSubmit());
+const sendEnabled = computed(() => {
+  const hasFiles = (props.attachments?.length ?? 0) > 0
+  const allUploaded = chatBoxFileListRef.value?.isAllUploaded ?? true
+  if (props.allowSendFilesOnly) {
+    return (hasTextInput.value || hasFiles) && (!hasFiles || allUploaded)
+  }
+  return hasTextInput.value && (!hasFiles || allUploaded)
+})
 
 const emit = defineEmits<{
-    (e: 'update:modelValue', value: string): void;
-    (e: 'update:attachments', value: FileInfo[]): void;
-    (e: 'update:selectedModelId', value: string): void;
-    (e: 'submit'): void;
-    (e: 'stop'): void;
-}>();
+  (e: 'update:modelValue', value: string): void
+  (e: 'update:attachments', value: FileInfo[]): void
+  (e: 'update:selectedModelId', value: string): void
+  (e: 'submit'): void
+  (e: 'stop'): void
+}>()
 
-const handleEnterKeydown = (event: KeyboardEvent) => {
-    if (isComposing.value || event.isComposing) {
-        // If in input method composition state, do nothing and allow default behavior
-        return;
-    }
-
-    const draftValue = (event.currentTarget as HTMLTextAreaElement | null)?.value ?? props.modelValue;
-
-    // Read from the textarea itself so Enter cannot race the parent v-model update.
-    if (!props.isRunning && canSubmit(draftValue)) {
-        event.preventDefault();
-        emit('update:modelValue', draftValue);
-        handleSubmit(draftValue);
-    }
-};
-
-const handleSubmit = (draftValue = props.modelValue) => {
-    if (props.isRunning || !canSubmit(draftValue)) return;
-    emit('submit');
-};
+const handleSubmit = () => {
+  if (props.isRunning || !sendEnabled.value) return
+  emit('submit')
+}
 
 const handleStop = () => {
-    emit('stop');
-};
+  emit('stop')
+}
 
 const uploadFile = () => {
-    chatBoxFileListRef.value?.uploadFile();
-};
+  chatBoxFileListRef.value?.uploadFile()
+}
 
+const runAddLocalFiles = () => {
+  showPlusMenu.value = false
+  slashMenuOpen.value = false
+  uploadFile()
+}
+
+const handlePlusSelect = (_item: SlashMenuItem) => {
+  showPlusMenu.value = false
+  uploadFile()
+}
+
+const handleSlashSelect = (item: SlashMenuItem) => {
+  const full: SlashItem =
+    slashMenuItems.value.find((i) => i.id === item.id) ??
+    buildSlashItems(runAddLocalFiles).find((i) => i.id === item.id) ??
+    {
+      id: 'add_local_files',
+      titleKey: 'Add local files',
+      run: runAddLocalFiles,
+    }
+
+  applySlashSelection({
+    editor: editor.value,
+    range: slashRange,
+    command: slashCommand,
+    item: full,
+  })
+  slashRange = null
+  slashCommand = null
+}
+
+const applySlashSuggestionProps = (suggestionProps: SuggestionProps<SlashItem>) => {
+  slashMenuItems.value = suggestionProps.items
+  slashCommand = suggestionProps.command
+  slashRange = suggestionProps.range
+  slashActiveIndex.value = 0
+  const rect = suggestionProps.clientRect?.()
+  if (rect) {
+    slashPositionStyle.value = {
+      position: 'fixed',
+      left: `${Math.round(rect.left)}px`,
+      top: `${Math.round(rect.bottom + 8)}px`,
+    }
+  }
+}
+
+/** Plain-text → TipTap JSON doc (avoids HTML parse of `<`/`&`). */
+const plainTextToDoc = (text: string) => ({
+  type: 'doc' as const,
+  content: (text || '').split('\n').map((line) => ({
+    type: 'paragraph' as const,
+    ...(line
+      ? { content: [{ type: 'text' as const, text: line }] }
+      : {}),
+  })),
+})
+
+const editor = useEditor({
+  extensions: [
+    StarterKit.configure({
+      heading: false,
+      codeBlock: false,
+      blockquote: false,
+      horizontalRule: false,
+      // keep bold/italic/lists/hardBreak
+    }),
+    Placeholder.configure({ placeholder: () => placeholderText.value }),
+    createSlashSuggestion({
+      items: () => buildSlashItems(runAddLocalFiles),
+      onOpenChange: (open) => {
+        slashMenuOpen.value = open
+        if (!open) {
+          slashMenuItems.value = []
+          slashCommand = null
+          // Keep slashRange until select/onStart so mouse click after blur can still delete `/`
+        }
+      },
+      render: {
+        onStart: (suggestionProps) => {
+          applySlashSuggestionProps(suggestionProps)
+        },
+        onUpdate: (suggestionProps) => {
+          applySlashSuggestionProps(suggestionProps)
+        },
+        onExit: () => {
+          slashMenuItems.value = []
+          slashCommand = null
+          // Keep slashRange for pending mouse click after focus steal
+        },
+        onKeyDown: ({ event }) => {
+          if (!slashMenuOpen.value || slashMenuItems.value.length === 0) return false
+          if (event.key === 'ArrowDown') {
+            event.preventDefault()
+            slashActiveIndex.value =
+              (slashActiveIndex.value + 1) % slashMenuItems.value.length
+            return true
+          }
+          if (event.key === 'ArrowUp') {
+            event.preventDefault()
+            slashActiveIndex.value =
+              (slashActiveIndex.value - 1 + slashMenuItems.value.length) %
+              slashMenuItems.value.length
+            return true
+          }
+          if (event.key === 'Enter') {
+            event.preventDefault()
+            const item = slashMenuItems.value[slashActiveIndex.value]
+            if (item) {
+              applySlashSelection({
+                editor: editor.value,
+                range: slashRange,
+                command: slashCommand,
+                item,
+              })
+              slashRange = null
+              slashCommand = null
+            }
+            return true
+          }
+          if (event.key === 'Escape') {
+            slashMenuOpen.value = false
+            slashRange = null
+            return true
+          }
+          return false
+        },
+      },
+    }),
+  ],
+  content: plainTextToDoc(props.modelValue || ''),
+  editorProps: {
+    attributes: { class: 'tiptap ProseMirror focus:outline-none' },
+    handleKeyDown: (_view, event) => {
+      if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+        if (slashMenuOpen.value) return false
+        if (!props.isRunning && sendEnabled.value) {
+          event.preventDefault()
+          handleSubmit()
+          return true
+        }
+      }
+      return false
+    },
+  },
+  onUpdate: ({ editor: ed }) => {
+    const text = ed.getText({ blockSeparator: '\n' })
+    hasTextInput.value = !!text.trim()
+    emit('update:modelValue', text)
+  },
+})
+
+const syncModelToEditor = (val: string) => {
+  if (!editor.value) return
+  const current = editor.value.getText({ blockSeparator: '\n' })
+  if (val !== current) {
+    editor.value.commands.setContent(plainTextToDoc(val), { emitUpdate: false })
+  }
+  hasTextInput.value = !!(val ?? '').trim()
+}
+
+watch(() => props.modelValue, (val) => {
+  syncModelToEditor(val ?? '')
+})
+
+// Retry inbound sync once the editor becomes ready (missed early modelValue).
+watch(editor, (ed) => {
+  if (ed) syncModelToEditor(props.modelValue ?? '')
+})
+
+watch(placeholderText, () => {
+  // Placeholder extension reads function; force view update if needed
+  if (editor.value?.view) {
+    editor.value.view.dispatch(editor.value.state.tr)
+  }
+})
+
+onBeforeUnmount(() => editor.value?.destroy())
+
+defineExpose({ editor })
+
+const onDocClick = (e: MouseEvent) => {
+  if (showPlusMenu.value && plusMenuRef.value && !plusMenuRef.value.contains(e.target as Node)) {
+    showPlusMenu.value = false
+  }
+}
+
+onMounted(() => document.addEventListener('mousedown', onDocClick))
+onUnmounted(() => document.removeEventListener('mousedown', onDocClick))
+
+// Sync initial hasTextInput from modelValue
+hasTextInput.value = !!props.modelValue.trim()
 </script>
+
+<style>
+.chat-input-editor .tiptap {
+  outline: none;
+  min-height: inherit;
+}
+
+.chat-input-editor .tiptap p.is-editor-empty:first-child::before,
+.chat-input-editor .tiptap p.is-empty:first-child::before {
+  color: var(--text-disable);
+  content: attr(data-placeholder);
+  float: left;
+  height: 0;
+  pointer-events: none;
+}
+</style>

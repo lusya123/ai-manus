@@ -7,6 +7,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from app.infrastructure.external.file.gridfsfile import get_file_storage
 from app.infrastructure.external.search import get_search_engine
 from app.domain.models.user import User, UserRole
+from app.domain.models.auth_session import CredentialSource
 from app.application.errors.exceptions import UnauthorizedError
 from app.core.config import get_settings
 
@@ -20,6 +21,7 @@ from app.domain.utils.error_reporting import safe_exception_summary
 from app.infrastructure.logging import redact_capability_text
 from app.infrastructure.external.cache import get_cache
 from app.infrastructure.external.llm import get_llm_factory
+from app.infrastructure.external.session_auth import RedisSessionStore
 
 # Import all required dependencies for agent service
 from app.domain.external.task import Task
@@ -35,6 +37,9 @@ from app.infrastructure.repositories.user_repository import MongoUserRepository
 from app.infrastructure.repositories.claw_repository import ClawRepository as MongoClawRepository
 from app.application.services.claw_service import ClawService
 from app.domain.services.claw_domain_service import ClawDomainService
+from app.application.services.project_service import ProjectService
+from app.infrastructure.repositories.mongo_project_repository import MongoProjectRepository
+from app.infrastructure.repositories.mongo_file_favorite_repository import MongoFileFavoriteRepository
 
 
 # Configure logging
@@ -127,6 +132,7 @@ def get_agent_service() -> AgentService:
         mcp_repository=mcp_repository,
         llm_factory=llm_factory,
         search_engine=search_engine,
+        project_repository=MongoProjectRepository(),
     ))
     
     # Create AgentService instance
@@ -141,6 +147,7 @@ def get_agent_service() -> AgentService:
         mcp_repository=mcp_repository,
         session_lifecycle_lease=RedisSessionLifecycleLease(),
         sandbox_provisioner=sandbox_provisioner,
+        file_favorite_repository=MongoFileFavoriteRepository(),
     )
 
 
@@ -165,6 +172,22 @@ def get_file_service() -> FileService:
 
 
 @lru_cache()
+def get_project_service() -> ProjectService:
+    """Get project service instance"""
+    logger.info("Creating ProjectService instance")
+    return ProjectService(
+        project_repository=MongoProjectRepository(),
+        session_repository=MongoSessionRepository(),
+    )
+
+
+@lru_cache()
+def get_session_store() -> RedisSessionStore:
+    """Get Redis-backed opaque auth session store."""
+    return RedisSessionStore()
+
+
+@lru_cache()
 def get_auth_service() -> AuthService:
     """
     Get authentication service instance with required dependencies
@@ -180,6 +203,31 @@ def get_auth_service() -> AuthService:
     return AuthService(
         user_repository=user_repository,
         token_service=get_token_service(),
+        session_store=get_session_store(),
+    )
+
+
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
+
+
+def _enforce_cookie_csrf(request: Request, source: CredentialSource) -> None:
+    """Require X-Requested-With on cookie-authenticated mutating requests."""
+    if source != CredentialSource.COOKIE:
+        return
+    if request.method.upper() in _SAFE_METHODS:
+        return
+    if request.headers.get("X-Requested-With") != "XMLHttpRequest":
+        raise UnauthorizedError("CSRF check failed")
+
+
+def _anonymous_user() -> User:
+    return User(
+        id="anonymous",
+        fullname="anonymous",
+        email="anonymous@localhost",
+        role=UserRole.USER,
+        is_active=True,
+        auth_provider="none",
     )
 
 
@@ -225,44 +273,43 @@ def get_email_service() -> EmailService:
 
 
 async def get_current_user(
+    request: Request,
     bearer_credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_bearer),
-    auth_service: AuthService = Depends(get_auth_service)
+    auth_service: AuthService = Depends(get_auth_service),
 ) -> User:
     """
-    Get current authenticated user (required)
-    
-    This dependency enforces authentication using Bearer Token.
-    If authentication fails, it raises an UnauthorizedError.
+    Get current authenticated user (required).
+
+    Resolves Authorization Bearer (opaque session or JWT grace) or HttpOnly
+    session cookie. Cookie-authenticated mutating requests require
+    X-Requested-With: XMLHttpRequest.
     """
     settings = get_settings()
-    
-    # If auth_provider is 'none', return anonymous user
+
     if settings.auth_provider == "none":
-        return User(
-            id="anonymous",
-            fullname="anonymous",
-            email="anonymous@localhost",
-            role=UserRole.USER,
-            is_active=True,
-            auth_provider="none",
-        )
-    
-    # Check if bearer token is provided
-    if not bearer_credentials:
-        raise UnauthorizedError("Authentication required")
-    
+        return _anonymous_user()
+
+    bearer = bearer_credentials.credentials if bearer_credentials else None
+    cookie_id = request.cookies.get(settings.session_cookie_name)
+
     try:
-        # Verify bearer token
-        user = await auth_service.verify_token(bearer_credentials.credentials)
-        
+        resolved = await auth_service.resolve_credentials(
+            bearer_token=bearer,
+            cookie_session_id=cookie_id,
+        )
+        if not resolved:
+            raise UnauthorizedError("Authentication required")
+
+        _enforce_cookie_csrf(request, resolved.source)
+
+        user = await auth_service.user_from_resolved(resolved)
         if not user:
             raise UnauthorizedError("Invalid token")
-            
         if not user.is_active:
             raise UnauthorizedError("User account is inactive")
-            
         return user
-        
+    except UnauthorizedError:
+        raise
     except Exception as e:
         logger.warning(
             "Authentication failed: %s", safe_exception_summary(e)
@@ -271,48 +318,72 @@ async def get_current_user(
 
 
 async def get_optional_current_user(
+    request: Request,
     bearer_credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_bearer),
-    auth_service: AuthService = Depends(get_auth_service)
+    auth_service: AuthService = Depends(get_auth_service),
 ) -> Optional[User]:
-    """
-    Get current authenticated user (optional)
-    
-    This dependency allows both authenticated and anonymous access.
-    Returns None if authentication fails or is not provided.
-    
-    Uses Bearer Token authentication.
-    """
+    """Get current authenticated user (optional)."""
     settings = get_settings()
-    
-    # If auth_provider is 'none', return anonymous user
+
     if settings.auth_provider == "none":
-        return User(
-            id="anonymous",
-            fullname="anonymous",
-            email="anonymous@localhost",
-            role=UserRole.USER,
-            is_active=True,
-            auth_provider="none",
-        )
-    
-    # If no bearer token provided, return None
-    if not bearer_credentials:
+        return _anonymous_user()
+
+    bearer = bearer_credentials.credentials if bearer_credentials else None
+    cookie_id = request.cookies.get(settings.session_cookie_name)
+    if not bearer and not cookie_id:
         return None
-    
+
     try:
-        # Try to verify bearer token
-        user = await auth_service.verify_token(bearer_credentials.credentials)
-        
+        resolved = await auth_service.resolve_credentials(
+            bearer_token=bearer,
+            cookie_session_id=cookie_id,
+        )
+        if not resolved:
+            return None
+        user = await auth_service.user_from_resolved(resolved)
         if user and user.is_active:
             return user
-            
     except Exception as e:
         logger.warning(
             "Optional authentication failed: %s",
             safe_exception_summary(e),
         )
-        
     return None
+
+
+async def resolve_ws_user(
+    websocket: WebSocket,
+    auth_service: Optional[AuthService] = None,
+) -> User:
+    """
+    Resolve user for WebSocket connections (B1).
+
+    Browser: Cookie session_id.
+    App: Authorization: Bearer <session_id>.
+    Query ?token= is not accepted.
+    """
+    settings = get_settings()
+    if settings.auth_provider == "none":
+        return _anonymous_user()
+
+    service = auth_service or get_auth_service()
+    bearer = None
+    auth_header = websocket.headers.get("authorization") or websocket.headers.get("Authorization")
+    if auth_header and auth_header.lower().startswith("bearer "):
+        bearer = auth_header[7:].strip()
+
+    cookie_id = websocket.cookies.get(settings.session_cookie_name)
+    resolved = await service.resolve_credentials(
+        bearer_token=bearer,
+        cookie_session_id=cookie_id,
+    )
+    if not resolved:
+        raise UnauthorizedError("Authentication required")
+    user = await service.user_from_resolved(resolved)
+    if not user or not user.is_active:
+        raise UnauthorizedError("Invalid token")
+    return user
+
 
 async def verify_signature(
     request: Request,

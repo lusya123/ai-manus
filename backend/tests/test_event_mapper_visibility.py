@@ -2,7 +2,9 @@ from datetime import UTC, datetime
 
 from app.domain.models.event import (
     BrowserToolContent,
+    ErrorEvent,
     FileToolContent,
+    FileUpdateEvent,
     McpToolContent,
     MessageEvent,
     PlanEvent,
@@ -12,6 +14,7 @@ from app.domain.models.event import (
     ShellToolContent,
     StepEvent,
     StepStatus,
+    TerminalUpdateEvent,
     ToolEvent,
     ToolStatus,
 )
@@ -21,7 +24,7 @@ from app.domain.models.search import SearchResultItem
 from app.interfaces.schemas.event import BaseEventData, EventMapper
 
 
-async def test_event_mapper_filters_message_notify_user_tool_events():
+async def test_private_event_mapper_preserves_message_notify_user_tool_events():
     event = ToolEvent(
         tool_call_id="tool-1",
         tool_name="message",
@@ -30,8 +33,11 @@ async def test_event_mapper_filters_message_notify_user_tool_events():
         status=ToolStatus.CALLING,
     )
 
-    assert await EventMapper.event_to_sse_event(event) is None
-    assert await EventMapper.events_to_sse_events([event]) == []
+    mapped = await EventMapper.event_to_stream_event(event)
+
+    assert mapped.event == "tool"
+    assert mapped.data.function == "message_notify_user"
+    assert await EventMapper.events_to_stream_events([event]) == [mapped]
 
 
 def test_persisted_naive_mongo_event_timestamp_is_interpreted_as_utc():
@@ -47,7 +53,7 @@ def test_persisted_naive_mongo_event_timestamp_is_interpreted_as_utc():
     )
 
 
-async def test_event_mapper_hides_plan_events_but_preserves_all_message_events():
+async def test_event_mapper_preserves_plan_steps_and_all_message_events():
     step = Step(
         id="1",
         description="Internal execution step",
@@ -69,13 +75,22 @@ async def test_event_mapper_hides_plan_events_but_preserves_all_message_events()
         MessageEvent(message="visible final answer"),
     ]
 
-    mapped = await EventMapper.events_to_sse_events(events)
+    mapped = await EventMapper.events_to_stream_events(events)
 
-    assert [event.event for event in mapped] == ["message", "message", "message", "message"]
+    assert [event.event for event in mapped] == [
+        "message",
+        "plan",
+        "step",
+        "message",
+        "message",
+        "message",
+    ]
     assert mapped[0].data.content == "hello"
-    assert mapped[1].data.content == "internal planner message"
-    assert mapped[2].data.content == "internal step result"
-    assert mapped[3].data.content == "visible final answer"
+    assert mapped[1].data.steps[0].description == "Internal execution step"
+    assert mapped[2].data.description == "Internal execution step"
+    assert mapped[3].data.content == "internal planner message"
+    assert mapped[4].data.content == "internal step result"
+    assert mapped[5].data.content == "visible final answer"
 
 
 async def test_public_event_mapper_uses_share_scoped_attachment_urls_only():
@@ -97,7 +112,7 @@ async def test_public_event_mapper_uses_share_scoped_attachment_urls_only():
                 f"?share_epoch={share_epoch}&signature=signed"
             )
 
-    mapped = await EventMapper.events_to_shared_sse_events(
+    mapped = await EventMapper.events_to_shared_stream_events(
         [
             MessageEvent(
                 role="assistant",
@@ -137,7 +152,7 @@ async def test_public_event_mapper_replaces_browser_file_id_with_share_url():
         function_args={"url": "https://example.com"},
         status=ToolStatus.CALLED,
     )
-    mapped = await EventMapper.event_to_shared_sse_event(
+    mapped = await EventMapper.event_to_shared_stream_event(
         event,
         session_id="session-1",
         share_epoch="epoch-1",
@@ -164,7 +179,7 @@ async def test_private_event_mapper_preserves_tool_args_for_authenticated_ui():
         status=ToolStatus.CALLED,
     )
 
-    mapped = await EventMapper.event_to_sse_event(event)
+    mapped = await EventMapper.event_to_stream_event(event)
 
     assert mapped.data.args == raw_args
 
@@ -210,7 +225,7 @@ async def test_public_event_mapper_never_exposes_raw_tool_args():
         ),
     ]
 
-    mapped = await EventMapper.events_to_shared_sse_events(
+    mapped = await EventMapper.events_to_shared_stream_events(
         events,
         session_id="session-1",
         share_epoch="epoch-1",
@@ -286,7 +301,7 @@ async def test_public_event_mapper_redacts_sensitive_tool_result_content():
         ),
     ]
 
-    mapped = await EventMapper.events_to_shared_sse_events(
+    mapped = await EventMapper.events_to_shared_stream_events(
         events,
         session_id="session-1",
         share_epoch="epoch-1",
@@ -327,7 +342,7 @@ async def test_public_event_mapper_keeps_only_sanitized_local_preview_metadata()
         status=ToolStatus.CALLED,
     )
 
-    mapped = await EventMapper.event_to_shared_sse_event(
+    mapped = await EventMapper.event_to_shared_stream_event(
         event,
         session_id="session-1",
         share_epoch="epoch-1",
@@ -379,7 +394,7 @@ async def test_public_event_mapper_strips_secrets_from_local_preview_urls():
         for index, (url, _expected_url) in enumerate(private_urls)
     ]
 
-    mapped = await EventMapper.events_to_shared_sse_events(
+    mapped = await EventMapper.events_to_shared_stream_events(
         events,
         session_id="session-1",
         share_epoch="epoch-1",
@@ -423,7 +438,7 @@ async def test_public_event_mapper_drops_non_local_preview_urls():
         status=ToolStatus.CALLED,
     )
 
-    mapped = await EventMapper.event_to_shared_sse_event(
+    mapped = await EventMapper.event_to_shared_stream_event(
         event,
         session_id="session-1",
         share_epoch="epoch-1",
@@ -436,3 +451,66 @@ async def test_public_event_mapper_drops_non_local_preview_urls():
     public_json = mapped.model_dump_json()
     for secret in ("external-secret", "url-secret", "preview-title-secret"):
         assert secret not in public_json
+
+
+async def test_public_event_mapper_drops_live_terminal_and_file_updates():
+    class FileService:
+        async def create_shared_session_signed_url(
+            self, session_id, file_id, share_epoch
+        ):
+            raise AssertionError("execution-only updates must not create public URLs")
+
+    events = [
+        TerminalUpdateEvent(
+            shell_id="shell-1",
+            output={"stdout": "terminal-result-secret"},
+            description="private-command-description",
+        ),
+        FileUpdateEvent(
+            path="/home/ubuntu/private-source.py",
+            content="file-update-secret",
+            old_content="old-file-secret",
+            file=FileInfo(
+                file_id="owner-file",
+                filename="private-source.py",
+                user_id="owner-secret",
+            ),
+        ),
+    ]
+
+    mapped = await EventMapper.events_to_shared_stream_events(
+        events,
+        session_id="session-1",
+        share_epoch="epoch-1",
+        shared_files={},
+        file_service=FileService(),
+    )
+
+    assert mapped == []
+
+
+async def test_public_event_mapper_replaces_raw_errors_with_generic_text():
+    class FileService:
+        async def create_shared_session_signed_url(
+            self, session_id, file_id, share_epoch
+        ):
+            raise AssertionError("errors must not create public URLs")
+
+    mapped = await EventMapper.event_to_shared_stream_event(
+        ErrorEvent(
+            error=(
+                "provider failed: Authorization=Bearer provider-secret "
+                "https://internal.example/?token=url-secret"
+            )
+        ),
+        session_id="session-1",
+        share_epoch="epoch-1",
+        shared_files={},
+        file_service=FileService(),
+    )
+
+    assert mapped.data.error == "Agent execution failed"
+    public_json = mapped.model_dump_json()
+    assert "provider-secret" not in public_json
+    assert "url-secret" not in public_json
+    assert "internal.example" not in public_json

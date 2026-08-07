@@ -62,6 +62,56 @@ function frontendConfigResponse(overrides = {}) {
 }
 
 async function installApiMocks(page, options = {}) {
+  await page.routeWebSocket("**/api/v1/ws/sessions", (ws) => {
+    ws.send(JSON.stringify({ op: "snapshot", sessions: [] }));
+  });
+
+  await page.routeWebSocket("**/api/v1/ws/chat", (ws) => {
+    ws.onMessage((message) => {
+      const frame = JSON.parse(String(message));
+      const sessionId = frame.session_id || "smoke-session";
+
+      if (frame.type === "join_session") {
+        ws.send(JSON.stringify({
+          type: "joined",
+          session_id: sessionId,
+          request_id: frame.id,
+        }));
+        return;
+      }
+
+      if (frame.type === "leave_session") {
+        ws.send(JSON.stringify({
+          type: "left",
+          session_id: sessionId,
+          request_id: frame.id,
+        }));
+        return;
+      }
+
+      if (frame.type === "chat") {
+        options.onChatSubmission?.(frame);
+        ws.send(JSON.stringify({
+          type: "ack",
+          request_id: frame.id,
+          submission_id: frame.id,
+          op: "chat",
+          session_id: sessionId,
+          ok: true,
+        }));
+        return;
+      }
+
+      if (frame.type === "stop_session") {
+        ws.send(JSON.stringify({
+          type: "stopped",
+          session_id: sessionId,
+          request_id: frame.id,
+        }));
+      }
+    });
+  });
+
   await page.route("**/api/**", async (route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -133,12 +183,35 @@ async function installApiMocks(page, options = {}) {
       return;
     }
 
-    if (url.pathname === "/api/v1/sessions/smoke-session/chat" && request.method() === "POST") {
-      options.onChatSubmission?.(request.postDataJSON());
+    if (url.pathname === "/api/v1/sessions/smoke-session" && request.method() === "GET") {
       await route.fulfill({
         status: 200,
-        contentType: "text/event-stream",
-        body: "",
+        contentType: "application/json",
+        body: JSON.stringify({
+          code: 0,
+          msg: "success",
+          data: {
+            session_id: "smoke-session",
+            title: "Smoke session",
+            status: "completed",
+            events: [],
+            is_shared: false,
+            is_favorite: false,
+            is_pinned: false,
+            project_id: null,
+            task_mode: "agent",
+            model_config: null,
+          },
+        }),
+      });
+      return;
+    }
+
+    if (url.pathname === "/api/v1/projects" && request.method() === "GET") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ code: 0, msg: "success", data: { projects: [] } }),
       });
       return;
     }
@@ -185,13 +258,18 @@ async function verifyEnterSubmits(browser, consoleErrors, pageErrors, requestFai
   const routePath = "/ enter-submit";
   const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
   let createSessionBody = null;
-  let chatSubmissionBody = null;
+  let chatSubmissionFrame = null;
+  let resolveChatSubmission;
+  const chatSubmissionReceived = new Promise((resolve) => {
+    resolveChatSubmission = resolve;
+  });
   await installApiMocks(page, {
     onCreateSession: (body) => {
       createSessionBody = body;
     },
-    onChatSubmission: (body) => {
-      chatSubmissionBody = body;
+    onChatSubmission: (frame) => {
+      chatSubmissionFrame = frame;
+      resolveChatSubmission();
     },
   });
   await page.addInitScript(() => {
@@ -220,23 +298,38 @@ async function verifyEnterSubmits(browser, consoleErrors, pageErrors, requestFai
 
   const draft = "smoke enter submit";
   await page.goto(BASE_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
-  await page.locator("textarea").fill(draft);
-  await page.locator("textarea").press("Enter");
+  const chatEditor = page.locator('.chat-input-editor .ProseMirror[contenteditable="true"]');
+  await chatEditor.fill(draft);
+  await chatEditor.press("Enter");
   await page.waitForURL(`${BASE_URL}/chat/smoke-session`, { timeout: 20_000 });
   await page.waitForFunction(
     (expectedText) => document.body.innerText.includes(expectedText),
     draft,
     { timeout: 20_000 },
   );
+  let chatSubmissionTimeout;
+  try {
+    await Promise.race([
+      chatSubmissionReceived,
+      new Promise((_, reject) => {
+        chatSubmissionTimeout = setTimeout(
+          () => reject(new Error("Timed out waiting for the Enter-triggered chat WebSocket frame")),
+          20_000,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(chatSubmissionTimeout);
+  }
 
   if (createSessionBody?.model_config?.model_id !== "smoke-model") {
     throw new Error(`Selected model was not sent when creating a session: ${JSON.stringify(createSessionBody)}`);
   }
-  if (chatSubmissionBody?.message !== draft) {
-    throw new Error(`Initial chat message was not submitted: ${JSON.stringify(chatSubmissionBody)}`);
+  if (chatSubmissionFrame?.type !== "chat" || chatSubmissionFrame?.session_id !== "smoke-session" || chatSubmissionFrame?.message !== draft) {
+    throw new Error(`Initial chat message was not submitted over WebSocket: ${JSON.stringify(chatSubmissionFrame)}`);
   }
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(chatSubmissionBody?.submission_id || "")) {
-    throw new Error(`Chat submission did not include an RFC 4122 v4 UUID: ${JSON.stringify(chatSubmissionBody)}`);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(chatSubmissionFrame?.id || "")) {
+    throw new Error(`Chat submission did not include an RFC 4122 v4 UUID: ${JSON.stringify(chatSubmissionFrame)}`);
   }
 
   const state = await page.evaluate(() => ({

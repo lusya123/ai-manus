@@ -554,13 +554,33 @@ def test_fork_deployment_uses_approved_sha_and_immutable_image_digests():
     )
     assert '"$EXPECTED_SHA" != "$GITHUB_SHA"' in authorization_step["run"]
     assert publish["needs"] == "publish-preflight"
-    assert publish["if"] == (
-        "needs.publish-preflight.outputs.enabled == 'true'"
+    assert " ".join(publish["if"].split()) == " ".join(
+        """
+        always() &&
+        !cancelled() &&
+        needs.publish-preflight.result == 'success' &&
+        needs.publish-preflight.outputs.enabled == 'true'
+        """.split()
     )
     assert publish["permissions"]["packages"] == "write"
 
     assert preflight["environment"] == "fork-production"
     assert preflight["needs"] == "publish-fork-images"
+    assert " ".join(preflight["if"].split()) == " ".join(
+        """
+        always() &&
+        !cancelled() &&
+        needs.publish-fork-images.result == 'success' &&
+        github.event_name == 'workflow_dispatch' &&
+        inputs.deploy_fork == true &&
+        (
+          github.ref == 'refs/heads/main' ||
+          github.ref == 'refs/heads/custom' ||
+          github.ref == 'refs/tags/deploy-test-20260721-artifact-fix-01'
+        ) &&
+        inputs.expected_sha == github.sha
+        """.split()
+    )
     # Environment-scoped vars are not available while GitHub evaluates a
     # job-level ``if``.  The job must enter the environment first and enforce
     # the explicit enable gate inside its preflight step.
@@ -590,8 +610,16 @@ def test_fork_deployment_uses_approved_sha_and_immutable_image_digests():
     assert "sha256:[0-9a-f]{64}" in digest_step["run"]
 
     assert deploy["needs"] == "deploy-preflight"
-    assert "inputs.deploy_fork == true" in deploy["if"]
-    assert "needs.deploy-preflight.outputs.enabled == 'true'" in deploy["if"]
+    assert " ".join(deploy["if"].split()) == " ".join(
+        """
+        always() &&
+        !cancelled() &&
+        needs.deploy-preflight.result == 'success' &&
+        github.event_name == 'workflow_dispatch' &&
+        inputs.deploy_fork == true &&
+        needs.deploy-preflight.outputs.enabled == 'true'
+        """.split()
+    )
     prepare_step = next(step for step in deploy["steps"] if step.get("id") == "deploy")
     assert "ai-manus-${component}@${digest}" in prepare_step["run"]
     ssh_step = next(step for step in deploy["steps"] if step.get("uses") == SSH_ACTION)

@@ -1191,10 +1191,17 @@ def assert_legacy_network_has_at_most_one_runtime(
             str(item).split("=", 1)[0]
             for item in (config.get("Env") or [])
         }
+        # The backend also carries Claw TTL/base-URL configuration.  The API
+        # key is the capability that distinguishes a Claw runtime from its
+        # gateway when old containers have no identifying labels or names.
         return (
             {"SERVICE_TIMEOUT_MINUTES", "CHROME_ARGS"}
             <= environment_keys
-            or {"CLAW_TTL_SECONDS", "MANUS_API_BASE_URL"}
+            or {
+                "CLAW_TTL_SECONDS",
+                "MANUS_API_BASE_URL",
+                "MANUS_API_KEY",
+            }
             <= environment_keys
         )
 

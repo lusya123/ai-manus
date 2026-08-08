@@ -1010,6 +1010,38 @@ def test_legacy_audit_fails_closed_for_two_user_runtimes() -> None:
         )
 
 
+def test_legacy_audit_detects_env_only_claw_runtime() -> None:
+    client = FakeDockerClient()
+    network = FakeNetwork(client.networks, "manus-network", {})
+    client.networks.items[network.name] = network
+    sandbox = FakeContainer(
+        "sandbox-id",
+        "sandbox-live",
+        labels={"ai-manus.kind": "sandbox"},
+    )
+    legacy_claw = FakeContainer(
+        "legacy-claw-id",
+        "unknown-sidecar",
+    )
+    legacy_claw.attrs["Config"]["Env"] = [
+        "CLAW_TTL_SECONDS=3600",
+        "MANUS_API_BASE_URL=http://backend:8000",
+        "MANUS_API_KEY=runtime-secret",
+    ]
+    client.containers.add(sandbox)
+    client.containers.add(legacy_claw)
+    network.connect(sandbox)
+    network.connect(legacy_claw)
+
+    with pytest.raises(RuntimeError, match="Multiple legacy"):
+        assert_legacy_network_has_at_most_one_runtime(
+            client,
+            network_names=("manus-network",),
+            sandbox_name_prefix="sandbox",
+            claw_name_prefix="claw",
+        )
+
+
 def test_agentbay_without_dynamic_claw_never_touches_docker(monkeypatch) -> None:
     monkeypatch.setattr(
         runtime_network_module,
@@ -1200,6 +1232,64 @@ def test_global_legacy_audit_finds_old_network_and_old_prefix(monkeypatch) -> No
 
     with pytest.raises(RuntimeError, match="retired-runtime-network"):
         audit_legacy_runtime_networks(settings)
+
+
+def test_legacy_audit_does_not_count_backend_claw_config_as_runtime(
+    monkeypatch,
+) -> None:
+    client = FakeDockerClient()
+    private_network = FakeNetwork(
+        client.networks,
+        "manus-sandbox-private",
+    )
+    client.networks.items[private_network.name] = private_network
+    backend = FakeContainer(
+        "backend-id",
+        "ai-manus-backend-1",
+        labels={
+            "com.docker.compose.project": "ai-manus",
+            "com.docker.compose.service": "backend",
+        },
+    )
+    backend.attrs["Config"]["Env"] = [
+        "CLAW_TTL_SECONDS=3600",
+        "MANUS_API_BASE_URL=http://backend:8000",
+    ]
+    sandbox = FakeContainer(
+        "sandbox-id",
+        "ai-manus-sandbox-private",
+        labels={"ai-manus.kind": "sandbox"},
+    )
+    client.containers.add(backend)
+    client.containers.add(sandbox)
+    private_network.connect(backend)
+    private_network.connect(sandbox)
+    monkeypatch.setattr(runtime_network_module, "_running_in_container", lambda: True)
+    monkeypatch.setattr(runtime_network_module, "_gateway_reference", lambda: "backend-id")
+    monkeypatch.setattr(
+        runtime_network_module,
+        "_current_container_reference",
+        lambda: "backend-id",
+    )
+    monkeypatch.setattr(
+        runtime_network_module.docker,
+        "from_env",
+        lambda **kwargs: client,
+    )
+    settings = SimpleNamespace(
+        runtime_network_isolation=True,
+        runtime_deployment_id="ai-manus",
+        sandbox_provider="docker",
+        sandbox_address=None,
+        sandbox_network="manus-network",
+        sandbox_name_prefix="ai-manus-sandbox",
+        claw_enabled=False,
+        claw_address=None,
+        claw_network=None,
+        claw_name_prefix="ai-manus-claw",
+    )
+
+    audit_legacy_runtime_networks(settings)
 
 
 def test_global_legacy_audit_ignores_another_compose_project(monkeypatch) -> None:

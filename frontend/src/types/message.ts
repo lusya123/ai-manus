@@ -9,6 +9,8 @@ export interface Message {
 
 export interface BaseContent {
   timestamp: number;
+  /** Durable logical turn identifier when supplied by the backend. */
+  turn_id?: string;
 }
 
 export interface MessageContent extends BaseContent {

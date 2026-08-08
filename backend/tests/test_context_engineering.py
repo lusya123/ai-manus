@@ -30,6 +30,7 @@ from app.domain.models.tool_result import ToolResult
 from app.domain.services.agents.base import BaseAgent, StructuredOutputEvent
 from app.domain.services.agents.execution import ExecutionAgent
 from app.domain.services.agents.planner import PlannerAgent
+from app.domain.services.prompts.execution import EXECUTION_PROMPT, SUMMARIZE_PROMPT
 from app.domain.services.prompts.system import build_system_prompt
 from app.domain.services.tools.base import (
     BaseToolkit,
@@ -40,6 +41,7 @@ from app.domain.services.tools.base import (
 )
 from app.domain.services.tools.message import MessageToolkit
 from app.domain.services.tools.mcp import MCPClientManager
+from app.domain.services.tools.preview import PreviewToolkit
 
 
 class EchoToolkit(BaseToolkit):
@@ -118,6 +120,32 @@ class TestSystemPromptBuilder:
     def test_describe_toolkits_compact_overview(self):
         overview = describe_toolkits([EchoToolkit(), SilentToolkit()])
         assert overview == "- echo: echo\n- silent: noop"
+
+    def test_interactive_web_deliverables_require_preview_contract(self):
+        toolkit = PreviewToolkit()
+        schema_description = toolkit.get_tool_schemas()[0]["function"]["description"]
+        for contract in (toolkit.instructions, schema_description):
+            assert "preview_show" in contract
+            assert "complete_step" in contract
+            assert "deliver_result" in contract
+            assert "browser/VNC" in contract
+            assert "open a file manually" in contract
+            assert "third-party pages" in contract
+
+        assert "ordinary research" in toolkit.instructions
+        assert "ordinary browsing" in schema_description
+
+        assert "preview_show" in EXECUTION_PROMPT
+        assert "complete_step" in EXECUTION_PROMPT
+        assert "browser/VNC" in EXECUTION_PROMPT
+        assert "open a file manually" in EXECUTION_PROMPT
+        assert "ordinary research" in EXECUTION_PROMPT
+
+        assert "preview_show" in SUMMARIZE_PROMPT
+        assert "deliver_result" in SUMMARIZE_PROMPT
+        assert "Browser/VNC" in SUMMARIZE_PROMPT
+        assert "open files manually" in SUMMARIZE_PROMPT
+        assert "ordinary research" in SUMMARIZE_PROMPT
 
 
 class TestOutputTool:

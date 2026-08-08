@@ -28,6 +28,14 @@
     </div>
   </div>
 
+  <button v-if="visible && !isShow && toolContent" @click="reopenComputerPanel"
+    data-testid="reopen-workspace-button"
+    class="fixed right-4 bottom-24 z-40 h-10 px-3 rounded-full inline-flex items-center gap-2 bg-[var(--background-white-main)] text-[var(--text-primary)] border border-[var(--border-main)] shadow-[0px_5px_16px_0px_var(--shadow-S),0px_0px_1.25px_0px_var(--shadow-S)] hover:bg-[var(--background-gray-main)] cursor-pointer"
+    :title="$t('Open Manus workspace')">
+    <Monitor class="size-4 text-[var(--icon-secondary)]" />
+    <span class="text-sm font-medium whitespace-nowrap">{{ $t('Open workspace') }}</span>
+  </button>
+
   <Teleport to="body">
     <!-- Official ChatComputerDialogPanel (z-upper → z-[1100]) -->
     <div
@@ -58,7 +66,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { Monitor } from 'lucide-vue-next'
 import type { ToolContent } from '../types/message'
 import type { PlanEventData } from '../types/event'
 import ComputerPanelContent from './ComputerPanelContent.vue'
@@ -90,7 +99,7 @@ const emit = defineEmits<{
   (e: 'useComputer'): void
 }>()
 
-defineProps<{
+const props = defineProps<{
   sessionId?: string
   realTime: boolean
   isShare: boolean
@@ -110,6 +119,18 @@ const showComputerPanel = (content: ToolContent, isLive: boolean = false) => {
 const hideComputerPanel = () => {
   isShow.value = false
   presentation.value = 'sidebar'
+}
+
+const clearComputerPanel = () => {
+  isShow.value = false
+  visible.value = true
+  live.value = false
+  toolContent.value = undefined
+  presentation.value = 'sidebar'
+}
+
+const reopenComputerPanel = () => {
+  if (toolContent.value) showComputerPanel(toolContent.value, live.value)
 }
 
 const togglePresentation = () => {
@@ -143,9 +164,12 @@ onUnmounted(() => {
   eventBus.off(UI_SHOW_FILE_PREVIEWER, onShowFilePreviewer)
 })
 
+watch(() => props.sessionId, clearComputerPanel)
+
 defineExpose({
   showComputerPanel,
   hideComputerPanel,
+  clearComputerPanel,
   isShow
 })
 </script>

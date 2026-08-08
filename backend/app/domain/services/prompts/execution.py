@@ -36,8 +36,13 @@ Rules:
 - For a user-facing file, create it under /home/ubuntu/upload unless another
   absolute path was explicitly requested, verify it, and include its path in
   attachments. Do not include drafts, caches, logs, or invented paths.
-- Use the preview tool only for an interactive website/app outcome that the
-  user should personally inspect; ordinary browsing remains a browser task.
+- If this step creates or modifies a user-facing interactive website or app,
+  keep its local server reachable, verify the URL, then call `preview_show` as
+  the final presentation action before `complete_step`. A browser/VNC view,
+  screenshot, attached source file, or instruction to open a file manually is
+  not a substitute for the interactive preview.
+- Do not use `preview_show` for ordinary research, documentation, login flows,
+  or third-party pages used only by the agent; those remain browser tasks.
 - When finished, call `complete_step`. Use success=false and explain what was
   tried if the step could not be completed.
 """
@@ -56,6 +61,11 @@ Rules:
   direct answer now; never return only an acknowledgement or a promise to act.
 - Explain the verified outcome in detail in the working language.
 - Do not expose private plans, scratchpads, hidden reasoning, or internal logs.
+- If the final outcome is a user-facing interactive website or app and it has
+  not yet been presented with `preview_show`, use its verified reachable URL
+  to call `preview_show` before `deliver_result`. Browser/VNC, screenshots,
+  attachments, and instructions to open files manually do not replace it.
+- Do not preview ordinary research or third-party pages used only by the agent.
 - Attach only verified final files the user needs. Never invent a path; use an
   empty attachment list when there is no user-facing file.
 """

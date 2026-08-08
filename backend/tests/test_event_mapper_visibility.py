@@ -1,5 +1,7 @@
 from datetime import UTC, datetime
 
+import pytest
+
 from app.domain.models.event import (
     BrowserToolContent,
     ErrorEvent,
@@ -22,6 +24,95 @@ from app.domain.models.file import FileInfo
 from app.domain.models.plan import Plan, Step
 from app.domain.models.search import SearchResultItem
 from app.interfaces.schemas.event import BaseEventData, EventMapper
+
+
+def _browser_event(
+    screenshot: str, *, tool_call_id: str = "browser-1"
+) -> ToolEvent:
+    return ToolEvent(
+        tool_call_id=tool_call_id,
+        tool_name="browser",
+        tool_content=BrowserToolContent(screenshot=screenshot),
+        function_name="browser_view",
+        function_args={},
+        status=ToolStatus.CALLED,
+    )
+
+
+async def test_private_browser_mapper_keeps_empty_screenshot_without_signing(
+    monkeypatch,
+):
+    class FileService:
+        async def create_internal_signed_url(self, file_id):
+            raise AssertionError("an empty screenshot must not be signed")
+
+    monkeypatch.setattr(
+        "app.interfaces.dependencies.get_file_service",
+        lambda: FileService(),
+    )
+
+    mapped = await EventMapper.event_to_stream_event(_browser_event(""))
+
+    assert mapped.data.content == BrowserToolContent(screenshot="")
+
+
+async def test_private_browser_mapper_fails_soft_when_screenshot_is_missing(
+    monkeypatch,
+):
+    class FileService:
+        async def create_internal_signed_url(self, file_id):
+            raise FileNotFoundError(file_id)
+
+    monkeypatch.setattr(
+        "app.interfaces.dependencies.get_file_service",
+        lambda: FileService(),
+    )
+
+    mapped = await EventMapper.event_to_stream_event(
+        _browser_event("missing-shot")
+    )
+
+    assert mapped.data.content == BrowserToolContent(screenshot="")
+
+
+async def test_missing_browser_screenshot_does_not_abort_later_history(
+    monkeypatch,
+):
+    class FileService:
+        async def create_internal_signed_url(self, file_id):
+            raise FileNotFoundError(file_id)
+
+    monkeypatch.setattr(
+        "app.interfaces.dependencies.get_file_service",
+        lambda: FileService(),
+    )
+
+    mapped = await EventMapper.events_to_stream_events(
+        [
+            _browser_event("missing-shot"),
+            MessageEvent(message="history continues"),
+        ]
+    )
+
+    assert [event.event for event in mapped] == ["tool", "message"]
+    assert mapped[0].data.content.screenshot == ""
+    assert mapped[1].data.content == "history continues"
+
+
+async def test_private_browser_mapper_does_not_swallow_other_signing_errors(
+    monkeypatch,
+):
+    class FileService:
+        async def create_internal_signed_url(self, file_id):
+            raise RuntimeError("signer unavailable")
+
+    monkeypatch.setattr(
+        "app.interfaces.dependencies.get_file_service",
+        lambda: FileService(),
+    )
+
+    with pytest.raises(RuntimeError, match="signer unavailable"):
+        await EventMapper.event_to_stream_event(_browser_event("shot-1"))
 
 
 async def test_private_event_mapper_preserves_message_notify_user_tool_events():

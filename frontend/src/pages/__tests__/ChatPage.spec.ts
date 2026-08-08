@@ -34,6 +34,7 @@ const { currentRoute, routerPush, agentMocks, toastMocks } = vi.hoisted(() => ({
   },
   toastMocks: {
     showErrorToast: vi.fn(),
+    showInfoToast: vi.fn(),
     showSuccessToast: vi.fn(),
   },
 }));
@@ -83,6 +84,15 @@ const SimpleBarStub = defineComponent({
   template: '<div><slot /></div>',
 });
 
+const computerPanelShow = vi.fn();
+const ComputerPanelStub = defineComponent({
+  name: 'ComputerPanel',
+  setup(_props, { expose }) {
+    expose({ showComputerPanel: computerPanelShow });
+  },
+  template: '<div data-testid="computer-panel" />',
+});
+
 const completedSession = (events: AgentEvent[] = []) => ({
   session_id: 'session-1',
   title: 'Session',
@@ -108,6 +118,7 @@ const mountPage = async () => {
       stubs: {
         ChatBox: ChatBoxStub,
         SimpleBar: SimpleBarStub,
+        ComputerPanel: ComputerPanelStub,
       },
     },
   });
@@ -146,6 +157,7 @@ describe('ChatPage WebSocket lifecycle', () => {
     }));
     Object.values(agentMocks).forEach(mock => mock.mockReset());
     Object.values(toastMocks).forEach(mock => mock.mockReset());
+    computerPanelShow.mockReset();
     routerPush.mockReset();
     agentMocks.getSession.mockResolvedValue(completedSession());
     agentMocks.clearUnreadMessageCount.mockResolvedValue(undefined);
@@ -172,6 +184,200 @@ describe('ChatPage WebSocket lifecycle', () => {
       expect.any(Object),
     );
     expect(wrapper.getComponent(ChatBoxStub).props('isRunning')).toBe(false);
+    wrapper.unmount();
+  });
+
+  it('shows an informative toast when no Manus workspace exists yet', async () => {
+    const wrapper = await mountPage();
+
+    await wrapper.get('[data-testid="workspace-button"]').trigger('click');
+
+    expect(toastMocks.showInfoToast).toHaveBeenCalledWith(
+      i18n.global.t('No Manus workspace yet'),
+    );
+    expect(computerPanelShow).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  it('reopens a legacy website turn as an interactive local preview', async () => {
+    agentMocks.getSession.mockResolvedValue(completedSession([
+      {
+        event: 'message',
+        data: {
+          event_id: 'user-1',
+          turn_id: 'turn-1',
+          role: 'user',
+          content: 'Build the website',
+          attachments: [],
+          timestamp: 1,
+        },
+      },
+      {
+        event: 'tool',
+        data: {
+          event_id: 'browser-1',
+          turn_id: 'turn-1',
+          tool_call_id: 'browser-1',
+          name: 'browser',
+          function: 'browser_navigate',
+          args: { url: 'http://localhost:8099/index.html' },
+          content: { screenshot: '' },
+          status: 'called',
+          timestamp: 2,
+        },
+      },
+    ] as AgentEvent[]));
+    const wrapper = await mountPage();
+
+    await wrapper.get('[data-testid="workspace-button"]').trigger('click');
+
+    expect(computerPanelShow).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tool_call_id: 'browser-1',
+        name: 'preview',
+        function: 'preview_show',
+        content: expect.objectContaining({ url: 'http://localhost:8099/index.html' }),
+      }),
+      false,
+    );
+    wrapper.unmount();
+  });
+
+  it('keeps the current-turn explicit preview ahead of later tool activity', async () => {
+    agentMocks.getSession.mockResolvedValue(completedSession([
+      {
+        event: 'message',
+        data: {
+          event_id: 'user-1', turn_id: 'turn-1', role: 'user', content: 'Build it', attachments: [], timestamp: 1,
+        },
+      },
+      {
+        event: 'tool',
+        data: {
+          event_id: 'preview-1', turn_id: 'turn-1', tool_call_id: 'preview-1', name: 'preview', function: 'preview_show',
+          args: { url: 'http://localhost:4173/' }, content: { url: 'http://localhost:4173/' }, status: 'called', timestamp: 2,
+        },
+      },
+      {
+        event: 'tool',
+        data: {
+          event_id: 'file-1', turn_id: 'turn-1', tool_call_id: 'file-1', name: 'file', function: 'file_read',
+          args: { file: '/home/ubuntu/index.html' }, status: 'called', timestamp: 3,
+        },
+      },
+    ] as AgentEvent[]));
+    const wrapper = await mountPage();
+
+    await wrapper.get('[data-testid="workspace-button"]').trigger('click');
+
+    expect(computerPanelShow).toHaveBeenCalledWith(
+      expect.objectContaining({ tool_call_id: 'preview-1', name: 'preview' }),
+      false,
+    );
+    wrapper.unmount();
+  });
+
+  it('does not let later live tool events replace an interactive preview', async () => {
+    const wrapper = await mountPage();
+    const callbacks = currentChatCallbacks();
+    callbacks?.onMessage?.({
+      event: 'message',
+      data: {
+        event_id: 'user-live', turn_id: 'turn-live', role: 'user', content: 'Build it', attachments: [], timestamp: 1,
+      },
+    });
+    callbacks?.onMessage?.({
+      event: 'tool',
+      data: {
+        event_id: 'preview-live', turn_id: 'turn-live', tool_call_id: 'preview-live', name: 'preview', function: 'preview_show',
+        args: { url: 'http://localhost:4173/' }, content: { url: 'http://localhost:4173/' }, status: 'called', timestamp: 2,
+      },
+    });
+    callbacks?.onMessage?.({
+      event: 'tool',
+      data: {
+        event_id: 'file-live', turn_id: 'turn-live', tool_call_id: 'file-live', name: 'file', function: 'file_read',
+        args: { file: '/home/ubuntu/index.html' }, status: 'called', timestamp: 3,
+      },
+    });
+    await nextTick();
+
+    expect(computerPanelShow).toHaveBeenLastCalledWith(
+      expect.objectContaining({ tool_call_id: 'preview-live', name: 'preview' }),
+      false,
+    );
+    wrapper.unmount();
+  });
+
+  it('does not pin a derived localhost preview over newer live browser activity', async () => {
+    const wrapper = await mountPage();
+    const callbacks = currentChatCallbacks();
+    callbacks?.onMessage?.({
+      event: 'message',
+      data: {
+        event_id: 'user-local', turn_id: 'turn-local', role: 'user', content: 'Inspect local admin', attachments: [], timestamp: 1,
+      },
+    });
+    callbacks?.onMessage?.({
+      event: 'tool',
+      data: {
+        event_id: 'navigate-local', turn_id: 'turn-local', tool_call_id: 'navigate-local', name: 'browser', function: 'browser_navigate',
+        args: { url: 'http://localhost:4173/admin' }, content: { screenshot: '/signed/shot-1' }, status: 'called', timestamp: 2,
+      },
+    });
+    callbacks?.onMessage?.({
+      event: 'tool',
+      data: {
+        event_id: 'click-local', turn_id: 'turn-local', tool_call_id: 'click-local', name: 'browser', function: 'browser_click',
+        args: { element: 'Login' }, status: 'calling', timestamp: 3,
+      },
+    });
+    await nextTick();
+
+    expect(computerPanelShow).toHaveBeenLastCalledWith(
+      expect.objectContaining({ tool_call_id: 'click-local', name: 'browser' }),
+      true,
+    );
+    wrapper.unmount();
+  });
+
+  it('does not reuse an older-turn preview for the current browser task', async () => {
+    agentMocks.getSession.mockResolvedValue(completedSession([
+      {
+        event: 'message',
+        data: {
+          event_id: 'user-1', turn_id: 'turn-1', role: 'user', content: 'Build it', attachments: [], timestamp: 1,
+        },
+      },
+      {
+        event: 'tool',
+        data: {
+          event_id: 'preview-1', turn_id: 'turn-1', tool_call_id: 'preview-1', name: 'preview', function: 'preview_show',
+          args: { url: 'http://localhost:4173/' }, content: { url: 'http://localhost:4173/' }, status: 'called', timestamp: 2,
+        },
+      },
+      {
+        event: 'message',
+        data: {
+          event_id: 'user-2', turn_id: 'turn-2', role: 'user', content: 'Research something else', attachments: [], timestamp: 3,
+        },
+      },
+      {
+        event: 'tool',
+        data: {
+          event_id: 'browser-2', turn_id: 'turn-2', tool_call_id: 'browser-2', name: 'browser', function: 'browser_navigate',
+          args: { url: 'https://example.com/' }, content: { screenshot: '/signed/shot' }, status: 'called', timestamp: 4,
+        },
+      },
+    ] as AgentEvent[]));
+    const wrapper = await mountPage();
+
+    await wrapper.get('[data-testid="workspace-button"]').trigger('click');
+
+    expect(computerPanelShow).toHaveBeenCalledWith(
+      expect.objectContaining({ tool_call_id: 'browser-2', name: 'browser' }),
+      false,
+    );
     wrapper.unmount();
   });
 

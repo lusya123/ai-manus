@@ -9,9 +9,16 @@ class PreviewToolkit(BaseToolkit):
 
     name: str = "preview"
     instructions: str = """
-- Use preview only for an interactive website, app, dashboard, prototype, game, or local project the user should inspect
-- Do not preview ordinary research pages, documentation, login flows, or third-party pages used only by the agent
-- Start local deliverable servers on a reachable host such as 0.0.0.0, verify the URL, then preview it
+- For a user-facing interactive website, app, dashboard, prototype, game, or
+  local web project, start its server on a reachable host, verify the URL, then
+  call preview_show as the final presentation action before complete_step or
+  deliver_result
+- A browser/VNC view, screenshot, attached source file, or instruction telling
+  the user to open a file manually is not a substitute for preview_show when
+  the interactive webpage itself is the deliverable
+- Do not use preview_show for ordinary research pages, documentation, login
+  flows, or third-party pages used only by the agent; those remain browser
+  tasks
 """
 
     def __init__(self):
@@ -25,14 +32,18 @@ class PreviewToolkit(BaseToolkit):
     ) -> ToolResult:
         """Show an interactive webpage preview to the user.
 
-        Use this only when the user's outcome is an interactive webpage they
-        should personally inspect, use, or accept, such as a created/modified
-        website, app, dashboard, prototype, game, or local project preview.
-        Do not use it for ordinary browsing, research, reading documentation,
-        logging in, checking a third-party page, or pages that only the agent
-        needs to inspect with browser tools. For local dev servers started in
-        the sandbox, pass the browser-accessible local URL, such as
-        http://localhost:3000 or http://127.0.0.1:5173.
+        When the user's deliverable is an interactive webpage they should
+        inspect, use, or accept (for example a created or modified website,
+        app, dashboard, prototype, game, or local web project), call
+        preview_show as the final presentation action before complete_step or
+        deliver_result. A browser/VNC view, screenshot, attached source file,
+        or instruction to open a file manually does not replace this preview.
+        For a local server started in the sandbox, pass its browser-accessible
+        URL, such as http://localhost:3000 or http://127.0.0.1:5173.
+
+        Do not use this for ordinary browsing, research, documentation, login
+        flows, or third-party pages used only by the agent; use browser tools
+        for those tasks instead.
 
         Args:
             url: URL of the user-facing webpage or web app to preview.

@@ -169,12 +169,22 @@ class ToolStreamEvent(BaseStreamEvent):
     async def from_event_async(cls, event: ToolEvent) -> Self:
         content = event.tool_content
         if isinstance(content, BrowserToolContent):
-            from app.interfaces.dependencies import get_file_service
-            content = BrowserToolContent(
-                screenshot=await get_file_service().create_internal_signed_url(
-                    content.screenshot
-                )
-            )
+            screenshot = content.screenshot
+            if screenshot:
+                from app.interfaces.dependencies import get_file_service
+                try:
+                    screenshot = (
+                        await get_file_service().create_internal_signed_url(
+                            screenshot
+                        )
+                    )
+                except FileNotFoundError:
+                    # Screenshot enrichment is best-effort.  A timeout can
+                    # persist an empty ID, and historical GridFS artifacts can
+                    # disappear independently of the durable event.  Neither
+                    # case should make the entire session history unreadable.
+                    screenshot = ""
+            content = BrowserToolContent(screenshot=screenshot)
         return cls(
             data=ToolEventData(
                 **BaseEventData.base_event_data(event),

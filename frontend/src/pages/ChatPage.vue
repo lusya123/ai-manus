@@ -130,6 +130,14 @@
             </PopoverContent>
           </Popover>
 
+          <button type="button" @click="handleWorkspaceShow"
+            data-testid="workspace-button"
+            class="h-8 px-2 sm:px-3 rounded-lg inline-flex items-center gap-1.5 hover:bg-[var(--fill-tsp-white-dark)] cursor-pointer border border-[var(--border-btn-main)] bg-[var(--background-white-main)]"
+            :title="t('Open Manus workspace')">
+            <Monitor class="text-[var(--icon-secondary)]" :size="18" />
+            <span class="hidden sm:inline text-[var(--text-secondary)] text-sm font-medium whitespace-nowrap">{{ t('Workspace') }}</span>
+          </button>
+
           <button type="button" @click="handleFileListShow"
             class="flex items-center justify-center cursor-pointer rounded-md hover:bg-[var(--fill-tsp-white-light)] size-8"
             :title="t('View all files in this task')">
@@ -211,9 +219,9 @@ import { PlanEventData, AgentEvent, type TerminalUpdateEventData, type FileUpdat
 import { useAgentEvents } from '../composables/useAgentEvents';
 import { useSessionPhase } from '../composables/useSessionPhase';
 import ComputerPanel from '../components/ComputerPanel.vue'
-import { ArrowDown, FileSearch, Lock, Globe, Link, Check, Ellipsis, Pencil, Star, Trash, FolderPlus, Folder, FolderSync, Pin, ChevronDown, CircleHelp } from 'lucide-vue-next';
+import { ArrowDown, FileSearch, Lock, Globe, Link, Check, Ellipsis, Pencil, Star, Trash, FolderPlus, Folder, FolderSync, Pin, ChevronDown, CircleHelp, Monitor } from 'lucide-vue-next';
 import ShareIcon from '@/components/icons/ShareIcon.vue';
-import { showErrorToast, showSuccessToast } from '../utils/toast';
+import { showErrorToast, showInfoToast, showSuccessToast } from '../utils/toast';
 import type { FileInfo } from '../api/file';
 import { useSessionFileList } from '../composables/useSessionFileList'
 import { useFilePreviewer } from '../composables/useFilePreviewer'
@@ -234,6 +242,7 @@ import {
   upsertCurrentSessionModelOption,
 } from '@/api/agentConfig';
 import type { ChatModelOption } from '@/api/agentConfig';
+import { selectPreferredWorkspaceTool } from '@/utils/workspaceTool';
 
 const router = useRouter()
 const { t } = useI18n()
@@ -340,9 +349,9 @@ const toggleModeMenu = () => {
   showModeMenu.value = !showModeMenu.value;
 };
 
-const toolHistory = computed(() => {
+const collectToolHistory = (source: Message[]) => {
   const tools: ToolContent[] = [];
-  for (const message of messages.value) {
+  for (const message of source) {
     if (message.type === 'tool') {
       tools.push(message.content as ToolContent);
     } else if (message.type === 'step') {
@@ -351,7 +360,29 @@ const toolHistory = computed(() => {
     }
   }
   return tools;
+};
+
+const toolHistory = computed(() => collectToolHistory(messages.value));
+
+/** Tools after the latest user message; legacy histories without one use all. */
+const currentTurnToolHistory = computed(() => {
+  let latestUserIndex = -1;
+  for (let index = messages.value.length - 1; index >= 0; index -= 1) {
+    if (messages.value[index].type === 'user') {
+      latestUserIndex = index;
+      break;
+    }
+  }
+  const source = latestUserIndex >= 0
+    ? messages.value.slice(latestUserIndex + 1)
+    : messages.value;
+  return collectToolHistory(source);
 });
+
+const preferredWorkspaceTool = computed(() => selectPreferredWorkspaceTool(
+  currentTurnToolHistory.value,
+  lastNoMessageTool.value,
+));
 
 const hasBrowserTool = computed(() =>
   toolHistory.value.some((t) => t.name === 'browser'),
@@ -435,7 +466,18 @@ const { handleEvent: handleAgentEvent, resetEventHistory } = useAgentEvents(
   {
     onToolActivity: (tool: ToolContent) => {
       if (realTime.value) {
-        computerPanel.value?.showComputerPanel(tool, true);
+        // Legacy localhost navigation is a history-reopen fallback only. In
+        // the live stream it could hide a newer browser/file action. Genuine
+        // preview_show tools remain pinned for the current user turn.
+        const workspaceTool = selectPreferredWorkspaceTool(
+          currentTurnToolHistory.value,
+          tool,
+          { allowLocalBrowserPreview: false },
+        ) ?? tool;
+        computerPanel.value?.showComputerPanel(
+          workspaceTool,
+          workspaceTool.name !== 'preview' && isLiveTool(workspaceTool),
+        );
       }
     },
   }
@@ -835,6 +877,19 @@ const handleStop = async () => {
 
 const handleFileListShow = () => {
   showSessionFileList()
+}
+
+const handleWorkspaceShow = () => {
+  const workspaceTool = preferredWorkspaceTool.value;
+  if (!workspaceTool) {
+    showInfoToast(t('No Manus workspace yet'));
+    return;
+  }
+  const live = workspaceTool.name !== 'preview' && isLiveTool(workspaceTool);
+  realTime.value = workspaceTool.name === 'preview'
+    ? isLastNoMessageTool(workspaceTool)
+    : live;
+  computerPanel.value?.showComputerPanel(workspaceTool, live);
 }
 
 // Share functionality handlers

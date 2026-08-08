@@ -10,6 +10,9 @@ import httpx
 from app.domain.external.search import SearchEngine
 from app.domain.models.search import SearchResultItem, SearchResults
 from app.domain.models.tool_result import ToolResult
+from app.infrastructure.external.llm.model_capabilities import (
+    effective_temperature,
+)
 from app.domain.utils.error_reporting import safe_exception_summary
 from app.infrastructure.external.search.bing_web_search import (
     _canonical_text,
@@ -575,7 +578,6 @@ class AnthropicWebSearchEngine(SearchEngine):
         payload: dict[str, Any] = {
             "model": self.model,
             "max_tokens": 1024,
-            "temperature": 0,
             "messages": [
                 {
                     "role": "user",
@@ -590,6 +592,9 @@ class AnthropicWebSearchEngine(SearchEngine):
                 }
             ],
         }
+        temperature = effective_temperature("anthropic", self.model, 0)
+        if temperature is not None:
+            payload["temperature"] = temperature
         try:
             response = await _request_anthropic_web_search(
                 url=self.url,

@@ -13,6 +13,9 @@ import httpx
 
 from app.application.services.claw_service import ClawService
 from app.core.config import get_settings
+from app.infrastructure.external.llm.model_capabilities import (
+    effective_temperature,
+)
 from app.infrastructure.external.llm.security import provider_api_base, provider_api_key
 from app.domain.utils.error_reporting import safe_exception_summary
 
@@ -404,7 +407,13 @@ def _openai_to_anthropic_request(request_body: dict, settings) -> dict:
     if system_prompt:
         body["system"] = system_prompt
     if "temperature" in request_body:
-        body["temperature"] = request_body["temperature"]
+        temperature = effective_temperature(
+            "anthropic",
+            body["model"],
+            request_body["temperature"],
+        )
+        if temperature is not None:
+            body["temperature"] = temperature
     if request_body.get("stream"):
         body["stream"] = True
     tools = _openai_tools_to_anthropic(request_body.get("tools"))

@@ -1,7 +1,9 @@
 import asyncio
 import io
-from types import MethodType
+from types import MethodType, SimpleNamespace
 from datetime import datetime, timedelta, UTC
+
+import pytest
 
 from langchain_core.messages import AIMessage
 
@@ -133,6 +135,33 @@ def test_openai_proxy_converts_openai_chat_request_to_anthropic_messages():
     assert converted["messages"] == [{"role": "user", "content": "你好"}]
     assert converted["tools"][0]["name"] == "lookup"
     assert converted["tools"][0]["input_schema"]["properties"]["q"]["type"] == "string"
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_temperature"),
+    [
+        ("claude-opus-4-8", None),
+        ("claude-opus-4-6", 0.7),
+    ],
+)
+def test_openai_proxy_omits_only_unsupported_anthropic_temperature(
+    model,
+    expected_temperature,
+):
+    settings = SimpleNamespace(model_name=model, max_tokens=1024)
+    converted = _openai_to_anthropic_request(
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": "hello"}],
+            "temperature": 0.7,
+        },
+        settings,
+    )
+
+    if expected_temperature is None:
+        assert "temperature" not in converted
+    else:
+        assert converted["temperature"] == expected_temperature
 
 
 def test_openai_proxy_converts_anthropic_response_to_openai_chat_completion():

@@ -7,6 +7,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from app.core.config import get_settings
 from app.domain.models.tool_result import ToolResult
 from app.domain.utils.error_reporting import safe_exception_summary
+from app.infrastructure.external.llm.model_capabilities import (
+    effective_temperature,
+)
 import logging
 
 # Set up logger for this module
@@ -29,10 +32,16 @@ class PlaywrightBrowser:
         kwargs = dict(
             model=self.settings.model_name,
             model_provider=self.settings.model_provider,
-            temperature=self.settings.temperature,
             max_tokens=self.settings.max_tokens,
             base_url=self.settings.api_base,
         )
+        temperature = effective_temperature(
+            self.settings.model_provider,
+            self.settings.model_name,
+            self.settings.temperature,
+        )
+        if temperature is not None:
+            kwargs["temperature"] = temperature
         if self.settings.extra_headers:
             kwargs["default_headers"] = self.settings.extra_headers
         self._model = init_chat_model(**kwargs)

@@ -27,6 +27,9 @@ from app.infrastructure.external.llm.robust_json_parser import (
     RobustJsonParser,
     ToolCallParseError,
 )
+from app.infrastructure.external.llm.model_capabilities import (
+    effective_temperature,
+)
 from app.infrastructure.external.llm.security import provider_api_base, provider_api_key
 
 logger = logging.getLogger(__name__)
@@ -62,10 +65,16 @@ class LangchainLLM:
         kwargs: Dict[str, Any] = dict(
             model=settings.model_name,
             model_provider=self._model_provider,
-            temperature=settings.temperature,
             max_tokens=settings.max_tokens,
             base_url=api_base,
         )
+        temperature = effective_temperature(
+            self._model_provider,
+            settings.model_name,
+            settings.temperature,
+        )
+        if temperature is not None:
+            kwargs["temperature"] = temperature
         if api_key:
             kwargs["api_key"] = api_key
         if settings.extra_headers:

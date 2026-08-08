@@ -953,8 +953,17 @@ def test_anthropic_web_parser_filters_each_result_and_unsafe_urls():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "expected_temperature"),
+    [
+        ("claude-opus-4-8", None),
+        ("claude-opus-4-6", 0),
+    ],
+)
 async def test_anthropic_web_search_uses_bounded_server_tool_request(
     monkeypatch,
+    model,
+    expected_temperature,
 ):
     captured = {}
 
@@ -970,7 +979,7 @@ async def test_anthropic_web_search_uses_bounded_server_tool_request(
     engine = AnthropicWebSearchEngine(
         api_base="https://gateway.example/v1",
         api_key="private-key",
-        model="claude-opus-4-8",
+        model=model,
         extra_headers={"x-routing": "test"},
     )
 
@@ -983,9 +992,12 @@ async def test_anthropic_web_search_uses_bounded_server_tool_request(
     assert captured["headers"]["x-api-key"] == "private-key"
     assert captured["headers"]["x-routing"] == "test"
     payload = captured["payload"]
-    assert payload["model"] == "claude-opus-4-8"
+    assert payload["model"] == model
     assert payload["max_tokens"] == 1024
-    assert payload["temperature"] == 0
+    if expected_temperature is None:
+        assert "temperature" not in payload
+    else:
+        assert payload["temperature"] == expected_temperature
     assert payload["tools"] == [
         {
             "type": "web_search_20250305",

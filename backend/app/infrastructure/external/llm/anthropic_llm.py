@@ -10,6 +10,9 @@ from anthropic import AsyncAnthropic
 from app.core.config import Settings
 from app.domain.models.message import LLMMessage, Role, ToolCall
 from app.domain.utils.model_output import normalize_model_content
+from app.infrastructure.external.llm.model_capabilities import (
+    effective_temperature,
+)
 from app.infrastructure.external.llm.security import (
     create_pinned_model_http_client,
 )
@@ -27,7 +30,11 @@ class AnthropicLLM:
         if not settings.api_base or not settings.byok_pinned_ip:
             raise RuntimeError("Anthropic BYOK requires a pinned endpoint")
         self._model = settings.model_name
-        self._temperature = settings.temperature
+        self._temperature = effective_temperature(
+            "anthropic",
+            settings.model_name,
+            settings.temperature,
+        )
         self._max_tokens = settings.max_tokens
         self._http_client = create_pinned_model_http_client(
             settings.api_base, settings.byok_pinned_ip
@@ -129,8 +136,9 @@ class AnthropicLLM:
             "model": self._model,
             "messages": payload,
             "max_tokens": self._max_tokens,
-            "temperature": self._temperature,
         }
+        if self._temperature is not None:
+            kwargs["temperature"] = self._temperature
         if system:
             kwargs["system"] = system
         converted_tools = self._convert_tools(tools)

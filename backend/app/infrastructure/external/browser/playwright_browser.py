@@ -103,6 +103,7 @@ class PlaywrightBrowser:
         self.playwright = None
         self.browser: Optional[PlaywrightBrowserHandle] = None
         self.page: Optional[Page] = None
+        self._cleanup_pages: list[Page] = []
         self._console_logs: deque[str] = deque(maxlen=MAX_CONSOLE_LOG_ENTRIES)
 
     # ------------------------------------------------------------------
@@ -146,24 +147,52 @@ class PlaywrightBrowser:
                 await asyncio.sleep(retry_delay)
 
     async def cleanup(self) -> None:
-        """Close all tabs and disconnect, releasing Playwright resources."""
-        try:
-            if self.browser:
-                for context in self.browser.contexts:
-                    for page in list(context.pages):
-                        try:
-                            await page.close()
-                        except Exception:
-                            pass
+        """Close every layer and keep failed handles available for retry."""
+        failed = False
+        pages = list(self._cleanup_pages)
+        if self.page is not None:
+            pages.append(self.page)
+        if self.browser is not None:
+            for context in self.browser.contexts:
+                pages.extend(list(context.pages))
+
+        self._cleanup_pages = []
+        seen: set[int] = set()
+        for page in pages:
+            if id(page) in seen:
+                continue
+            seen.add(id(page))
+            try:
+                if not page.is_closed():
+                    await page.close()
+            except Exception:
+                failed = True
+                self._cleanup_pages.append(page)
+                logger.error("Error closing a Playwright page")
+            else:
+                if self.page is page:
+                    self.page = None
+
+        if self.browser is not None:
+            try:
                 await self.browser.close()
-            if self.playwright:
+            except Exception:
+                failed = True
+                logger.error("Error closing Playwright browser")
+            else:
+                self.browser = None
+
+        if self.playwright is not None:
+            try:
                 await self.playwright.stop()
-        except Exception as exc:
-            logger.error("Error cleaning up Playwright resources: %s", exc)
-        finally:
-            self.page = None
-            self.browser = None
-            self.playwright = None
+            except Exception:
+                failed = True
+                logger.error("Error stopping Playwright")
+            else:
+                self.playwright = None
+
+        if failed:
+            raise RuntimeError("Playwright cleanup failed")
 
     async def _ensure_page(self) -> Page:
         """Return the active page, connecting and focusing the newest tab."""

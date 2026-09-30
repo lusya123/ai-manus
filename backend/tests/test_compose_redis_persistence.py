@@ -132,7 +132,7 @@ def test_user_controlled_runtimes_are_isolated_from_datastores(compose_name: str
     }
     assert services_on_data_network == {"backend", "mongodb", "redis"}
 
-    for runtime_name in ("sandbox", "claw"):
+    for runtime_name in ("sandbox",):
         assert set(services[runtime_name]["networks"]) == {RUNTIME_NETWORK}
 
     backend_environment = _environment_map(services["backend"])
@@ -145,20 +145,10 @@ def test_user_controlled_runtimes_are_isolated_from_datastores(compose_name: str
             else runtime_network_name
         )
     )
-    expected_configured_claw_network = (
-        "${CLAW_NETWORK:-manus-network}"
-        if compose_name == "docker-compose.yml"
-        else (
-            "${DEV_CLAW_NETWORK:-manus-network-dev}"
-            if compose_name == "docker-compose-development.yml"
-            else runtime_network_name
-        )
-    )
     assert (
         backend_environment["SANDBOX_NETWORK"]
         == expected_configured_runtime_network
     )
-    assert backend_environment["CLAW_NETWORK"] == expected_configured_claw_network
     assert backend_environment["RUNTIME_NETWORK_ISOLATION"] == "true"
     expected_deployment = (
         "${RUNTIME_DEPLOYMENT_ID:-ai-manus-dev}"
@@ -166,8 +156,6 @@ def test_user_controlled_runtimes_are_isolated_from_datastores(compose_name: str
         else "${RUNTIME_DEPLOYMENT_ID:-ai-manus}"
     )
     assert backend_environment["RUNTIME_DEPLOYMENT_ID"] == expected_deployment
-    if compose_name != "docker-compose-development.yml":
-        assert backend_environment["CLAW_PUBLISH_HOST_PORTS"] == "false"
     if compose_name == "docker-compose-development.yml":
         assert backend_environment["SANDBOX_PROVIDER"] == "docker"
 
@@ -201,7 +189,6 @@ def test_fork_deployment_worker_bridges_runtime_and_data_networks_safely():
     }
     worker_environment = _environment_map(worker)
     assert worker_environment["SANDBOX_NETWORK"] == RUNTIME_NETWORK
-    assert worker_environment["CLAW_NETWORK"] == RUNTIME_NETWORK
     assert worker_environment["RUNTIME_DEPLOYMENT_ID"] == "ai-manus"
     assert worker_environment["MONGODB_URI"] == "mongodb://mongodb:27017"
     assert worker_environment["REDIS_HOST"] == "redis"
@@ -338,7 +325,6 @@ def test_explicit_fork_publish_skips_only_the_redundant_multiarch_build():
         "frontend-smoke",
         "backend-unit-security",
         "sandbox-unit",
-        "claw-runtime-smoke",
     }
 
     assert " ".join(build_condition.split()) == " ".join(
@@ -370,7 +356,6 @@ def test_explicit_fork_publish_skips_only_the_redundant_multiarch_build():
         needs.frontend-smoke.result == 'success' &&
         needs.backend-unit-security.result == 'success' &&
         needs.sandbox-unit.result == 'success' &&
-        needs.claw-runtime-smoke.result == 'success' &&
         (
           (
             github.repository == 'Simpleyyt/ai-manus' &&
@@ -648,7 +633,6 @@ def test_fork_deployment_uses_approved_sha_and_immutable_image_digests():
         "FRONTEND_IMAGE",
         "BACKEND_IMAGE",
         "SANDBOX_IMAGE",
-        "CLAW_IMAGE",
         "MOCKSERVER_IMAGE",
     ):
         assert image_variable in ssh_step["env"]
@@ -656,7 +640,6 @@ def test_fork_deployment_uses_approved_sha_and_immutable_image_digests():
     assert "image: ${FRONTEND_IMAGE}" in deploy_script
     assert "image: ${BACKEND_IMAGE}" in deploy_script
     assert "image: ${SANDBOX_IMAGE}" in deploy_script
-    assert "image: ${CLAW_IMAGE}" in deploy_script
     assert "image: ${MOCKSERVER_IMAGE}" in deploy_script
     assert 'hotpatch_image="$SANDBOX_IMAGE"' in deploy_script
     assert ".RepoDigests" in deploy_script
@@ -1265,7 +1248,6 @@ def test_helper_scripts_use_distinct_compose_projects():
     assert 'RESOURCE_PREFIX="manus-$PROJECT_NAME"' in development_script
     assert 'DEV_RESOURCE_PREFIX="$RESOURCE_PREFIX"' in development_script
     assert 'DEV_SANDBOX_NETWORK=' in development_script
-    assert 'DEV_CLAW_NETWORK=' in development_script
 
 
 def test_local_docker_sandboxes_have_cpu_memory_and_process_limits():
@@ -1295,19 +1277,14 @@ def test_production_dynamic_runtime_images_follow_the_compose_release():
         "${SANDBOX_IMAGE:-${IMAGE_REGISTRY:-simpleyyt}/"
         "manus-sandbox:${IMAGE_TAG:-latest}}"
     )
-    assert backend_environment["CLAW_IMAGE"] == (
-        "${CLAW_IMAGE:-${IMAGE_REGISTRY:-simpleyyt}/"
-        "manus-claw:${IMAGE_TAG:-latest}}"
-    )
 
 
-def test_container_entrypoints_do_not_sync_dependencies_or_log_claw_token():
+def test_container_entrypoints_do_not_sync_dependencies():
     backend_dockerfile = (PROJECT_ROOT / "backend/Dockerfile").read_text()
     sandbox_dockerfile = (PROJECT_ROOT / "sandbox/Dockerfile").read_text()
     mockserver_dockerfile = (PROJECT_ROOT / "mockserver/Dockerfile").read_text()
     worker_entrypoint = (PROJECT_ROOT / "backend/start_worker.sh").read_text()
     sandbox_supervisor = (PROJECT_ROOT / "sandbox/supervisord.conf").read_text()
-    claw_entrypoint = (PROJECT_ROOT / "claw/entrypoint.sh").read_text()
     workflow = yaml.safe_load(
         (PROJECT_ROOT / ".github/workflows/docker-build-and-push.yml").read_text()
     )
@@ -1329,19 +1306,9 @@ def test_container_entrypoints_do_not_sync_dependencies_or_log_claw_token():
     assert "exec uv run" not in worker_entrypoint
     assert "command=uv run" not in sandbox_supervisor
 
-    shell_commands = [
-        line
-        for line in claw_entrypoint.splitlines()
-        if line.lstrip().startswith(("echo ", "printf "))
-    ]
-    assert all("OPENCLAW_GATEWAY_TOKEN" not in line for line in shell_commands)
-    assert "umask 077" in claw_entrypoint
-    assert claw_entrypoint.count('wait "${GATEWAY_PID}"') == 1
-
-
 @pytest.mark.parametrize(
     "lock_name",
-    ["frontend/package-lock.json", "claw/manus-claw/package-lock.json"],
+    ["frontend/package-lock.json"],
 )
 def test_npm_locks_use_the_official_registry(lock_name: str):
     lock = json.loads((PROJECT_ROOT / lock_name).read_text())

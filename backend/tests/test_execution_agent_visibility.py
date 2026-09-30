@@ -2,14 +2,17 @@ from types import MethodType
 
 from app.domain.models.event import MessageEvent, StepEvent, ToolEvent, ToolStatus
 from app.domain.models.message import Message
+from app.domain.models.agent_output import StepReport
 from app.domain.models.plan import Plan, Step
 from app.domain.services.agents.execution import ExecutionAgent
+from app.domain.services.agents.base import StructuredOutputEvent
 
 
 async def test_execute_step_hides_notify_tool_and_intermediate_step_result():
     agent = object.__new__(ExecutionAgent)
 
-    async def execute(self, _message):
+    async def execute(self, _message, *, output_tool):
+        assert output_tool.name == "complete_step"
         yield ToolEvent(
             tool_call_id="tool-1",
             tool_name="message",
@@ -24,19 +27,11 @@ async def test_execute_step_hides_notify_tool_and_intermediate_step_result():
             function_args={"text": "internal progress text"},
             status=ToolStatus.CALLED,
         )
-        yield MessageEvent(
-            message='{"success": true, "result": "internal step result", "attachments": []}'
+        yield StructuredOutputEvent(
+            output=StepReport(success=True, result="internal step result")
         )
 
-    async def parse_json(self, value):
-        return {
-            "success": True,
-            "result": "internal step result",
-            "attachments": [],
-        }
-
     agent.execute = MethodType(execute, agent)
-    agent._parse_json = MethodType(parse_json, agent)
 
     events = [
         event

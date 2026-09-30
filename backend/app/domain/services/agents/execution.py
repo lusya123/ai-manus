@@ -171,6 +171,8 @@ class ExecutionAgent(BaseAgent):
             elif isinstance(event, MessageEvent):
                 continue
             elif isinstance(event, ToolEvent):
+                if event.function_name == "message_notify_user":
+                    continue
                 if event.function_name == "message_ask_user":
                     if event.status == ToolStatus.CALLING:
                         yield MessageEvent(

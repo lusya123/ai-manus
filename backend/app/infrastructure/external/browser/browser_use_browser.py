@@ -19,7 +19,12 @@ from typing import Any, List, Optional
 import asyncio
 import json
 import logging
+import os
 from collections import deque
+
+# browser-use configures its own handlers at import time. Keep request and CDP
+# payloads under the application's redacting log handlers instead.
+os.environ["BROWSER_USE_SETUP_LOGGING"] = "false"
 
 from browser_use.browser.events import (
     ClickCoordinateEvent,
@@ -114,12 +119,12 @@ class BrowserUseBrowser:
         if self._session is not None:
             try:
                 await self._session.stop()
-            except Exception as exc:
-                logger.error("Error stopping BrowserSession: %s", exc)
-            finally:
-                self._session = None
-                self._console_clients.clear()
-                self._console_enabled_sessions.clear()
+            except Exception:
+                logger.error("Error stopping BrowserSession")
+                raise RuntimeError("BrowserSession cleanup failed") from None
+            self._session = None
+            getattr(self, "_console_clients", set()).clear()
+            getattr(self, "_console_enabled_sessions", set()).clear()
 
     # ------------------------------------------------------------------
     # Event dispatch helper (official browser-use tools pattern)

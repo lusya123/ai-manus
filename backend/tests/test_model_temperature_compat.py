@@ -4,9 +4,6 @@ import pytest
 
 from app.core.config import Settings
 from app.domain.models.message import LLMMessage
-from app.infrastructure.external.browser.playwright_browser import (
-    PlaywrightBrowser,
-)
 from app.infrastructure.external.llm.anthropic_llm import AnthropicLLM
 from app.infrastructure.external.llm.langchain_llm import LangchainLLM
 from app.infrastructure.external.llm.model_capabilities import (
@@ -88,7 +85,6 @@ def test_langchain_anthropic_omits_only_unsupported_temperature(
     else:
         assert captured["temperature"] == expected_temperature
 
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("model", "expected_temperature"),
@@ -151,41 +147,3 @@ async def test_native_anthropic_omits_only_unsupported_temperature(
     else:
         assert captured["temperature"] == expected_temperature
     assert http_client.is_closed
-
-
-@pytest.mark.parametrize(
-    ("model", "expected_temperature"),
-    [
-        ("claude-opus-4-8", None),
-        ("claude-opus-4-6", 0.7),
-    ],
-)
-def test_playwright_model_omits_only_unsupported_temperature(
-    monkeypatch,
-    model,
-    expected_temperature,
-):
-    captured = {}
-    settings = SimpleNamespace(
-        model_name=model,
-        model_provider="anthropic",
-        temperature=0.7,
-        max_tokens=1024,
-        api_base="https://gateway.example",
-        extra_headers=None,
-    )
-    monkeypatch.setattr(
-        "app.infrastructure.external.browser.playwright_browser.get_settings",
-        lambda: settings,
-    )
-    monkeypatch.setattr(
-        "app.infrastructure.external.browser.playwright_browser.init_chat_model",
-        lambda **kwargs: captured.update(kwargs) or SimpleNamespace(),
-    )
-
-    PlaywrightBrowser("http://sandbox:9222")
-
-    if expected_temperature is None:
-        assert "temperature" not in captured
-    else:
-        assert captured["temperature"] == expected_temperature

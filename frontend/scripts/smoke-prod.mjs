@@ -7,7 +7,7 @@ import { preview } from "vite";
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.SMOKE_PORT || 4173);
 const BASE_URL = `http://${HOST}:${PORT}`;
-const ROUTES_TO_VERIFY = ["/", "/chat", "/chat/claw"];
+const ROUTES_TO_VERIFY = ["/", "/chat"];
 
 function findChromeExecutable() {
   const candidates = [
@@ -39,7 +39,6 @@ function frontendConfigResponse(overrides = {}) {
       show_github_button: true,
       github_repository_url: "https://github.com/simpleyyt/ai-manus",
       google_analytics_id: null,
-      claw_enabled: true,
       default_model: {
         id: "system-default",
         label: "System Default",
@@ -216,40 +215,19 @@ async function installApiMocks(page, options = {}) {
       return;
     }
 
-    if (url.pathname === "/api/v1/claw") {
-      if (request.method() === "GET") {
-        await route.fulfill({
-          status: 200,
-          contentType: "application/json",
-          body: JSON.stringify({
-            code: 0,
-            msg: "success",
-            data: {
-              id: "smoke-claw",
-              user_id: "smoke-user",
-              status: "stopped",
-              created_at: "2026-01-01T00:00:00Z",
-              updated_at: "2026-01-01T00:00:00Z",
-            },
-          }),
-        });
-        return;
-      }
-
-      if (request.method() === "DELETE") {
-        await route.fulfill({
-          status: 200,
-          contentType: "application/json",
-          body: JSON.stringify({ code: 0, msg: "success", data: {} }),
-        });
-        return;
-      }
+    if (url.pathname === "/api/v1/skills" && request.method() === "GET") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ code: 0, msg: "success", data: { catalog: [], added: [] } }),
+      });
+      return;
     }
 
     await route.fulfill({
       status: 404,
       contentType: "application/json",
-      body: JSON.stringify({ code: 404, msg: "not mocked", data: null }),
+      body: JSON.stringify({ code: 404, msg: `not mocked: ${request.method()} ${url.pathname}`, data: null }),
     });
   });
 }
@@ -433,9 +411,6 @@ async function main() {
           const bodyText = document.body.innerText.trim();
           if (!app || app.childElementCount === 0 || bodyText.length === 0) {
             return false;
-          }
-          if (window.location.pathname === "/chat/claw") {
-            return bodyText.includes("OpenClaw");
           }
           return true;
         },

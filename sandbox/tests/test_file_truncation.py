@@ -13,7 +13,7 @@ from app.services.file import FileService
 
 @pytest.fixture
 def file_service():
-    return FileService()
+    return FileService(writable_roots=(tempfile.gettempdir(),))
 
 
 def _write_temp(content: str) -> str:

@@ -1,8 +1,8 @@
 """Unit tests for the framework-agnostic tool abstraction.
 
-Verifies that the ``@tool`` decorator derives OpenAI-compatible function
-schemas from signatures + Google-style docstrings, and that toolkits expose
-lookup / invocation without depending on LangChain.
+Verifies that ``@tool`` takes descriptions from either decorator arguments
+or a Google-style docstring, and that toolkits expose lookup / invocation
+without depending on LangChain.
 """
 from typing import Optional
 
@@ -10,7 +10,6 @@ import pytest
 
 from app.domain.models.tool_result import ToolResult
 from app.domain.services.tools.base import BaseToolkit, tool
-from app.domain.services.tools.file import FileToolkit
 
 
 class SampleToolkit(BaseToolkit):
@@ -20,7 +19,7 @@ class SampleToolkit(BaseToolkit):
         super().__init__()
         self.backend = backend
 
-    @tool(parse_docstring=True)
+    @tool
     async def do_thing(self, id: str, count: Optional[int] = None) -> ToolResult:
         """Do a thing with an id. Use for testing.
 
@@ -57,6 +56,13 @@ class TestToolSchema:
         assert "Do a thing with an id" in fn["description"]
         assert "Args:" not in fn["description"]
 
+    def test_openai_schema_includes_brief(self):
+        params = self.tk.get_tool_schemas()[0]["function"]["parameters"]
+        assert "brief" in params["properties"]
+        assert "user-facing" in params["properties"]["brief"]["description"]
+        # Official timeline needs brief — require it on every executable tool
+        assert "brief" in params.get("required", [])
+
     def test_parameter_descriptions_from_docstring(self):
         params = self.tk.get_tool_schemas()[0]["function"]["parameters"]
         assert params["type"] == "object"
@@ -91,18 +97,122 @@ class TestToolLookupAndInvoke:
         assert result.data == "abc:3"
         assert self.backend.calls == [("abc", 3)]
 
+    async def test_invoke_strips_brief_before_calling_impl(self):
+        tool_obj = self.tk.get_tool("do_thing")
+        result = await tool_obj.invoke({
+            "id": "abc",
+            "count": 1,
+            "brief": "编写 Python 示例代码",
+        })
+        assert result.data == "abc:1"
+        assert self.backend.calls == [("abc", 1)]
+
     def test_tool_carries_toolkit_reference(self):
         assert self.tk.get_tool("do_thing").toolkit is self.tk
 
+    async def test_decorated_method_stays_callable(self):
+        result = await self.tk.do_thing(id="abc", count=2)
+        assert result.data == "abc:2"
+        assert self.backend.calls == [("abc", 2)]
 
-def test_model_file_tools_do_not_expose_privileged_writes():
-    toolkit = FileToolkit(object())
-    schemas = {
-        schema["function"]["name"]: schema["function"]["parameters"]
-        for schema in toolkit.get_tool_schemas()
-    }
 
-    assert "sudo" not in schemas["file_write"]["properties"]
-    assert "sudo" not in schemas["file_str_replace"]["properties"]
-    # Privileged reads remain a separate, read-only compatibility capability.
-    assert "sudo" in schemas["file_read"]["properties"]
+class ExplicitToolkit(BaseToolkit):
+    name = "explicit"
+
+    @tool(
+        description="Do a thing with an id. Use for testing.",
+        args={
+            "id": "The unique identifier",
+            "count": "(Optional) How many times",
+        },
+    )
+    async def do_thing(self, id: str, count: Optional[int] = None) -> ToolResult:
+        """This docstring must be ignored in decorator mode.
+
+        Args:
+            id: WRONG id docs
+            count: WRONG count docs
+        """
+        return ToolResult(success=True, data=f"{id}:{count}")
+
+    @tool("Rename a file.", args={"path": "Absolute path of the file"})
+    async def rename(self, path: str) -> ToolResult:
+        return ToolResult(success=True, data=path)
+
+
+class SchemaToolkit(BaseToolkit):
+    name = "schema"
+
+    @tool(
+        description="Look something up",
+        parameters={
+            "q": {"type": "string", "description": "Search query"},
+        },
+        required=["q"],
+    )
+    async def lookup(self, q: str) -> ToolResult:
+        return ToolResult(success=True, data=q)
+
+
+class TestDecoratorDocs:
+    def test_parameter_descriptions_from_decorator(self):
+        tk = ExplicitToolkit()
+        params = tk.get_tool("do_thing").to_openai_schema()["function"]["parameters"]
+        assert params["properties"]["id"]["description"] == "The unique identifier"
+        assert "How many times" in params["properties"]["count"]["description"]
+        assert "WRONG" not in params["properties"]["id"]["description"]
+
+    def test_decorator_description_ignores_docstring(self):
+        tk = ExplicitToolkit()
+        fn = tk.get_tool("do_thing").to_openai_schema()["function"]
+        assert fn["description"] == "Do a thing with an id. Use for testing."
+        assert "ignored" not in fn["description"]
+
+    def test_positional_description(self):
+        tk = ExplicitToolkit()
+        fn = tk.get_tool("rename").to_openai_schema()["function"]
+        assert fn["description"] == "Rename a file."
+        assert fn["parameters"]["properties"]["path"]["description"] == "Absolute path of the file"
+
+    def test_explicit_parameters_schema(self):
+        tk = SchemaToolkit()
+        params = tk.get_tool("lookup").to_openai_schema()["function"]["parameters"]
+        assert params["properties"]["q"]["description"] == "Search query"
+        assert "q" in params["required"]
+
+    def test_param_docs_must_use_args(self):
+        with pytest.raises(TypeError, match="args="):
+            @tool(description="oops", id="not nested")
+            async def bad(self, id: str) -> ToolResult:
+                return ToolResult(success=True)
+
+    def test_shell_toolkit_uses_decorator_docs(self):
+        from types import SimpleNamespace
+
+        from app.domain.services.tools.shell import ShellToolkit
+
+        tk = ShellToolkit(SimpleNamespace())
+        fn = tk.get_tool("shell_exec").to_openai_schema()["function"]
+        assert "Execute commands in a specified shell session" in fn["description"]
+        assert fn["parameters"]["properties"]["exec_dir"]["description"].startswith(
+            "Working directory"
+        )
+
+
+class TestTakeBrief:
+    def test_take_brief_splits_ui_label(self):
+        from app.domain.services.tools.base import take_brief
+
+        brief, args = take_brief({
+            "file": "/home/ubuntu/a.py",
+            "brief": "  编写 Python 示例代码  ",
+        })
+        assert brief == "编写 Python 示例代码"
+        assert args == {"file": "/home/ubuntu/a.py"}
+
+    def test_take_brief_missing(self):
+        from app.domain.services.tools.base import take_brief
+
+        brief, args = take_brief({"file": "a.py"})
+        assert brief is None
+        assert args == {"file": "a.py"}

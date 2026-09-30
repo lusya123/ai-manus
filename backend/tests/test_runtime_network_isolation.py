@@ -1346,24 +1346,3 @@ def test_global_legacy_audit_ignores_another_compose_project(monkeypatch) -> Non
     )
 
     audit_legacy_runtime_networks(settings)
-
-
-def test_claw_private_backend_url_and_host_ports_are_disabled() -> None:
-    from app.infrastructure.external.claw.docker_claw_runtime import (
-        DockerClawRuntime,
-    )
-
-    runtime = object.__new__(DockerClawRuntime)
-    runtime.settings = SimpleNamespace(
-        runtime_network_isolation=True,
-        manus_api_base_url="http://backend:8000",
-        backend_sandbox_url=None,
-        backend_internal_url=None,
-        backend_public_url=None,
-        claw_publish_host_ports=True,
-    )
-
-    assert runtime._container_reachable_backend_url() == (
-        f"http://{RUNTIME_GATEWAY_ALIAS}:8000"
-    )
-    assert runtime._publish_host_ports is False

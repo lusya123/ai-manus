@@ -1,3 +1,48 @@
+import io
+from datetime import UTC, datetime
+
+import pytest
+
+
+class FakeFileStorage:
+    def __init__(self):
+        self.files: dict[str, bytes] = {}
+
+    async def upload_file(
+        self,
+        file_data,
+        filename,
+        user_id,
+        content_type=None,
+        metadata=None,
+    ):
+        from app.domain.models.file import FileInfo
+
+        data = file_data.read()
+        file_id = f"file_{len(self.files) + 1}"
+        self.files[file_id] = data
+        return FileInfo(
+            file_id=file_id,
+            filename=filename,
+            size=len(data),
+            upload_date=datetime.now(UTC),
+        )
+
+    async def download_file(self, file_id, user_id=None):
+        from app.domain.models.file import FileInfo
+
+        data = self.files[file_id]
+        return io.BytesIO(data), FileInfo(
+            file_id=file_id,
+            filename="skill.zip",
+            size=len(data),
+            upload_date=datetime.now(UTC),
+        )
+
+
+@pytest.fixture
+def fake_file_storage():
+    return FakeFileStorage()
 """
 Pytest configuration and fixtures
 """
@@ -63,6 +108,19 @@ def secure_test_process_settings(monkeypatch):
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_llm_env(monkeypatch):
+    """Keep offline tests deterministic regardless of the host environment.
+
+    Two leak paths exist: the shell may carry a real API_BASE, and importing
+    browser_use (pulled in transitively at collection time) runs load_dotenv,
+    which walks up to the repo-root .env and injects API_BASE into the
+    process. Settings() would then pick it up and break provider-default
+    assertions depending on test order.
+    """
+    monkeypatch.delenv("API_BASE", raising=False)
 
 @pytest.fixture
 def client():

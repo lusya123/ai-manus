@@ -30,7 +30,6 @@ async def get_frontend_config() -> APIResponse[ClientConfigResponse]:
             show_github_button=settings.show_github_button,
             github_repository_url=settings.github_repository_url,
             google_analytics_id=settings.google_analytics_id,
-            claw_enabled=settings.claw_enabled,
             default_model=ModelOptionResponse(
                 id="system-default",
                 label=settings.model_name,

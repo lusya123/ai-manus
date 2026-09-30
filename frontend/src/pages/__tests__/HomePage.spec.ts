@@ -39,7 +39,6 @@ const clientConfig: ClientConfigResponse = {
   show_github_button: false,
   github_repository_url: '',
   google_analytics_id: null,
-  claw_enabled: false,
   supported_byok_providers: ['openai', 'anthropic', 'deepseek', 'ollama'],
 };
 

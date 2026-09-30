@@ -15,7 +15,6 @@ services:
     image: simpleyyt/manus-backend
     depends_on:
       - sandbox
-      - claw
     restart: unless-stopped
     sysctls:
       net.ipv4.ip_forward: "0"
@@ -45,22 +44,12 @@ services:
       - SANDBOX_MEMORY_LIMIT=2g
       - SANDBOX_CPU_LIMIT=2.0
       - SANDBOX_PIDS_LIMIT=512
-      - CLAW_IMAGE=simpleyyt/manus-claw
-      - CLAW_NETWORK=manus-network
       - RUNTIME_NETWORK_ISOLATION=true
       - RUNTIME_DEPLOYMENT_ID=${RUNTIME_DEPLOYMENT_ID:-ai-manus}
-      - CLAW_PUBLISH_HOST_PORTS=false
 
   sandbox:
     image: simpleyyt/manus-sandbox
     command: /bin/sh -c "exit 0"  # prevent sandbox from starting, ensure image is pulled
-    restart: "no"
-    networks:
-      - manus-network
-
-  claw:
-    image: simpleyyt/manus-claw
-    entrypoint: /bin/sh -c "exit 0"  # prevent claw from starting, ensure image is pulled
     restart: "no"
     networks:
       - manus-network
@@ -91,7 +80,7 @@ volumes:
     name: manus-redis-data
 
 networks:
-  # Frontend, backend, and user-controlled sandbox/Claw runtimes communicate
+  # Frontend, backend, and user-controlled sandbox runtimes communicate
   # here. No datastore is attached to this network.
   manus-network:
     name: manus-network

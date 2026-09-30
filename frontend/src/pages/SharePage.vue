@@ -34,7 +34,7 @@
             @toolClick="handleToolClick" />
 
           <!-- Loading indicator: only before first visible replay output -->
-          <LoadingIndicator v-if="showThinking" :text="$t('{name} is thinking', { name: 'Manus' })" />
+          <LoadingIndicator v-if="showThinking" :text="$t('Thinking')" />
           <div v-else-if="isLoading" aria-hidden="true" class="h-5 invisible" />
         </div>
 
@@ -102,6 +102,7 @@ import { Message, MessageContent, ToolContent, StepContent, AttachmentsContent, 
 import { PlanEventData } from '../types/event';
 import { useAgentEvents } from '../composables/useAgentEvents';
 import ComputerPanel from '../components/ComputerPanel.vue'
+import { isComputerPanelTool } from '../constants/tool';
 import { ArrowDown, FileSearch, Link, Bot } from 'lucide-vue-next';
 import ManusLogoTextIcon from '../components/icons/ManusLogoTextIcon.vue';
 import { showErrorToast, showSuccessToast } from '../utils/toast';
@@ -205,14 +206,13 @@ const showThinking = computed(() => {
 });
 
 // Shared agent event -> message list conversion
-const { handleEvent, resetEventHistory } = useAgentEvents(
+const { handleEvent } = useAgentEvents(
   { messages, title, plan, lastEventId, lastTool, lastNoMessageTool },
   {
     onToolActivity: (tool: ToolContent) => {
-      // Public tool arguments and most results are intentionally redacted.
-      // Only surface content the shared-session mapper explicitly retained.
-      if (realTime.value && tool.content) {
-        computerPanel.value?.showComputerPanel(tool, false);
+      // Official: Computer closed by default; only follow tools if already open.
+      if (realTime.value) {
+        computerPanel.value?.followLiveToolIfOpen(tool, false);
       }
     },
   }
@@ -230,7 +230,6 @@ watch(messages, async () => {
 
 // Reset all refs to their initial values
 const resetState = () => {
-  resetEventHistory();
   // Reset reactive state to initial values
   Object.assign(state, createInitialState());
 };
@@ -320,7 +319,9 @@ onUnmounted(() => {
 });
 
 const handleToolClick = (tool: ToolContent) => {
-  if (!tool.content) return;
+  if (!isComputerPanelTool(tool.name)) {
+    return;
+  }
   realTime.value = false;
   if (sessionId.value) {
     computerPanel.value?.showComputerPanel(tool, false);
@@ -328,14 +329,16 @@ const handleToolClick = (tool: ToolContent) => {
 }
 
 const handleSelectTool = (tool: ToolContent) => {
-  if (!tool.content) return;
+  if (!isComputerPanelTool(tool.name)) {
+    return;
+  }
   realTime.value = false;
   computerPanel.value?.showComputerPanel(tool, false);
 }
 
 const jumpToRealTime = () => {
   realTime.value = true;
-  if (lastNoMessageTool.value?.content) {
+  if (lastNoMessageTool.value) {
     computerPanel.value?.showComputerPanel(lastNoMessageTool.value, false);
   }
 }
@@ -371,3 +374,4 @@ const handleCopyLink = async () => {
   }
 }
 </script>
+

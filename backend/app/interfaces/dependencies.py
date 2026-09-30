@@ -34,11 +34,12 @@ from app.infrastructure.repositories.mongo_session_repository import MongoSessio
 from app.infrastructure.repositories.mongo_turn_submission_repository import MongoTurnSubmissionRepository
 from app.infrastructure.repositories.file_mcp_repository import FileMCPRepository
 from app.infrastructure.repositories.user_repository import MongoUserRepository
-from app.infrastructure.repositories.claw_repository import ClawRepository as MongoClawRepository
-from app.application.services.claw_service import ClawService
-from app.domain.services.claw_domain_service import ClawDomainService
 from app.application.services.project_service import ProjectService
+from app.application.services.skill_service import SkillService
+from app.application.services.skill_runtime_service import SkillRuntimeService
 from app.infrastructure.repositories.mongo_project_repository import MongoProjectRepository
+from app.infrastructure.repositories.mongo_skill_repository import MongoSkillRepository
+from app.infrastructure.repositories.mongo_user_skill_repository import MongoUserSkillRepository
 from app.infrastructure.repositories.mongo_file_favorite_repository import MongoFileFavoriteRepository
 
 
@@ -133,6 +134,7 @@ def get_agent_service() -> AgentService:
         llm_factory=llm_factory,
         search_engine=search_engine,
         project_repository=MongoProjectRepository(),
+        skill_runtime_service=get_skill_runtime_service(),
     ))
     
     # Create AgentService instance
@@ -169,6 +171,23 @@ def get_file_service() -> FileService:
         file_storage=file_storage,
         token_service=token_service,
     )
+
+
+@lru_cache()
+def get_skill_service() -> SkillService:
+    """Get skill service instance"""
+    logger.info("Creating SkillService instance")
+    return SkillService(
+        skill_repository=MongoSkillRepository(),
+        user_skill_repository=MongoUserSkillRepository(),
+        file_storage=get_file_storage(),
+    )
+
+
+@lru_cache()
+def get_skill_runtime_service() -> SkillRuntimeService:
+    """Get skill runtime service instance"""
+    return SkillRuntimeService(skill_service=get_skill_service())
 
 
 @lru_cache()
@@ -236,32 +255,6 @@ def get_token_service() -> TokenService:
     """Get token service instance"""
     logger.info("Creating TokenService instance")
     return TokenService()
-
-
-@lru_cache()
-def get_claw_service() -> ClawService:
-    """Get claw service instance"""
-    logger.info("Creating ClawService instance")
-    settings = get_settings()
-    claw_repository = MongoClawRepository()
-
-    if settings.claw_address:
-        from app.infrastructure.external.claw.fixed_claw_runtime import FixedClawRuntime
-        claw_runtime = FixedClawRuntime(address=settings.claw_address)
-    else:
-        from app.infrastructure.external.claw.docker_claw_runtime import DockerClawRuntime
-        claw_runtime = DockerClawRuntime()
-
-    from app.infrastructure.external.claw.http_claw_client import HttpClawClient
-    claw_client = HttpClawClient()
-
-    claw_domain_service = ClawDomainService(
-        claw_repository=claw_repository,
-        claw_runtime=claw_runtime,
-        claw_client=claw_client,
-    )
-
-    return ClawService(claw_domain_service=claw_domain_service)
 
 
 @lru_cache()

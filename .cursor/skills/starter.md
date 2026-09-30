@@ -71,16 +71,16 @@ Requires `API_KEY` and, unless using disposable local `AUTH_PROVIDER=none`, a st
 
 ### Security-sensitive setup rules
 
-- Generate JWT, local-auth, `MODEL_CREDENTIAL_ENCRYPTION_KEYS`, and `CLAW_API_KEY_HMAC_KEYS` values independently; never copy a public example into a live environment. `REGISTRATION_ENABLED` remains `false` unless a test explicitly needs signup.
+- Generate JWT, local-auth, and `MODEL_CREDENTIAL_ENCRYPTION_KEYS` values independently; never copy a public example into a live environment. `REGISTRATION_ENABLED` remains `false` unless a test explicitly needs signup.
 - New password hashes use random per-user PBKDF2-SHA256 salts and at least 600,000 rounds. `PASSWORD_SALT`/`PASSWORD_LEGACY_HASH_ROUNDS` are only for progressively upgrading old hashes.
 - Redis contains security state, not disposable cache data. Keep the Compose AOF `everysec`, `noeviction`, and named-volume settings, or give an external production Redis equivalent persistence, backups, and high availability. A host crash can still lose roughly one second of AOF writes, so Redis is not a hard billing ledger.
 - Set `CORS_ALLOWED_ORIGINS` to comma-separated exact browser origins in non-local deployments. Wildcards and credentialed CORS are rejected.
 - Refresh tokens are single-use and rotate inside a logout-revocable family. Sub2API browser handoff requires a one-time random `state`, fragment-only credentials, and `/auth/me` verification before commit.
 - Run `scripts/rotate_model_credential_keys.py` without `--apply` before any BYOK key rotation. Pre-marker plaintext credential migration requires every historical server/catalog key in temporary `LEGACY_SYSTEM_API_KEYS` and a dry run of `scripts/migrate_agent_credentials.py`.
-- Preserve the multipart pre-parser cap, per-file limit, and per-user GridFS quotas when debugging uploads. Claw has additional WebSocket, attachment, proxy, upload, and bounded-history limits.
+- Preserve the multipart pre-parser cap, per-file limit, and per-user GridFS quotas when debugging uploads.
 - `TASK_BACKEND=local` requires `BACKEND_REPLICA_COUNT=1`. Multiple API processes/replicas require Celery and identical Redis, MongoDB, JWT, model-keyring, and sandbox settings across backend/workers.
 - AgentBay deletion waits for task cancellation and provider confirmation; failed cleanup retains the session ID for retry. Never print or log signed AgentBay gateway links.
-- Keep user/model-controlled Docker runtimes on `manus-network` and MongoDB/Redis on the internal `manus-data-network`. Backend is the only application service attached to both; never attach sandbox or Claw to the data network.
+- Keep user/model-controlled Docker runtimes on `manus-network` and MongoDB/Redis on the internal `manus-data-network`. Backend is the only application service attached to both; never attach sandbox to the data network.
 
 <!-- Added 2026-07-16: security, secret-rotation, upload, and multi-replica deployment invariants. -->
 

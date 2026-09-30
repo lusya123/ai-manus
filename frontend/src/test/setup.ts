@@ -1,4 +1,12 @@
 // Node 25 exposes incomplete storage globals unless a CLI storage file is set.
+import { vi } from 'vitest';
+
+vi.mock('lottie-web', () => ({
+  default: {
+    loadAnimation: () => ({ setSpeed: () => {}, destroy: () => {} }),
+  },
+}));
+
 // Install a deterministic in-memory implementation before application modules load.
 const createMemoryStorage = (): Storage => {
   const values = new Map<string, string>();

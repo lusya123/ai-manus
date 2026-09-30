@@ -10,7 +10,6 @@ export interface ClientConfigResponse {
   show_github_button: boolean
   github_repository_url: string
   google_analytics_id: string | null
-  claw_enabled: boolean
   default_model?: ModelOptionResponse | null
   available_models?: ModelOptionResponse[]
   supported_byok_providers: string[]

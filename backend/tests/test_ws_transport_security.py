@@ -41,7 +41,6 @@ async def _call_route(route, websocket):
     [
         ws_routes.sessions_list_ws,
         ws_routes.chat_ws,
-        ws_routes.claw_ws,
         ws_routes.vnc_ws,
     ],
 )
@@ -65,7 +64,6 @@ async def test_all_cookie_websockets_reject_untrusted_origin_before_auth(
     [
         ws_routes.sessions_list_ws,
         ws_routes.chat_ws,
-        ws_routes.claw_ws,
         ws_routes.vnc_ws,
     ],
 )

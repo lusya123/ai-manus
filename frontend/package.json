@@ -10,6 +10,7 @@
     "type-check": "vue-tsc",
     "lint": "eslint src",
     "test": "vitest run",
+    "test:e2e": "playwright test",
     "test:watch": "vitest",
     "preview": "vite preview"
   },
@@ -30,6 +31,7 @@
     "clsx": "^2.1.1",
     "dompurify": "^3.2.5",
     "framer-motion": "^10.12.16",
+    "lottie-web": "^5.13.0",
     "lucide-vue-next": "^0.511.0",
     "marked": "^15.0.8",
     "mitt": "^3.0.1",
@@ -44,6 +46,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.63.0",
     "@tailwindcss/typography": "^0.5.16",
     "@types/node": "^24.0.13",
     "@vitejs/plugin-vue": "^4.2.3",

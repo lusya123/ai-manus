@@ -6,6 +6,7 @@ export type SettingsTabId =
   | 'account'
   | 'shortcuts'
   | 'personalization'
+  | 'skills'
   | 'help'
 
 const isSettingsDialogOpen = ref(false)
@@ -21,6 +22,7 @@ export function useSettingsDialog() {
       || tabId === 'account'
       || tabId === 'shortcuts'
       || tabId === 'personalization'
+      || tabId === 'skills'
       || tabId === 'help'
     ) {
       defaultTab.value = tabId

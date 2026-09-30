@@ -351,6 +351,7 @@ class AgentService:
         message: str,
         timestamp: Optional[datetime] = None,
         attachments: Optional[List[FileInfo]] = None,
+        required_skills: Optional[List[dict[str, str]]] = None,
     ) -> TurnSubmission:
         """Durably accept and dispatch before SSE response headers are sent."""
         try:
@@ -361,6 +362,7 @@ class AgentService:
                 message=message,
                 timestamp=timestamp,
                 attachments=attachments,
+                required_skills=required_skills,
             )
         except TurnSubmissionConflictError as exc:
             raise ConflictError(str(exc)) from exc

@@ -38,6 +38,7 @@ class ChatRequest(BaseModel):
     timestamp: Optional[int] = None
     message: Optional[str] = None
     attachments: Optional[List[ChatAttachment]] = Field(default=None, max_length=10)
+    required_skills: Optional[List[dict[str, str]]] = Field(default=None, max_length=20)
     event_id: Optional[str] = Field(default=None, max_length=128)
     submission_id: Optional[UUID] = None
 

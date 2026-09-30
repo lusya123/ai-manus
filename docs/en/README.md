@@ -1,4 +1,4 @@
-# 🤖 AI Manus × Claw Open Source General AI Agent
+# 🤖 AI Manus Open Source General AI Agent
 
 Official Site: <https://ai-manus.com>
 
@@ -6,11 +6,9 @@ GitHub: <https://github.com/simpleyyt/ai-manus> | Demo: <https://app.ai-manus.co
 
 Blog: [Rebuild Manus with WebUI and Sandbox](https://simpleyyt.com/2026/03/07/rebuild-manus-with-webui-and-sandbox/)
 
-Join our community: [QQ Group (1005477581)](https://qun.qq.com/universal-share/share?ac=1&authKey=p4X3Da5iMpR4liAenxwvhs7IValPKiCFtUevRlJouz9qSTSZsMnPJc3hzsJjgQYv&busi_data=eyJncm91cENvZGUiOiIxMDA1NDc3NTgxIiwidG9rZW4iOiJNZmUrTmQ0UzNDZDNqNDFVdjVPS1VCRkJGRWVlV0R3RFJSRVFoZDAwRjFDeUdUM0t6aUIyczlVdzRjV1BYN09IIiwidWluIjoiMzQyMjExODE1In0%3D&data=C3B-E6BlEbailV32co77iXL5vxPIhtD9y_itWLSq50hKqosO_55_isOZym2Faaq4hs9-517tUY8GSWaDwPom-A&svctype=4&tempid=h5_group_info)
-
 ---
 
-AI Manus is a general-purpose AI Agent system that can be fully privately deployed and supports running various tools and operations in a sandbox environment. Now with deep **Claw** integration (powered by [OpenClaw](https://github.com/anthropics/openclaw)), delivering the Manus × Claw experience: one-click AI assistant deployment, persistent per-user isolated containers, optional expiry policies, and full chat history.
+AI Manus is a general-purpose AI Agent system that can be fully privately deployed and supports running various tools and operations in a sandbox environment.
 
 The goal of AI Manus project is to become a fully privately deployable enterprise-level Manus application. Vertical Manus applications have many repetitive engineering tasks, and this project hopes to unify this part, allowing everyone to build vertical Manus applications like building blocks.
 
@@ -20,15 +18,16 @@ Each service and tool in AI Manus includes a Built-in version that can be fully 
 
 ## Basic Features
 
-[](https://github.com/user-attachments/assets/37060a09-c647-4bcb-920c-959f7fa73ebe ':include :type=video controls width="100%"')
+[](https://github.com/user-attachments/assets/89e0da0f-789f-464f-8648-49eb5035fe2f ':include :type=video controls width="100%"')
 
 ## Core Features
 
  * **Deployment:** Only requires one LLM service for deployment, no dependency on other external services.
  * **Agent loop:** Plan-and-execute with composable system prompts and native structured output tools (`create_plan` / `complete_step`, etc.).
  * **Tools:** Supports Terminal, Browser, File, Web Search, message tools, with real-time viewing and takeover capabilities, and supports external MCP tool integration.
- * **Claw:** Integrated [OpenClaw](https://github.com/anthropics/openclaw) AI assistant with one-click deployment, persistent per-user isolated containers, optional expiry policies, and full chat history.
- * **Sandbox:** Each task gets an isolated sandbox using local Docker or optional [Alibaba Cloud Wuying AgentBay](agentbay.md).
+ * **Skills:** Reusable skill packages (official catalog / upload / GitHub import). Manage under Settings → Features → Skills; invoke with `/` or `+` → Use skills; chat history keeps skill chips with hover tooltips. Agent loads via progressive `load_skill` and syncs packages into the sandbox. See [Skills](skills.md).
+
+ * **Sandbox:** Each Task is allocated a separate sandbox that runs in a local Docker environment.
  * **Task Sessions:** Manages session history through Mongo/Redis, supports background tasks.
  * **Library:** The sidebar Library page aggregates attachments and artifacts across the user's sessions, with type filters, search, per-file favorites, preview, and navigation back to the source task.
  * **Conversations:** Supports stopping and interruption, supports file upload and download.

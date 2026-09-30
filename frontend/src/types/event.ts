@@ -53,18 +53,24 @@ export interface ToolEventData extends BaseEventData {
   function: string;
   args: {[key: string]: any};
   content?: any;
+  /** Official StandardToolUsed timeline label (NL action), not file path. */
+  brief?: string | null;
 }
 
 export interface StepEventData extends BaseEventData {
   status: "pending" | "running" | "completed" | "failed"
   id: string
   description: string
+  /** Present when the step finished with a concrete outcome. */
+  result?: string
 }
 
 export interface MessageEventData extends BaseEventData {
   content: string;
   role: "user" | "assistant";
   attachments: FileInfo[];
+  /** Skill chips invoked with this user turn (composer → chat detail). */
+  required_skills?: { id: string; name: string }[];
 }
 
 export interface ErrorEventData extends BaseEventData {

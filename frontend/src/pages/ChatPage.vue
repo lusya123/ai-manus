@@ -164,8 +164,9 @@
           <ChatMessage v-for="(message, index) in messages" :key="index" :message="message"
             :hideHeader="isConsecutiveAssistant(messages, index)"
             :showLiteBadge="taskMode === 'chat'"
-            :showCopyActions="shouldShowAssistantCopyActions(index)"
+            :showCopyActions="shouldShowAssistantCopyActionsAt(index)"
             :isLastBeforeUser="isAssistantLastBeforeUser(index)"
+            :step-connects-to-next="isStepConnectedToNext(messages, index)"
             @toolClick="handleToolClick" />
           <ChatWaitingContinue
             :visible="showWaitingContinue"
@@ -173,9 +174,9 @@
           <ChatTaskCompleted
             :visible="showTaskCompleted"
             :copy-text="lastAssistantPlainText" />
-          <!-- AgentIsTyping: only fill the empty gap before first visible turn output -->
-          <LoadingIndicator v-if="showThinking" :text="$t('{name} is thinking', { name: 'Manus' })" />
-          <!-- Official running spacer when work is already visible (tools/steps/messages) -->
+          <!-- AgentIsTyping / LiveStatus gap: busy with no live step/tool indicator -->
+          <LoadingIndicator v-if="showThinking" :text="$t('Thinking')" />
+          <!-- Official running spacer when a step/tool already shows progress -->
           <div v-else-if="isBusy" aria-hidden="true" class="h-5 invisible" />
         </div>
 
@@ -188,9 +189,7 @@
             :visible="showTakeControlBanner"
             @takeControl="handleTakeControl" />
           <ChatBox v-model="inputMessage" v-model:attachments="attachments" :rows="1" dense @submit="handleSubmit"
-            :isRunning="isBusy" :isStopping="isStopping" @stop="handleStop" :placeholder="chatPlaceholder"
-            :selected-model-id="selectedModelId" :model-options="modelOptions" show-model-picker
-            model-picker-disabled />
+            :isRunning="isBusy" :isStopping="isStopping" @stop="handleStop" :placeholder="chatPlaceholder" />
         </div>
       </div>
     </div>
@@ -213,11 +212,12 @@ import ChatTaskCompleted from '../components/ChatTaskCompleted.vue';
 import ChatWaitingContinue from '../components/ChatWaitingContinue.vue';
 import TakeControlBanner from '../components/TakeControlBanner.vue';
 import * as agentApi from '../api/agent';
-import { ChatSubmissionError, createChatSubmissionId } from '../api/chatWs';
-import { Message, MessageContent, ToolContent, StepContent, isConsecutiveAssistant } from '../types/message';
+import { Message, MessageContent, ToolContent, StepContent, isConsecutiveAssistant, shouldShowAssistantCopyActions, isAssistantLastBeforeUser as isAssistantLastBeforeUserMsg, isStepConnectedToNext } from '../types/message';
 import { PlanEventData, AgentEvent, type TerminalUpdateEventData, type FileUpdateEventData } from '../types/event';
 import { useAgentEvents } from '../composables/useAgentEvents';
 import { useSessionPhase } from '../composables/useSessionPhase';
+import { ChatSubmissionError, createChatSubmissionId } from '../api/chatWs';
+import { isComputerPanelTool } from '../constants/tool';
 import ComputerPanel from '../components/ComputerPanel.vue'
 import { ArrowDown, FileSearch, Lock, Globe, Link, Check, Ellipsis, Pencil, Star, Trash, FolderPlus, Folder, FolderSync, Pin, ChevronDown, CircleHelp, Monitor } from 'lucide-vue-next';
 import ShareIcon from '@/components/icons/ShareIcon.vue';
@@ -226,22 +226,13 @@ import type { FileInfo } from '../api/file';
 import { useSessionFileList } from '../composables/useSessionFileList'
 import { useFilePreviewer } from '../composables/useFilePreviewer'
 import { copyToClipboard } from '../utils/dom'
-import { SessionStatus, type ProjectItem, type SessionModelConfig } from '../types/response';
+import { SessionStatus, type ProjectItem } from '../types/response';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import LoadingIndicator from '@/components/ui/LoadingIndicator.vue';
 import { useContextMenu, createMenuItem, createDangerMenuItem, createSeparator, createSubmenuItem } from '../composables/useContextMenu';
 import { useDialog } from '../composables/useDialog';
 import { getProjects, createProject } from '../api/project';
 import { eventBus } from '../utils/eventBus';
-import { getCachedClientConfig } from '@/api/config';
-import {
-  buildChatModelOptions,
-  CURRENT_SESSION_MODEL_ID,
-  resolveModelIdForConfig,
-  SYSTEM_MODEL_ID,
-  upsertCurrentSessionModelOption,
-} from '@/api/agentConfig';
-import type { ChatModelOption } from '@/api/agentConfig';
 import { selectPreferredWorkspaceTool } from '@/utils/workspaceTool';
 
 const router = useRouter()
@@ -254,21 +245,6 @@ const isFavorite = ref(false);
 const isPinned = ref(false);
 const projectId = ref<string | null>(null);
 const taskMode = ref<'agent' | 'chat'>('agent');
-const modelOptions = ref<ChatModelOption[]>([]);
-const selectedModelId = ref(SYSTEM_MODEL_ID);
-
-const loadModelOptions = async () => {
-  modelOptions.value = buildChatModelOptions(await getCachedClientConfig());
-};
-
-const syncSelectedSessionModel = (modelConfig?: SessionModelConfig | null) => {
-  const nextModelId = resolveModelIdForConfig(modelConfig, modelOptions.value);
-  modelOptions.value = upsertCurrentSessionModelOption(
-    modelOptions.value,
-    nextModelId === CURRENT_SESSION_MODEL_ID ? modelConfig : null,
-  );
-  selectedModelId.value = nextModelId;
-};
 
 // Create initial state factory
 const createInitialState = () => ({
@@ -288,8 +264,8 @@ const createInitialState = () => ({
   attachments: [] as FileInfo[],
   shareMode: 'private' as 'private' | 'public', // Default to private mode
   linkCopied: false,
-  sharingLoading: false, // Loading state for share operations
-  isStopping: false,
+  sharingLoading: false,
+  isStopping: false // Loading state for share operations
 });
 
 // Create reactive state
@@ -313,7 +289,7 @@ const {
   shareMode,
   linkCopied,
   sharingLoading,
-  isStopping,
+  isStopping
 } = toRefs(state);
 
 const {
@@ -349,9 +325,9 @@ const toggleModeMenu = () => {
   showModeMenu.value = !showModeMenu.value;
 };
 
-const collectToolHistory = (source: Message[]) => {
+const toolHistory = computed(() => {
   const tools: ToolContent[] = [];
-  for (const message of source) {
+  for (const message of messages.value) {
     if (message.type === 'tool') {
       tools.push(message.content as ToolContent);
     } else if (message.type === 'step') {
@@ -360,11 +336,8 @@ const collectToolHistory = (source: Message[]) => {
     }
   }
   return tools;
-};
+});
 
-const toolHistory = computed(() => collectToolHistory(messages.value));
-
-/** Tools after the latest user message; legacy histories without one use all. */
 const currentTurnToolHistory = computed(() => {
   let latestUserIndex = -1;
   for (let index = messages.value.length - 1; index >= 0; index -= 1) {
@@ -376,7 +349,12 @@ const currentTurnToolHistory = computed(() => {
   const source = latestUserIndex >= 0
     ? messages.value.slice(latestUserIndex + 1)
     : messages.value;
-  return collectToolHistory(source);
+  const tools: ToolContent[] = [];
+  for (const message of source) {
+    if (message.type === 'tool') tools.push(message.content as ToolContent);
+    else if (message.type === 'step') tools.push(...((message.content as StepContent).tools ?? []));
+  }
+  return tools;
 });
 
 const preferredWorkspaceTool = computed(() => selectPreferredWorkspaceTool(
@@ -434,41 +412,25 @@ const lastAssistantPlainText = computed(() => {
 });
 
 /**
- * Official ChatReplyActions: show Copy under assistant replies that are not the
- * live last message (TaskCompleted footer owns copy when task is done).
+ * Official ChatReplyActions: last reply owned by TaskCompleted / WaitingContinue
+ * (or hidden while live). Earlier assistant replies keep inline Copy.
  */
-const shouldShowAssistantCopyActions = (index: number) => {
-  const m = messages.value[index];
-  if (m?.type !== 'assistant') return false;
-  if (!((m.content as MessageContent).content || '').trim()) return false;
-  if (isBusy.value || phase.value === 'running' || phase.value === 'pending') {
-    return index !== lastAssistantIndex.value;
-  }
-  if (showTaskCompleted.value || showWaitingContinue.value) {
-    return index !== lastAssistantIndex.value;
-  }
-  return true;
-};
+const shouldShowAssistantCopyActionsAt = (index: number) =>
+  shouldShowAssistantCopyActions(messages.value, index, lastAssistantIndex.value, {
+    footerOwnsLastCopy: showTaskCompleted.value || showWaitingContinue.value,
+    hideLastWhileBusy:
+      isBusy.value || phase.value === 'running' || phase.value === 'pending',
+  });
 
-const isAssistantLastBeforeUser = (index: number) => {
-  if (messages.value[index]?.type !== 'assistant') return false;
-  for (let i = index + 1; i < messages.value.length; i++) {
-    const t = messages.value[i].type;
-    if (t === 'user') return true;
-    if (t === 'assistant') return false;
-  }
-  return false;
-};
+const isAssistantLastBeforeUser = (index: number) =>
+  isAssistantLastBeforeUserMsg(messages.value, index);
 
 // Shared agent event -> message list conversion
-const { handleEvent: handleAgentEvent, resetEventHistory } = useAgentEvents(
+const { handleEvent: handleAgentEvent } = useAgentEvents(
   { messages, title, plan, lastEventId, lastTool, lastNoMessageTool },
   {
     onToolActivity: (tool: ToolContent) => {
       if (realTime.value) {
-        // Legacy localhost navigation is a history-reopen fallback only. In
-        // the live stream it could hide a newer browser/file action. Genuine
-        // preview_show tools remain pinned for the current user turn.
         const workspaceTool = selectPreferredWorkspaceTool(
           currentTurnToolHistory.value,
           tool,
@@ -485,7 +447,11 @@ const { handleEvent: handleAgentEvent, resetEventHistory } = useAgentEvents(
 
 const handleEvent = (event: AgentEvent) => {
   handleAgentEvent(event);
-  // Live phase authority is status_update only (backend-status-channel design).
+  // Live phase authority is status_update; wait is a belt-and-suspenders cue
+  // so the footer can appear even if the trailing status_update races.
+  if (event.event === 'wait') {
+    noteDomainEvent('wait');
+  }
 };
 
 // Reset all refs to their initial values
@@ -499,7 +465,6 @@ const resetState = () => {
   if (prevSessionId) {
     void agentApi.leaveChatSession(prevSessionId);
   }
-  resetEventHistory();
 
   // Reset reactive state to initial values
   Object.assign(state, createInitialState());
@@ -604,12 +569,12 @@ const reconcileSessionPhase = async (targetSessionId: string) => {
   }
 };
 
-const handleSubmit = () => {
+const handleSubmit = (requiredSkills: agentApi.RequiredSkillRef[] = []) => {
   if (isBusy.value || isStopping.value) return;
-  void chat(inputMessage.value, attachments.value);
+  void chat(inputMessage.value, attachments.value, requiredSkills);
 }
 
-const chat = async (message: string = '', files: FileInfo[] = []) => {
+const chat = async (message: string = '', files: FileInfo[] = [], requiredSkills: agentApi.RequiredSkillRef[] = []) => {
   const targetSessionId = sessionId.value;
   if (!targetSessionId || isStopping.value) return;
 
@@ -627,6 +592,7 @@ const chat = async (message: string = '', files: FileInfo[] = []) => {
         content: message,
         timestamp: Math.floor(Date.now() / 1000),
         attachments: files.length > 0 ? files : undefined,
+        required_skills: requiredSkills.length > 0 ? requiredSkills : undefined,
       } as MessageContent,
     });
   }
@@ -658,6 +624,7 @@ const chat = async (message: string = '', files: FileInfo[] = []) => {
         },
       },
       submissionId,
+      requiredSkills,
     );
     if (sessionId.value !== targetSessionId) {
       cancel();
@@ -763,15 +730,13 @@ const applySessionMeta = (session: Awaited<ReturnType<typeof agentApi.getSession
   isPinned.value = !!session.is_pinned;
   projectId.value = session.project_id ?? null;
   taskMode.value = session.task_mode === 'chat' ? 'chat' : 'agent';
-  syncSelectedSessionModel(session.model_config);
 };
 
 // Initialize active conversation
-onMounted(async () => {
+onMounted(() => {
   document.addEventListener('mousedown', handleModeMenuOutside);
   window.addEventListener('scroll', handleModeMenuScroll, true);
   hideFilePreviewer();
-  await loadModelOptions();
   const routeParams = router.currentRoute.value.params;
   if (routeParams.sessionId) {
     // If sessionId is included in URL, use it directly
@@ -779,6 +744,7 @@ onMounted(async () => {
     // Get initial message / mode from history.state (HomePage → new chat)
     const message = history.state?.message as string | undefined;
     const files = history.state?.files as FileInfo[] | undefined;
+    const requiredSkills = history.state?.requiredSkills as agentApi.RequiredSkillRef[] | undefined;
     const seededMode = history.state?.taskMode as 'agent' | 'chat' | undefined;
     history.replaceState({}, document.title);
     if (seededMode === 'chat' || seededMode === 'agent') {
@@ -794,7 +760,7 @@ onMounted(async () => {
         } catch (e) {
           console.error('Failed to load session meta before initial chat', e);
         }
-        await chat(message || '', files || []);
+        await chat(message || '', files || [], requiredSkills || []);
       })();
     } else {
       restoreSession();
@@ -834,6 +800,9 @@ const isLiveTool = (tool: ToolContent) => {
 }
 
 const handleToolClick = (tool: ToolContent) => {
+  if (!isComputerPanelTool(tool.name)) {
+    return;
+  }
   realTime.value = false;
   if (sessionId.value) {
     computerPanel.value?.showComputerPanel(tool, isLiveTool(tool));

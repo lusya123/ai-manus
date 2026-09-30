@@ -9,7 +9,7 @@
 1. Web sends a create Agent request to Server, Server creates Sandbox through `/var/run/docker.sock` and returns session ID.
 2. Sandbox is an Ubuntu Docker environment that starts Chrome browser and API services for File/Shell and other tools.
 3. Web sends user messages to the session ID, Server receives user messages and forwards them to PlanAct Agent for processing.
-4. PlanAct Agent plans and executes steps: the planner/executor submit structured results through native tool calls (e.g. `create_plan` / `complete_step`), and invoke sandbox tools (Shell / Browser / File / Search / MCP) as needed.
+4. PlanAct Agent plans and executes steps: the planner/executor submit structured results through native tool calls (e.g. `create_plan` / `complete_step`), and invoke sandbox tools (Shell / Browser / File / Search / MCP) and skill tools (`load_skill`) as needed.
 5. All events generated during Agent processing flow through Redis queues and are pushed back to the Web over WebSocket (`/api/v1/ws/chat` with `join_session` / `leave_session`); session-list updates use `/api/v1/ws/sessions`.
 
 **When users browse tools:**
@@ -19,23 +19,21 @@
     2. Web's NoVNC component connects via Server `/api/v1/ws/vnc/{session_id}` (Cookie / Bearer) and forwards to the Sandbox, enabling browser viewing.
 - Other tools: Other tools work on similar principles.
 
-### Docker Network Boundary
+## Skills
 
-- `manus-network` is the runtime network for Frontend, Backend, and Sandbox/Claw containers that execute user/model-driven code.
-- `manus-data-network` is an `internal` data network used only by Backend, MongoDB, and Redis.
-- Backend is the sole application service attached to both networks. Sandbox and Claw must never join the data network, preventing arbitrary shell/tool code from bypassing Backend to read or mutate users, sessions, revocation state, or task state.
+Skills are reusable workflow packages (`SKILL.md` plus optional assets). Users add/enable them under **Settings → Features → Skills**, and invoke them in chat with `/`, composer **`+` → Use skills**, or skill chips. Sends attach `required_skills`; history renders chips with hover tooltips.
 
-## Claw (Manus × Claw)
+**Runtime layers (Agent mode):**
 
-Claw is AI Manus's deeply integrated [OpenClaw](https://github.com/anthropics/openclaw) AI assistant module, delivering the **Manus × Claw** experience as a standalone chat interface.
+1. **L1:** Enabled skill names/descriptions go into the system prompt (and the `<available_skills>` catalog inside the `load_skill` tool description).
+2. **Soft L2:** After an explicit invocation, inject an `<active_skill>` activation marker (no body); require `load_skill` first. The plan’s first step is corrected to `Load {name} skill`.
+3. **Hard L2:** Full `SKILL.md` enters context only via the `load_skill` tool result.
+4. **L3:** Enabled packages are written into the sandbox at `/home/ubuntu/skills/{name}/` (not a Docker volume mount — synced via the sandbox `file_write` API; see [Skills](skills.md#sandbox-path-mapping-l3)).
 
-**Architecture Overview:**
+User flows, package format, and HTTP APIs: [Skills](skills.md).
 
-- **claw/ container image:** Built on the digest-pinned OpenClaw `2026.7.1-2` image, includes the `manus-claw` Node plugin, and runs the OpenClaw Gateway; containers are persistent by default and TTL is an explicit optional policy.
-- **Backend integration:** Server dynamically creates per-user Claw Docker containers (or connects to a fixed dev instance), manages state in the MongoDB `claws` collection, merges MongoDB history with OpenClaw `.jsonl` session files, and exposes REST + WebSocket + file upload/resolve + OpenAI-compatible LLM proxy endpoints.
-- **Frontend integration:** When `claw_enabled` is turned on, a "Manus Claw" entry appears in the sidebar, routing to the `/chat/claw` page with real-time chat over WebSocket.
-- **manus-claw plugin:** Bridges the OpenClaw Gateway with the Manus backend, providing an HTTP server, the `manus_upload_file` tool, file resolution, and session history reads.
 ## Library
+
 
 Library is a dedicated sidebar page (route `/library`) for browsing files the current user uploaded or produced across task sessions.
 

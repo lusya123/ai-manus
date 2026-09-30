@@ -22,13 +22,8 @@ INSECURE_JWT_SECRETS = {
 # as one backend-owned contract so the UI cannot advertise unsupported values.
 SUPPORTED_BYOK_PROVIDERS = ("openai", "anthropic", "deepseek", "ollama")
 
-# MongoDB rejects documents larger than 16 MiB.  Claw chat messages are
-# embedded in the same aggregate as lifecycle metadata, so history must leave
-# meaningful headroom for the rest of that document and BSON array overhead.
-CLAW_HISTORY_DEFAULT_MAX_BYTES = 8 * 1024 * 1024
-CLAW_HISTORY_SAFE_MAX_BYTES = 12 * 1024 * 1024
 # Session documents also embed canonical file metadata, so their event
-# projection needs more headroom than the Claw-only lifecycle aggregate.
+# projection needs more headroom than a small lifecycle aggregate.
 # Complete durable turn replay lives in the separate turn-output collection;
 # this embedded history is intentionally only a recent, bounded projection.
 SESSION_HISTORY_DEFAULT_MAX_BYTES = 6 * 1024 * 1024
@@ -172,7 +167,7 @@ class Settings(BaseSettings):
     sandbox_memory_limit: str | None = "2g"
     sandbox_cpu_limit: float | None = Field(default=2.0, gt=0)
     sandbox_pids_limit: int | None = Field(default=512, ge=32)
-    # Managed Docker sandbox/Claw containers are hostile execution domains.
+    # Managed Docker sandbox containers are hostile execution domains.
     # Give every runtime an internal control bridge plus a one-container egress
     # bridge; only trusted backend/worker clients join the control bridge.
     # Dynamic Docker runtimes require this durable provider-visible intent.
@@ -224,8 +219,6 @@ class Settings(BaseSettings):
     backend_internal_url: str | None = None
     frontend_sandbox_url: str | None = None
     backend_sandbox_url: str | None = None
-    claw_public_url: str | None = None
-    claw_internal_url: str | None = None
     host_gateway_url: str | None = None
     # Comma-separated exact browser origins. Wildcards are intentionally not
     # accepted because localhost deployments can otherwise be driven by any
@@ -233,7 +226,7 @@ class Settings(BaseSettings):
     cors_allowed_origins: str | None = None
     
     # Search engine configuration
-    search_provider: str | None = "bing_web"  # "anthropic_web", "baidu", "baidu_web", "google", "bing", "bing_web", "tavily", "serper", "custom"
+    search_provider: str | None = "bing_web"  # "anthropic_web", "baidu", "baidu_web", "google", "bing", "bing_web", "tavily", "serper", "youcom", "custom"
     bing_web_market: str = "en-US"
     bing_web_setlang: str = "en"
     anthropic_web_search_api_base: str | None = None
@@ -245,6 +238,7 @@ class Settings(BaseSettings):
     tavily_api_key: str | None = None
     # Serper.dev search configuration (SEARCH_PROVIDER=serper)
     serper_api_key: str | None = None
+    youcom_api_key: str | None = None
     # Custom search API configuration (SEARCH_PROVIDER=custom)
     search_api_url: str | None = None
     search_api_key: str | None = None
@@ -320,77 +314,6 @@ class Settings(BaseSettings):
     # Extra headers for LLM requests (parsed from EXTRA_HEADERS env var, JSON)
     extra_headers: dict | None = None
     
-    # Claw (OpenClaw) configuration
-    claw_enabled: bool = False
-    claw_image: str = "simpleyyt/manus-claw"
-    claw_name_prefix: str = "manus-claw"
-    claw_ttl_seconds: int = 0
-    claw_network: str | None = None  # Docker network bridge name for claw containers
-    claw_ready_timeout: int = 300  # Max seconds to wait for claw container to become ready
-    claw_address: str | None = None  # If set, use this fixed host instead of creating Docker containers
-    # Bootstrap key injected into a fixed development Claw runtime.  It is
-    # accepted only when the matching owned Claw record is RUNNING; it is not a
-    # process-wide proxy bypass and is never returned by the user-facing API.
-    claw_api_key: str | None = None
-    # Comma-separated current,previous... HMAC secrets for durable runtime-key
-    # digests.  The first key signs new/rotated records; previous keys permit
-    # online verification and lazy rehash during secret rotation.
-    claw_api_key_hmac_keys: str | None = None
-    manus_api_base_url: str = "http://backend:8000"  # URL of this backend accessible from claw containers
-    claw_publish_host_ports: bool = True
-    claw_host_bind_address: str = "127.0.0.1"
-    claw_http_container_port: int = 18788
-    claw_gateway_container_port: int = 18789
-    claw_max_instances_total: int = 20
-    claw_idle_timeout_seconds: int = 0
-    claw_cleanup_interval_seconds: int = 60
-    # Opt-out applies only to externally managed CLAW_ADDRESS runtimes.
-    # Docker-created runtimes are always destroyed before ownership is deleted.
-    claw_destroy_on_delete: bool = True
-    claw_memory_limit: str | None = "1g"
-    claw_nano_cpus: int | None = 1_000_000_000
-    claw_pids_limit: int | None = 256
-    # Cost/abuse limits for the Claw-only OpenAI-compatible model proxy.
-    claw_proxy_max_input_bytes: int = 128 * 1024
-    claw_proxy_requests_per_minute: int = 30
-    claw_proxy_max_concurrent_requests: int = 2
-    claw_proxy_request_lease_seconds: int = 300
-    # Distributed ownership lease for one in-flight Claw chat turn.  The
-    # application renews it while streaming, so the value is only the
-    # fail-safe window after a crashed replica.
-    claw_chat_turn_lease_seconds: int = 300
-    claw_chat_max_message_bytes: int = 64 * 1024
-    # Bound both the in-memory stream and the assistant message persisted in
-    # the embedded Claw history document.
-    claw_chat_max_response_bytes: int = Field(default=256 * 1024, ge=1)
-    # A read timeout is not a whole-turn deadline: an upstream can otherwise
-    # keep a response alive forever with periodic keepalives.
-    claw_chat_max_duration_seconds: float = Field(default=300.0, gt=0)
-    # Enforce raw SSE limits before decoding/JSON parsing.  The stream limit
-    # includes framing and non-text events in addition to visible model text.
-    claw_chat_max_upstream_event_bytes: int = Field(
-        default=512 * 1024, ge=1
-    )
-    claw_chat_max_upstream_stream_bytes: int = Field(
-        default=2 * 1024 * 1024, ge=1
-    )
-    # Per-WebSocket subscriber memory budget.  Slow subscribers retain the
-    # latest turn only and always receive that turn's terminal event.
-    claw_event_queue_max_bytes: int = Field(default=512 * 1024, ge=1024)
-    claw_chat_max_attachments: int = 10
-    claw_chat_max_attachment_bytes: int = 25 * 1024 * 1024
-    claw_chat_max_total_attachment_bytes: int = 50 * 1024 * 1024
-    claw_upload_max_bytes: int = 25 * 1024 * 1024
-    # One atomic Mongo update retains the newest records satisfying both the
-    # count and aggregate BSON-byte budgets.  The byte ceiling deliberately
-    # stays below MongoDB's 16 MiB document limit to leave room for lifecycle
-    # fields and array/document overhead.
-    claw_history_max_messages: int = Field(default=128, ge=1, le=128)
-    claw_history_max_bytes: int = Field(
-        default=CLAW_HISTORY_DEFAULT_MAX_BYTES,
-        ge=1,
-        le=CLAW_HISTORY_SAFE_MAX_BYTES,
-    )
     # Total HTTP body cap enforced before FastAPI parses multipart uploads.
     # The extra MiB above the default per-file cap covers multipart metadata.
     multipart_upload_max_body_bytes: int = 26 * 1024 * 1024
@@ -454,17 +377,6 @@ class Settings(BaseSettings):
         
     def validate(self):
         """Validate configuration settings"""
-        largest_claw_history_record = max(
-            int(self.claw_chat_max_message_bytes),
-            int(self.claw_chat_max_response_bytes),
-            int(self.claw_chat_max_upstream_event_bytes),
-            int(self.claw_chat_max_upstream_stream_bytes),
-        )
-        if self.claw_history_max_bytes < largest_claw_history_record + 4096:
-            raise ValueError(
-                "CLAW_HISTORY_MAX_BYTES must exceed every permitted Claw "
-                "message/response record by at least 4096 bytes"
-            )
         if self.session_history_max_bytes < self.session_event_max_bytes + 4096:
             raise ValueError(
                 "SESSION_HISTORY_MAX_BYTES must exceed "
@@ -521,14 +433,13 @@ class Settings(BaseSettings):
         dynamic_docker_sandbox = (
             sandbox_provider == "docker" and not self.sandbox_address
         )
-        dynamic_docker_claw = self.claw_enabled and not self.claw_address
         if (
             not self.runtime_network_isolation
-            and (dynamic_docker_sandbox or dynamic_docker_claw)
+            and dynamic_docker_sandbox
         ):
             raise ValueError(
                 "RUNTIME_NETWORK_ISOLATION=false is unsupported for dynamic "
-                "Docker Sandbox or Claw runtimes; use fixed runtime addresses "
+                "Docker Sandbox runtimes; use a fixed runtime address "
                 "or enable isolated runtime networks"
             )
         if sandbox_provider == "agentbay":
@@ -593,30 +504,6 @@ class Settings(BaseSettings):
                 "LOCAL_AUTH_PASSWORD must be changed from the development "
                 "default outside local/test/development environments"
             )
-
-        if (
-            self.claw_enabled
-            and self.claw_address
-            and auth_provider not in {"none", "local"}
-        ):
-            raise ValueError(
-                "CLAW_ADDRESS is a shared fixed runtime and is supported only "
-                "with single-user AUTH_PROVIDER=none/local"
-            )
-
-        if self.claw_api_key_hmac_keys:
-            hmac_keys = [
-                part.strip()
-                for part in self.claw_api_key_hmac_keys.split(",")
-                if part.strip()
-            ]
-            if not hmac_keys or any(
-                len(key.encode("utf-8")) < 32 for key in hmac_keys
-            ):
-                raise ValueError(
-                    "Every CLAW_API_KEY_HMAC_KEYS entry must be at least "
-                    "32 bytes"
-                )
 
         # Parse eagerly so malformed/wildcard browser trust cannot survive to
         # application startup.

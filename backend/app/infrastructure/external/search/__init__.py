@@ -37,6 +37,7 @@ def get_search_engine() -> Optional[SearchEngine]:
     from app.infrastructure.external.search.bing_web_search import BingWebSearchEngine
     from app.infrastructure.external.search.tavily_search import TavilySearchEngine
     from app.infrastructure.external.search.serper_search import SerperSearchEngine
+    from app.infrastructure.external.search.youcom_search import YouComSearchEngine
     from app.infrastructure.external.search.custom_search import CustomSearchEngine
 
     settings = get_settings()
@@ -119,6 +120,12 @@ def get_search_engine() -> Optional[SearchEngine]:
             return SerperSearchEngine(api_key=settings.serper_api_key)
         else:
             logger.warning("Serper Search Engine not initialized: missing API key (SERPER_API_KEY)")
+    elif settings.search_provider == "youcom":
+        if settings.youcom_api_key:
+            logger.info("Initializing You.com Search Engine")
+            return YouComSearchEngine(api_key=settings.youcom_api_key)
+        else:
+            logger.warning("You.com Search Engine not initialized: missing API key (YOUCOM_API_KEY)")
     elif settings.search_provider == "custom":
         if settings.search_api_url:
             logger.info("Initializing Custom Search Engine")

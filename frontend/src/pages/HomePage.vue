@@ -76,7 +76,7 @@
           <div class="flex flex-col w-full bg-[var(--background-gray-main)]">
             <div class="[&amp;:not(:empty)]:pb-2 bg-[var(--background-gray-main)] rounded-[22px_22px_0px_0px]">
             </div>
-            <ChatBox :rows="2" v-model="message" v-model:attachments="attachments"
+            <ChatBox ref="chatBoxRef" :rows="2" v-model="message" v-model:attachments="attachments"
               :selected-model-id="selectedModelId" :model-options="modelOptions" show-model-picker
               @update:selectedModelId="handleModelChange" @submit="handleSubmit" :isRunning="false" />
           </div>
@@ -110,7 +110,7 @@
 
 <script setup lang="ts">
 import SimpleBar from '../components/SimpleBar.vue';
-import { ref, onMounted, onUnmounted, computed } from 'vue';
+import { ref, onMounted, onUnmounted, computed, watch, nextTick } from 'vue';
 import { useRouter } from 'vue-router';
 import { useI18n } from 'vue-i18n';
 import ChatBox from '../components/ChatBox.vue';
@@ -124,6 +124,7 @@ import type { Component } from 'vue';
 import type { FileInfo } from '../api/file';
 import { useFilePreviewer } from '../composables/useFilePreviewer';
 import { useAuth } from '../composables/useAuth';
+import { consumePendingHomeDraft, pendingHomeDraft } from '../composables/usePendingHomeMessage';
 import { getCachedClientConfig } from '../api/config';
 import {
   AGENT_CONFIG_CHANGED_EVENT,
@@ -140,6 +141,7 @@ const router = useRouter();
 const message = ref('');
 const isSubmitting = ref(false);
 const attachments = ref<FileInfo[]>([]);
+const chatBoxRef = ref<InstanceType<typeof ChatBox> | null>(null);
 const { hideFilePreviewer } = useFilePreviewer();
 const { currentUser } = useAuth();
 const showGithubButton = ref(false);
@@ -218,8 +220,20 @@ const handleSuggestionClick = (suggestion: Suggestion) => {
   message.value = t(suggestion.label);
 };
 
+const applyPendingHomeDraft = async () => {
+  const draft = consumePendingHomeDraft();
+  if (!draft) return;
+  await nextTick();
+  chatBoxRef.value?.seedDraft(draft);
+};
+
+watch(pendingHomeDraft, (draft) => {
+  if (draft) void applyPendingHomeDraft();
+});
+
 onMounted(async () => {
   hideFilePreviewer();
+  await applyPendingHomeDraft();
   document.addEventListener('mousedown', handleModeMenuOutside);
   window.addEventListener('scroll', handleModeMenuScroll, true);
   loadedClientConfig = await getCachedClientConfig();
@@ -243,7 +257,7 @@ const handleModelChange = (modelId: string) => {
   saveSelectedModelId(selectedModelId.value);
 };
 
-const handleSubmit = async () => {
+const handleSubmit = async (requiredSkills: { id: string; name: string }[] = []) => {
   if (message.value.trim() && !isSubmitting.value) {
     isSubmitting.value = true;
 
@@ -265,6 +279,7 @@ const handleSubmit = async () => {
           modelId: selectedModelId.value,
           message: message.value,
           taskMode: taskMode.value,
+          requiredSkills,
           files: attachments.value.map((file: FileInfo) => ({
             file_id: file.file_id,
             filename: file.filename,

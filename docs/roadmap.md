@@ -2,15 +2,6 @@
 
 > 持续迭代中：Deploy & Expose、多集群部署、企业级沙盒安全
 
-## Claw（Manus × Claw）
-
- * [x] 集成 [OpenClaw](https://github.com/anthropics/openclaw) AI 助手
- * [x] 一键部署、用户隔离容器
- * [x] 常驻容器与可选过期策略
- * [x] 完整聊天历史（MongoDB + OpenClaw 会话合并）
- * [x] 文件上传与下载
- * [x] OpenAI 兼容 LLM 代理
-
 ## 工具
 
  * [x] 支持浏览器接管
@@ -48,7 +39,6 @@
  * [x] 支持 Bing、Google、Tavily、Serper 等搜索提供商
  * [x] 支持 Celery 任务后端（`TASK_BACKEND=celery`）
  * [ ] 支持阿里云等文件存储提供商
- * [x] 支持阿里云无影 AgentBay 沙盒提供商
- * [ ] 支持 e2b 等更多沙盒提供商
+ * [ ] 支持 e2b 等沙盒提供商
  * [ ] 支持 mem0 记忆提供商
  * [ ] 沙盒企业级安全建设

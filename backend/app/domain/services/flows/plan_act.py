@@ -1,38 +1,41 @@
 import logging
-from app.domain.services.flows.base import BaseFlow
-from app.domain.models.message import Message
-from typing import AsyncGenerator, Optional
 from enum import Enum
+from typing import AsyncGenerator, Optional
+
+from app.domain.external.browser import Browser
+from app.domain.external.llm import LLM
+from app.domain.external.sandbox import Sandbox
+from app.domain.external.search import SearchEngine
 from app.domain.models.event import (
     BaseEvent,
+    DoneEvent,
+    MessageEvent,
     PlanEvent,
     PlanStatus,
-    MessageEvent,
-    DoneEvent,
     TitleEvent,
-    ErrorEvent,
+    WaitEvent,
 )
-from app.domain.models.plan import ExecutionStatus
-from app.domain.services.agents.planner import PlannerAgent
-from app.domain.services.agents.execution import ExecutionAgent
-from app.domain.external.sandbox import Sandbox
-from app.domain.external.browser import Browser
-from app.domain.external.search import SearchEngine
-from app.domain.external.llm import LLM
-from app.domain.repositories.agent_repository import AgentRepository
-from app.domain.repositories.session_repository import SessionRepository
-from app.domain.repositories.project_repository import ProjectRepository
+from app.domain.models.message import Message
+from app.domain.models.plan import ExecutionStatus, Step
 from app.domain.models.session import SessionStatus
-from app.domain.services.tools.mcp import MCPToolkit
-from app.domain.services.tools.shell import ShellToolkit
+from app.domain.repositories.agent_repository import AgentRepository
+from app.domain.repositories.project_repository import ProjectRepository
+from app.domain.repositories.session_repository import SessionRepository
+from app.domain.services.agents.execution import ExecutionAgent
+from app.domain.services.agents.planner import PlannerAgent
+from app.domain.services.flows.base import BaseFlow
+from app.domain.services.plan_progress import mark_first_step_running
+from app.domain.services.prompts.execution import can_skip_summarize
 from app.domain.services.tools.browser import BrowserToolkit
 from app.domain.services.tools.file import FileToolkit
+from app.domain.services.tools.mcp import MCPToolkit
 from app.domain.services.tools.message import MessageToolkit
 from app.domain.services.tools.search import SearchToolkit
-from app.domain.services.tools.preview import PreviewToolkit
-from app.domain.services.prompts.runtime import build_runtime_environment_prompt
+from app.domain.services.tools.shell import ShellToolkit
+from app.domain.services.tools.skill import SkillToolkit
 
 logger = logging.getLogger(__name__)
+
 
 class AgentStatus(str, Enum):
     IDLE = "idle"
@@ -42,7 +45,23 @@ class AgentStatus(str, Enum):
     COMPLETED = "completed"
     UPDATING = "updating"
 
+
+def step_needs_replan(step: Step) -> bool:
+    """Only failed / unsuccessful steps ask Planner to rewrite remaining work."""
+    if step.status == ExecutionStatus.FAILED:
+        return True
+    if step.status == ExecutionStatus.COMPLETED and step.success is False:
+        return True
+    return False
+
+
 class PlanActFlow(BaseFlow):
+    """Plan-Act state machine: Planner creates/updates plan; Executor runs one step at a time.
+
+    Successful steps are marked locally (no Planner round-trip). Planner.update_plan
+    runs only when the finished step failed or reported success=false.
+    """
+
     def __init__(
         self,
         agent_id: str,
@@ -64,213 +83,224 @@ class PlanActFlow(BaseFlow):
         self._llm = llm
         self.status = AgentStatus.IDLE
         self.plan = None
+        self._done = False
+        self._resume_waiting = False
 
+        self._skill_toolkit = SkillToolkit()
         tools = [
             ShellToolkit(sandbox),
             BrowserToolkit(browser),
             FileToolkit(sandbox),
-            PreviewToolkit(),
             MessageToolkit(),
-            mcp_tool
+            self._skill_toolkit,
+            mcp_tool,
         ]
-        
-        # Only add search tool when search_engine is not None
         if search_engine:
             tools.append(SearchToolkit(search_engine))
 
-        runtime_prompt = build_runtime_environment_prompt(sandbox)
-
-        # Planner receives only a compact capability overview; the executor
-        # receives the invocable schemas themselves.
         self.planner = PlannerAgent(
             agent_id=self._agent_id,
             agent_repository=self._repository,
             llm=self._llm,
             capability_toolkits=tools,
-            runtime_prompt=runtime_prompt,
         )
-        logger.debug(f"Created planner agent for Agent {self._agent_id}")
-            
         self.executor = ExecutionAgent(
             agent_id=self._agent_id,
             agent_repository=self._repository,
             llm=self._llm,
             tools=tools,
-            runtime_prompt=runtime_prompt,
         )
-        logger.debug(f"Created execution agent for Agent {self._agent_id}")
 
     async def _apply_project_instruction(self, project_id: Optional[str]) -> None:
         instruction: Optional[str] = None
-        project_repository = getattr(self, "_project_repository", None)
-        if project_id and project_repository:
-            project = await project_repository.find_by_id(project_id)
+        if project_id and self._project_repository:
+            project = await self._project_repository.find_by_id(project_id)
             if project and project.instruction:
                 instruction = project.instruction
-        for agent in (self.planner, self.executor):
-            set_instruction = getattr(agent, "set_project_instruction", None)
-            if callable(set_instruction):
-                set_instruction(instruction)
-            sync_prompt = getattr(agent, "sync_system_prompt", None)
-            if callable(sync_prompt) and hasattr(agent, "memory"):
-                await sync_prompt()
+        self.planner.set_project_instruction(instruction)
+        self.executor.set_project_instruction(instruction)
+
+    def set_skill_catalog(self, catalog: Optional[str]) -> None:
+        """Inject L1 skill metadata into planner and executor system prompts."""
+        self.planner.set_skill_catalog(catalog)
+        self.executor.set_skill_catalog(catalog)
+
+    def set_enabled_skills(
+        self,
+        skills: Optional[list[tuple[str, str]]] = None,
+        bodies: Optional[dict[str, str]] = None,
+    ) -> None:
+        """Refresh ``load_skill`` catalog + bodies from the user's enabled skills."""
+        self._skill_toolkit.set_skills(list(skills or []))
+        self._skill_toolkit.set_bodies(dict(bodies or {}))
+
+    async def _apply_skill_context(self, message: Message) -> None:
+        from app.domain.services.prompts.system import (
+            format_skill_context,
+            format_skill_planner_context,
+        )
+
+        if not message.skill:
+            self.planner.set_skill_context(None)
+            self.executor.set_skill_context(None)
+            return
+
+        # Planner: activation only — must schedule a first load_skill step.
+        # Executor: soft MUST call load_skill before other work.
+        self.planner.set_skill_context(
+            format_skill_planner_context(
+                name=message.skill.name,
+                task=message.message,
+            )
+        )
+        self.executor.set_skill_context(
+            format_skill_context(
+                name=message.skill.name,
+                task=message.message,
+            )
+        )
+
+    async def _sync_agent_prompts(self) -> None:
+        await self.planner.sync_system_prompt()
+        await self.executor.sync_system_prompt()
 
     async def run(
-        self,
-        message: Message,
-        resumes_waiting: Optional[bool] = None,
+        self, message: Message, resumes_waiting: Optional[bool] = None
     ) -> AsyncGenerator[BaseEvent, None]:
-
-        # TODO: move to task runner
+        self._done = False
         session = await self._session_repository.find_by_id(self._session_id)
         if not session:
             raise ValueError(f"Session {self._session_id} not found")
 
-        await self._apply_project_instruction(
-            getattr(session, "project_id", None)
-        )
+        await self._apply_project_instruction(session.project_id)
+        await self._apply_skill_context(message)
+        await self._sync_agent_prompts()
 
-        if resumes_waiting is not None:
-            # Durable workers receive the intent captured at acceptance time.
-            # Do not infer it from Session.status: the durable RUNNING
-            # projection is written immediately after the execution claim.
-            if resumes_waiting:
-                logger.debug(
-                    "Session %s is resuming a persisted WAITING turn",
-                    self._session_id,
-                )
-                await self.executor.roll_back(message)
-                await self.planner.roll_back(message)
-                self.status = AgentStatus.EXECUTING
-            else:
-                self.status = AgentStatus.PLANNING
+        if session.status != SessionStatus.PENDING:
+            await self.executor.roll_back(message)
+            await self.planner.roll_back(message)
+
+        self._resume_waiting = (
+            session.status == SessionStatus.WAITING
+            if resumes_waiting is None
+            else resumes_waiting
+        )
+        if self._resume_waiting:
+            self.status = AgentStatus.EXECUTING
+        elif session.status == SessionStatus.RUNNING:
+            self.status = AgentStatus.PLANNING
         else:
-            # Compatibility for legacy/non-durable callers that do not carry
-            # an explicit acceptance-time resume decision.
-            if session.status != SessionStatus.PENDING:
-                logger.debug(f"Session {self._session_id} is not in PENDING status, rolling back")
-                await self.executor.roll_back(message)
-                await self.planner.roll_back(message)
+            self.status = AgentStatus.IDLE
 
-            if session.status == SessionStatus.RUNNING:
-                logger.debug(f"Session {self._session_id} is in RUNNING status")
-                self.status = AgentStatus.PLANNING
-
-            if session.status == SessionStatus.WAITING:
-                logger.debug(f"Session {self._session_id} is in WAITING status")
-                self.status = AgentStatus.EXECUTING
-
-        await self._session_repository.update_status(self._session_id, SessionStatus.RUNNING)  
-        self.plan = session.get_last_plan()
-        zero_step_requires_summary = False
-
-        logger.info(
-            "Agent %s started processing message", self._agent_id
+        await self._session_repository.update_status(
+            self._session_id, SessionStatus.RUNNING
         )
+        self.plan = session.get_last_plan()
+
         step = None
         while True:
             if self.status == AgentStatus.IDLE:
-                logger.info(f"Agent {self._agent_id} state changed from {AgentStatus.IDLE} to {AgentStatus.PLANNING}")
                 self.status = AgentStatus.PLANNING
+
             elif self.status == AgentStatus.PLANNING:
-                # Create plan
-                logger.info(f"Agent {self._agent_id} started creating plan")
-                plan_created = False
-                planning_error_emitted = False
                 async for event in self.planner.create_plan(message):
                     if isinstance(event, PlanEvent) and event.status == PlanStatus.CREATED:
-                        plan_created = True
-                        self.plan = event.plan
-                        logger.info(f"Agent {self._agent_id} created plan successfully with {len(event.plan.steps)} steps")
-                        if event.plan.title and event.plan.title.strip():
-                            yield TitleEvent(title=event.plan.title)
-                    elif isinstance(event, ErrorEvent):
-                        planning_error_emitted = True
+                        plan = event.plan
+                        if message.skill and plan:
+                            from app.domain.services.skills.plan_steps import (
+                                ensure_skill_read_first_step,
+                            )
+
+                            ensure_skill_read_first_step(plan, message.skill.name)
+                        self.plan = (
+                            mark_first_step_running(plan)
+                            if plan and plan.steps
+                            else plan
+                        )
+                        event = PlanEvent(status=PlanStatus.CREATED, plan=self.plan)
+                        if self.plan.title and self.plan.title.strip():
+                            yield TitleEvent(title=self.plan.title)
+                        if self.plan.message and self.plan.message.strip():
+                            yield MessageEvent(
+                                role="assistant",
+                                message=self.plan.message,
+                            )
                     yield event
-                if not plan_created or self.plan is None:
-                    logger.warning(f"Agent {self._agent_id} failed to create a plan")
-                    if not planning_error_emitted:
-                        yield ErrorEvent(error="Failed to create a plan.")
-                    self.status = AgentStatus.IDLE
-                    yield DoneEvent()
-                    return
-                logger.info(f"Agent {self._agent_id} state changed from {AgentStatus.PLANNING} to {AgentStatus.EXECUTING}")
-                self.status = AgentStatus.EXECUTING
-                if len(self.plan.steps) == 0:
-                    logger.info(f"Agent {self._agent_id} created plan successfully with no steps")
-                    # PlanOutput.message is an acknowledgement, not a final
-                    # answer. Always let the executor produce deliver_result
-                    # with the original request and plan context explicitly in
-                    # view, including for simple or infeasible zero-step plans.
-                    zero_step_requires_summary = True
-                    self.status = AgentStatus.SUMMARIZING
-                    
+
+                if not self.plan or not self.plan.steps:
+                    self.status = AgentStatus.COMPLETED
+                else:
+                    self.status = AgentStatus.EXECUTING
+
             elif self.status == AgentStatus.EXECUTING:
-                # Execute plan
+                if not self.plan:
+                    self.status = AgentStatus.COMPLETED
+                    continue
+
                 self.plan.status = ExecutionStatus.RUNNING
                 step = self.plan.get_next_step()
                 if not step:
-                    logger.info(f"Agent {self._agent_id} has no more steps, state changed from {AgentStatus.EXECUTING} to {AgentStatus.COMPLETED}")
                     self.status = AgentStatus.SUMMARIZING
                     continue
-                # Execute step
-                logger.info(
-                    "Agent %s started executing step %s",
-                    self._agent_id,
-                    step.id,
-                )
-                async for event in self.executor.execute_step(self.plan, step, message):
+
+                waited = False
+                if self._resume_waiting:
+                    self._resume_waiting = False
+                    events = self.executor.resume_step(self.plan, step)
+                else:
+                    events = self.executor.execute_step(self.plan, step, message)
+
+                async for event in events:
+                    if isinstance(event, WaitEvent):
+                        waited = True
                     yield event
-                logger.info(f"Agent {self._agent_id} completed step {step.id}, state changed from {AgentStatus.EXECUTING} to {AgentStatus.UPDATING}")
+
+                if waited:
+                    self._done = False
+                    return
+
                 await self.executor.compact_memory()
-                logger.debug(f"Agent {self._agent_id} compacted memory")
-                self.status = AgentStatus.UPDATING
-            elif self.status == AgentStatus.UPDATING:
-                # Update plan
-                logger.info(f"Agent {self._agent_id} started updating plan")
-                async for event in self.planner.update_plan(self.plan, step):
-                    if isinstance(event, ErrorEvent):
-                        # Updating is advisory recovery between executable
-                        # steps. The existing plan remains usable, while an
-                        # ErrorEvent is terminal to SSE/durable/frontend
-                        # consumers. Keep this failure internal and continue
-                        # the remaining plan instead of ending the client
-                        # stream before the worker's eventual result.
-                        logger.warning(
-                            "Agent %s could not update plan after step %s; "
-                            "continuing the existing plan",
-                            self._agent_id,
-                            getattr(step, "id", "unknown"),
-                        )
-                        continue
-                    yield event
-                logger.info(f"Agent {self._agent_id} plan update completed, state changed from {AgentStatus.UPDATING} to {AgentStatus.EXECUTING}")
-                self.status = AgentStatus.EXECUTING
-            elif self.status == AgentStatus.SUMMARIZING:
-                # Conclusion
-                logger.info(f"Agent {self._agent_id} started summarizing")
-                visible_summary_emitted = False
-                async for event in self.executor.summarize(self.plan, message):
-                    if isinstance(event, ErrorEvent) or (
-                        isinstance(event, MessageEvent) and bool(event.message.strip())
-                    ):
-                        visible_summary_emitted = True
-                    yield event
-                if zero_step_requires_summary and not visible_summary_emitted:
-                    yield ErrorEvent(
-                        error="The agent completed without producing a visible response."
+
+                if step_needs_replan(step):
+                    logger.info(
+                        "Agent %s step %s needs replan (status=%s success=%s)",
+                        self._agent_id,
+                        step.id,
+                        step.status,
+                        step.success,
                     )
-                logger.info(f"Agent {self._agent_id} summarizing completed, state changed from {AgentStatus.SUMMARIZING} to {AgentStatus.COMPLETED}")
+                    self.status = AgentStatus.UPDATING
+                else:
+                    # Local progress only — keep Plan panel in sync without Planner LLM.
+                    yield PlanEvent(status=PlanStatus.UPDATED, plan=self.plan)
+                    self.status = AgentStatus.EXECUTING
+
+            elif self.status == AgentStatus.UPDATING:
+                async for event in self.planner.update_plan(self.plan, step):
+                    yield event
+                self.status = AgentStatus.EXECUTING
+
+            elif self.status == AgentStatus.SUMMARIZING:
+                if can_skip_summarize(self.plan):
+                    logger.info(
+                        "Agent %s skipping summarize for single successful step",
+                        self._agent_id,
+                    )
+                    self.status = AgentStatus.COMPLETED
+                    continue
+                async for event in self.executor.summarize():
+                    yield event
                 self.status = AgentStatus.COMPLETED
+
             elif self.status == AgentStatus.COMPLETED:
-                self.plan.status = ExecutionStatus.COMPLETED
-                logger.info(f"Agent {self._agent_id} plan has been completed")
-                yield PlanEvent(status=PlanStatus.COMPLETED, plan=self.plan)
+                if self.plan:
+                    self.plan.status = ExecutionStatus.COMPLETED
+                    yield PlanEvent(status=PlanStatus.COMPLETED, plan=self.plan)
                 self.status = AgentStatus.IDLE
                 break
+
+        self._done = True
         yield DoneEvent()
-        
-        logger.info(f"Agent {self._agent_id} message processing completed")
-    
+
     def is_done(self) -> bool:
-        return self.status == AgentStatus.IDLE
+        return self._done

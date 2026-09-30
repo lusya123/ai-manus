@@ -1,16 +1,15 @@
-"""WebSocket routes for realtime session list, chat, and Claw."""
+"""WebSocket routes for realtime session list and chat."""
 
 from __future__ import annotations
 
 import asyncio
 import json
+import websockets
 import logging
 import uuid
 from datetime import datetime
 from typing import Any, Optional
 
-import httpx
-import websockets
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from pydantic import ValidationError as PydanticValidationError
@@ -22,15 +21,12 @@ from app.application.errors.exceptions import (
     TooManyRequestsError,
 )
 from app.core.config import get_settings
-from app.domain.models.claw import ClawAttachment
 from app.domain.models.file import FileInfo
 from app.domain.models.turn_submission import TurnSubmission
 from app.domain.utils.error_reporting import safe_exception_summary
 from app.interfaces.dependencies import (
     resolve_ws_user,
     get_agent_service,
-    get_claw_service,
-    get_file_service,
 )
 from app.interfaces.schemas.event import EventMapper
 from app.interfaces.schemas.session import ChatRequest, ListSessionItem
@@ -46,10 +42,7 @@ router = APIRouter(prefix="/ws", tags=["ws"])
 
 SESSION_LIST_KEEPALIVE_SECONDS = 20.0
 CHAT_WS_PING_SECONDS = 20.0
-CLAW_HEARTBEAT_INTERVAL = 15
 WS_AUTH_WATCHDOG_SECONDS = 20.0
-CLAW_WS_MIN_FRAME_MAX_BYTES = 128 * 1024
-CLAW_WS_FRAME_OVERHEAD_BYTES = 64 * 1024
 WS_JSON_MAX_DEPTH = 64
 
 # Chat WS protocol (aligned with official Manus control-plane contract).
@@ -62,10 +55,6 @@ ERR_INTERNAL = 5000
 CHAT_WS_REQUEST_ID_MAX_CHARS = 128
 CHAT_WS_SESSION_ID_MAX_CHARS = 128
 CHAT_WS_EVENT_ID_MAX_CHARS = 128
-
-
-class _ClawInputLimitError(ValueError):
-    """Raised when a client-controlled Claw chat input exceeds a hard cap."""
 
 
 class _WsFrameTooLargeError(ValueError):
@@ -204,6 +193,19 @@ def _agent_status_from_session(status: Any) -> str:
     if value in ("pending", "running", "waiting", "completed"):
         return value
     return "completed"
+
+
+def _final_agent_status(
+    session_status: Any,
+    *,
+    saw_wait: bool = False,
+    saw_error: bool = False,
+) -> str:
+    if saw_wait or _session_status_value(session_status) == "waiting":
+        return "waiting"
+    if saw_error:
+        return "error"
+    return _agent_status_from_session(session_status)
 
 
 def _events_after(events: list[Any], last_event_id: Optional[str]) -> list[Any]:
@@ -436,6 +438,7 @@ async def chat_ws(websocket: WebSocket):
         accepted_submission: Optional[TurnSubmission] = None,
     ) -> None:
         saw_error = False
+        saw_wait = False
         try:
             async for event in agent_service.chat(
                 session_id=session_id,
@@ -455,6 +458,7 @@ async def chat_ws(websocket: WebSocket):
                 # Mid-stream phase: WaitEvent means Mongo is already WAITING — tell
                 # clients immediately so phase UI does not depend on domain→phase fallbacks.
                 if getattr(event, "type", None) == "wait":
+                    saw_wait = True
                     await send_status_update(session_id, "waiting")
             if joined_session_id == session_id:
                 session = await agent_service.get_session(session_id, user.id)
@@ -463,7 +467,7 @@ async def chat_ws(websocket: WebSocket):
                 # over saw_error — early tool errors can coexist with a later WaitEvent.
                 # Send status_update BEFORE stream_end: clients often clear handlers on
                 # stream_end, which would drop a trailing status_update.
-                if final_status == "waiting":
+                if saw_wait or final_status == "waiting":
                     await send_status_update(session_id, "waiting")
                 elif saw_error:
                     await send_status_update(session_id, "error")
@@ -689,6 +693,7 @@ async def chat_ws(websocket: WebSocket):
                         timestamp=raw.get("timestamp"),
                         message=raw.get("message"),
                         attachments=raw.get("attachments"),
+                        required_skills=raw.get("required_skills"),
                         event_id=raw.get("last_event_id") or raw.get("event_id"),
                         submission_id=submission_id,
                     )
@@ -718,6 +723,7 @@ async def chat_ws(websocket: WebSocket):
                         message=chat_request.message or "",
                         timestamp=timestamp,
                         attachments=attachments or None,
+                        required_skills=chat_request.required_skills,
                     )
                 except BadRequestError:
                     await send_error(
@@ -832,313 +838,6 @@ async def chat_ws(websocket: WebSocket):
             pass
     finally:
         await cancel_stream()
-
-
-@router.websocket("/claw")
-async def claw_ws(websocket: WebSocket):
-    """Claw chat channel — same Cookie / Bearer resolve as /ws/sessions and /ws/chat.
-
-    Client → Server:
-      {"type":"chat","message":"...","session_id":"default","file_ids":[]}
-
-    Server → Client:
-      {"type":"text","content":"..."}
-      {"type":"file",...}
-      {"type":"done","stop_reason":"..."}
-      {"type":"error","error":"..."}
-      {"type":"catchup","content":"..."}
-      {"type":"heartbeat"}
-    """
-    if not await _enforce_ws_origin(websocket):
-        return
-    try:
-        user = await resolve_ws_user(websocket)
-    except Exception:
-        await websocket.close(code=4001, reason="Unauthorized")
-        return
-
-    await websocket.accept()
-
-    claw_service = get_claw_service()
-    settings = get_settings()
-    queue = claw_service.event_bus.subscribe(user.id)
-
-    async def _write_events() -> None:
-        try:
-            pending = claw_service.get_pending_content(user.id)
-            if pending:
-                await websocket.send_json({"type": "catchup", "content": pending})
-            get_terminal_event = getattr(
-                claw_service, "get_terminal_event", lambda *_: None
-            )
-            terminal_event = get_terminal_event(user.id, "default")
-            if terminal_event is not None and queue.empty():
-                await websocket.send_json(terminal_event)
-            elif not pending and queue.empty():
-                is_processing = getattr(
-                    claw_service, "is_processing", lambda *_: True
-                )
-                if not is_processing(user.id, "default"):
-                    await websocket.send_json(
-                        {"type": "done", "stop_reason": "idle"}
-                    )
-
-            while True:
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=CLAW_HEARTBEAT_INTERVAL)
-                    await websocket.send_json(event)
-                except asyncio.TimeoutError:
-                    await websocket.send_json({"type": "heartbeat"})
-        except (WebSocketDisconnect, asyncio.CancelledError, Exception):
-            pass
-
-    file_service = get_file_service()
-
-    async def _ensure_user_still_authorized() -> bool:
-        """Apply logout, revocation, and account-disable changes per turn."""
-        return await _enforce_ws_authorization(websocket, user.id)
-
-    async def _process_files(
-        file_ids: list[str], uid: str
-    ) -> tuple[str, list[ClawAttachment]]:
-        claw = await claw_service.validate_claw_for_chat(uid)
-        claw_base_url = claw.http_base_url
-
-        refs: list[str] = []
-        attachments: list[ClawAttachment] = []
-        max_file_bytes = max(1, int(settings.claw_chat_max_attachment_bytes))
-        max_total_bytes = max(
-            max_file_bytes,
-            int(settings.claw_chat_max_total_attachment_bytes),
-        )
-        total_bytes = 0
-        for fid in file_ids:
-            try:
-                stream, info = await file_service.download_file(fid, uid)
-                ct = info.content_type or ""
-                filename = str(info.filename or fid)[:255]
-                try:
-                    declared_size = int(info.size or 0)
-                except (TypeError, ValueError) as exc:
-                    raise _ClawInputLimitError(
-                        "Attachment has an invalid size"
-                    ) from exc
-                if declared_size < 0:
-                    raise _ClawInputLimitError("Attachment has an invalid size")
-                if declared_size > max_file_bytes:
-                    raise _ClawInputLimitError(
-                        "Attachment exceeds the per-file size limit"
-                    )
-                if declared_size > max_total_bytes - total_bytes:
-                    raise _ClawInputLimitError(
-                        "Attachments exceed the total size limit"
-                    )
-                if not hasattr(stream, "read"):
-                    raise ValueError("Attachment stream is unavailable")
-                read_limit = min(max_file_bytes, max_total_bytes - total_bytes)
-                raw_buffer = bytearray()
-                while len(raw_buffer) <= read_limit:
-                    chunk = stream.read(
-                        min(1024 * 1024, read_limit + 1 - len(raw_buffer))
-                    )
-                    if not isinstance(chunk, (bytes, bytearray)):
-                        raise ValueError("Attachment stream returned invalid data")
-                    if not chunk:
-                        break
-                    raw_buffer.extend(chunk)
-                if len(raw_buffer) > read_limit:
-                    raise _ClawInputLimitError(
-                        "Attachment exceeds the configured size limit"
-                    )
-                raw = bytes(raw_buffer)
-                total_bytes += len(raw)
-
-                attachments.append(ClawAttachment(
-                    file_id=fid, filename=filename,
-                    content_type=ct, size=info.size or 0,
-                ))
-
-                if not claw_base_url:
-                    refs.append(f'<MANUS_FILE name="{filename}" id="{fid}" status="no_claw" />')
-                    continue
-
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    resp = await client.post(
-                        f"{claw_base_url}/workspace",
-                        params={"file_id": fid, "filename": filename},
-                        content=raw,
-                        headers={"Content-Type": "application/octet-stream"},
-                    )
-                    resp.raise_for_status()
-                    result = resp.json()
-                    local_path = result.get("path", "")
-
-                refs.append(
-                    f'<MANUS_FILE path="{local_path}" name="{filename}" '
-                    f'id="{fid}" type="{ct}" size="{info.size}" />'
-                )
-                logger.info(
-                    "[claw-ws] pushed attachment to workspace: file_id=%s",
-                    fid,
-                )
-
-            except _ClawInputLimitError:
-                raise
-            except Exception as exc:
-                logger.warning(
-                    "[claw-ws] failed to process file %s: %s",
-                    fid,
-                    safe_exception_summary(exc),
-                )
-                refs.append(
-                    f'<MANUS_FILE name="{fid}" id="{fid}" status="download_failed" '
-                    'reason="file_unavailable" />'
-                )
-
-        return "\n".join(refs), attachments
-
-    async def _read_messages() -> None:
-        try:
-            max_frame_bytes = max(
-                CLAW_WS_MIN_FRAME_MAX_BYTES,
-                int(settings.claw_chat_max_message_bytes)
-                + CLAW_WS_FRAME_OVERHEAD_BYTES,
-            )
-            while True:
-                try:
-                    data = await _receive_bounded_json(
-                        websocket,
-                        max_frame_bytes,
-                    )
-                except _WsFrameTooLargeError:
-                    await websocket.close(code=1009, reason="Message too large")
-                    return
-                except ValueError:
-                    await websocket.close(code=1003, reason="Invalid JSON")
-                    return
-                if not isinstance(data, dict):
-                    await websocket.send_json({
-                        "type": "error",
-                        "error": "Invalid Claw WebSocket message",
-                    })
-                    continue
-                msg_type = data.get("type")
-                if msg_type == "chat":
-                    if not await _ensure_user_still_authorized():
-                        return
-                    raw_message = data.get("message", "")
-                    if not isinstance(raw_message, str):
-                        await websocket.send_json({
-                            "type": "error",
-                            "error": "Invalid Claw message",
-                        })
-                        continue
-                    message = raw_message.strip()
-                    max_message_bytes = max(
-                        1, int(settings.claw_chat_max_message_bytes)
-                    )
-                    if len(message.encode("utf-8")) > max_message_bytes:
-                        await websocket.send_json({
-                            "type": "error",
-                            "error": "Claw message exceeds the configured size limit",
-                        })
-                        continue
-                    session_id = data.get("session_id", "default")
-                    if session_id != "default":
-                        await websocket.send_json({
-                            "type": "error",
-                            "error": "Only the default Claw conversation is supported",
-                        })
-                        continue
-                    file_ids = data.get("file_ids", [])
-                    max_attachments = max(
-                        0, int(settings.claw_chat_max_attachments)
-                    )
-                    if (
-                        not isinstance(file_ids, list)
-                        or len(file_ids) > max_attachments
-                        or any(
-                            not isinstance(file_id, str)
-                            or not file_id
-                            or len(file_id) > 256
-                            for file_id in file_ids
-                        )
-                    ):
-                        await websocket.send_json({
-                            "type": "error",
-                            "error": "Invalid or excessive Claw attachments",
-                        })
-                        continue
-                    user_attachments: list[ClawAttachment] = []
-
-                    if file_ids:
-                        try:
-                            file_refs, user_attachments = await _process_files(
-                                file_ids, user.id
-                            )
-                        except _ClawInputLimitError as exc:
-                            await websocket.send_json({
-                                "type": "error",
-                                "error": str(exc),
-                            })
-                            continue
-                        if file_refs:
-                            message = f"{message}\n\n{file_refs}" if message else file_refs
-
-                    if len(message.encode("utf-8")) > max_message_bytes:
-                        await websocket.send_json({
-                            "type": "error",
-                            "error": "Claw message and attachment metadata exceed the configured size limit",
-                        })
-                        continue
-
-                    if message:
-                        if not await _ensure_user_still_authorized():
-                            return
-                        try:
-                            await claw_service.send_message(user.id, message, session_id)
-                            if user_attachments:
-                                await claw_service.claw_repository.append_message(
-                                    user.id, "attachments", "user", attachments=user_attachments,
-                                )
-                        except ConflictError:
-                            await websocket.send_json({
-                                "type": "error",
-                                "error": "A Claw response is already in progress",
-                            })
-                        except ServiceUnavailableError:
-                            await websocket.send_json({
-                                "type": "error",
-                                "error": "Claw chat is temporarily unavailable; please retry",
-                            })
-                        except Exception as exc:
-                            logger.error(
-                                "[claw-ws] failed to dispatch chat for user=%s: %s",
-                                user.id,
-                                safe_exception_summary(exc),
-                            )
-                            await websocket.send_json({
-                                "type": "error",
-                                "error": "Unable to start Claw response",
-                            })
-        except (WebSocketDisconnect, asyncio.CancelledError, Exception):
-            pass
-
-    write_task = asyncio.create_task(_write_events())
-    read_task = asyncio.create_task(_read_messages())
-    auth_task = asyncio.create_task(_ws_auth_watchdog(websocket, user.id))
-
-    try:
-        _done, pending = await asyncio.wait(
-            [write_task, read_task, auth_task],
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for t in pending:
-            t.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-    finally:
-        claw_service.event_bus.unsubscribe(user.id, queue)
-
 
 @router.websocket("/vnc/{session_id}")
 async def vnc_ws(websocket: WebSocket, session_id: str):

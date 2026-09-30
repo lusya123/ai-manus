@@ -3,10 +3,23 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, field_validator
 
 
+class SkillContext(BaseModel):
+    skill_id: str
+    name: str
+    body: str
+
+
+class RequiredSkill(BaseModel):
+    skill_id: str
+    name: str
+
+
 class Message(BaseModel):
     """User-facing input message (a chat turn from the user)."""
     message: str = ""
     attachments: List[str] = Field(default_factory=list)
+    required_skills: List[RequiredSkill] = Field(default_factory=list)
+    skill: Optional[SkillContext] = None
 
 
 class Role(str, Enum):

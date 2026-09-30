@@ -22,14 +22,6 @@ from app.infrastructure.external.llm.security import (
     validate_model_credential_encryption,
 )
 from app.infrastructure.models.documents import AgentDocument
-from app.interfaces.api.openai_routes import (
-    _anthropic_headers,
-    _anthropic_stream_event_to_openai_chunks,
-    _configured_llm_api_base,
-    _get_llm_response,
-    _safe_stream_llm_response,
-    _stream_llm_response,
-)
 from app.interfaces.schemas.session import AgentModelConfigRequest
 
 
@@ -626,24 +618,6 @@ async def test_delete_session_never_restores_agent_after_destructive_cleanup():
     assert trace == ["agent-delete", "session-delete"]
 
 
-def test_anthropic_defaults_use_anthropic_key_base_and_protect_required_headers():
-    settings = Settings(
-        _env_file=None,
-        api_key=None,
-        anthropic_api_key="anthropic-key",
-        api_base=None,
-        model_name="claude-sonnet-4-6",
-        model_provider="anthropic",
-        jwt_secret_key="test-only-jwt-root-secret-at-least-32-bytes",
-        extra_headers={"x-api-key": "wrong", "X-Custom": "ok"},
-    )
-    settings.validate()
-
-    assert _configured_llm_api_base(settings) == "https://api.anthropic.com"
-    headers = _anthropic_headers(settings)
-    assert headers["x-api-key"] == "anthropic-key"
-    assert headers["anthropic-version"] == "2023-06-01"
-    assert headers["X-Custom"] == "ok"
 
 
 def test_langchain_anthropic_uses_provider_key_and_official_base(monkeypatch):
@@ -675,115 +649,3 @@ def test_langchain_anthropic_uses_provider_key_and_official_base(monkeypatch):
     assert captured["model_provider"] == "anthropic"
     assert captured["api_key"] == "anthropic-key"
     assert captured["base_url"] is None
-
-
-async def test_anthropic_stream_and_nonstream_use_the_same_target_and_key(monkeypatch):
-    calls = []
-
-    class FakeResponse:
-        is_success = True
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return False
-
-        async def aiter_lines(self):
-            yield 'data: {"type":"message_stop"}'
-
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {
-                "id": "msg-1",
-                "model": "claude-sonnet-4-6",
-                "content": [{"type": "text", "text": "ok"}],
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 1, "output_tokens": 1},
-            }
-
-    class FakeClient:
-        def __init__(self, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return False
-
-        def stream(self, method, url, **kwargs):
-            calls.append(("stream", url, kwargs["headers"]))
-            return FakeResponse()
-
-        async def post(self, url, **kwargs):
-            calls.append(("nonstream", url, kwargs["headers"]))
-            return FakeResponse()
-
-    monkeypatch.setattr(
-        "app.interfaces.api.openai_routes.httpx.AsyncClient", FakeClient
-    )
-    settings = Settings(
-        _env_file=None,
-        api_key=None,
-        anthropic_api_key="anthropic-key",
-        api_base=None,
-        model_name="claude-sonnet-4-6",
-        model_provider="anthropic",
-    )
-    body = {"model": "claude-sonnet-4-6", "messages": [], "stream": True}
-
-    streamed = [chunk async for chunk in _stream_llm_response(body, settings)]
-    nonstreamed = await _get_llm_response({**body, "stream": False}, settings)
-
-    assert streamed[-1] == b"data: [DONE]\n\n"
-    assert nonstreamed["choices"][0]["message"]["content"] == "ok"
-    assert [call[1] for call in calls] == [
-        "https://api.anthropic.com/v1/messages",
-        "https://api.anthropic.com/v1/messages",
-    ]
-    assert [call[2]["x-api-key"] for call in calls] == [
-        "anthropic-key",
-        "anthropic-key",
-    ]
-
-
-def test_anthropic_stream_error_is_redacted_then_done():
-    chunks = _anthropic_stream_event_to_openai_chunks(
-        {
-            "type": "error",
-            "error": {"type": "overloaded_error", "message": "try later"},
-        },
-        {},
-    )
-
-    assert chunks[0] == {
-        "error": {
-            "type": "api_error",
-            "message": "LLM backend streaming request failed",
-        }
-    }
-    assert "try later" not in str(chunks[0])
-    assert chunks[1] == "[DONE]"
-
-
-async def test_stream_transport_exception_becomes_explicit_sse_error(monkeypatch):
-    async def broken_stream(*args, **kwargs):
-        if False:
-            yield b""
-        raise RuntimeError("connection reset")
-
-    monkeypatch.setattr(
-        "app.interfaces.api.openai_routes._stream_llm_response", broken_stream
-    )
-    chunks = [
-        chunk.decode("utf-8")
-        async for chunk in _safe_stream_llm_response({}, SimpleNamespace())
-    ]
-
-    assert '"error"' in chunks[0]
-    assert "LLM backend streaming request failed" in chunks[0]
-    assert "connection reset" not in chunks[0]
-    assert chunks[1] == "data: [DONE]\n\n"

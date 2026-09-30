@@ -1,4 +1,4 @@
-# 🤖 AI Manus × Claw 开源通用智能体
+# 🤖 AI Manus 开源通用智能体
 
 官网地址：<https://ai-manus.com>
 
@@ -6,11 +6,9 @@ GitHub：<https://github.com/simpleyyt/ai-manus> | Demo：<https://app.ai-manus.
 
 博客文章：[我也复刻了一个 Manus，带高仿 WebUI 和沙盒](https://simpleyyt.com/2026/03/07/rebuild-manus-with-webui-and-sandbox/)
 
-加入我们的社群：[QQ群(1005477581)](https://qun.qq.com/universal-share/share?ac=1&authKey=p4X3Da5iMpR4liAenxwvhs7IValPKiCFtUevRlJouz9qSTSZsMnPJc3hzsJjgQYv&busi_data=eyJncm91cENvZGUiOiIxMDA1NDc3NTgxIiwidG9rZW4iOiJNZmUrTmQ0UzNDZDNqNDFVdjVPS1VCRkJGRWVlV0R3RFJSRVFoZDAwRjFDeUdUM0t6aUIyczlVdzRjV1BYN09IIiwidWluIjoiMzQyMjExODE1In0%3D&data=C3B-E6BlEbailV32co77iXL5vxPIhtD9y_itWLSq50hKqosO_55_isOZym2Faaq4hs9-517tUY8GSWaDwPom-A&svctype=4&tempid=h5_group_info)
-
 ---
 
-AI Manus 是一个通用的 AI Agent 系统，可以完全私有部署，支持在沙盒环境中运行各种工具和操作。现已深度集成 **Claw**（基于 [OpenClaw](https://github.com/anthropics/openclaw)），实现 Manus × Claw 联合体验：一键部署 AI 助手、用户隔离常驻容器、可选过期策略与完整聊天历史。
+AI Manus 是一个通用的 AI Agent 系统，可以完全私有部署，支持在沙盒环境中运行各种工具和操作。
 
 AI Manus 项目目标是希望成为可完全私有部署的企业级 Manus 应用。垂类 Manus 的应用有多种重复性的工程化工作，这个项目希望把这部分统一，让大家可以像搭积木一下建立起一个垂类 Manus 应用。
 
@@ -20,15 +18,16 @@ AI Manus 中每个服务与工具都包含一个 Built-in 版本，可以做到�
 
 ## 基本功能
 
-[](https://github.com/user-attachments/assets/37060a09-c647-4bcb-920c-959f7fa73ebe ':include :type=video controls width="100%"')
+[](https://github.com/user-attachments/assets/89e0da0f-789f-464f-8648-49eb5035fe2f ':include :type=video controls width="100%"')
 
 ## 核心功能
 
  * **部署：**最小只需要一个 LLM 服务即可完成部署，不需要依赖其它外部服务。
  * **Agent 循环：**Plan-and-Execute，可组合 System Prompt，原生结构化输出工具（`create_plan` / `complete_step` 等）。
  * **工具：**支持 Terminal、Browser、File、Web Search、消息工具，并支持实时查看和接管，支持外部 MCP 工具集成。
- * **Claw：**集成 [OpenClaw](https://github.com/anthropics/openclaw) AI 助手，一键部署、用户隔离常驻容器、可选过期策略、完整聊天历史。
- * **沙盒：**每个 Task 会分配独立沙盒，可使用本地 Docker 或可选的[阿里云无影 AgentBay](agentbay.md)。
+ * **Skills：**可复用技能包（官方目录 / 上传 / GitHub 导入）。在「设置 → 功能 → 技能」管理；对话中用 `/` 或 `+` →「使用技能」调用；历史消息保留技能 chip 与悬停说明。Agent 经 `load_skill` 渐进加载并同步到沙盒。详见 [Skills 技能](skills.md)。
+
+ * **沙盒：**每个 Task 会分配单独的一个沙盒，沙盒在本地 Docker 环境里面运行。
  * **任务会话：**通过 Mongo/Redis 对会话历史进行管理，支持后台任务。
  * **库：**侧栏「库」页面聚合用户各会话中的附件与产物，支持类型筛选、搜索、文件级收藏与预览，并可跳转回原任务。
  * **对话：**支持停止与打断，支持文件上传与下载。

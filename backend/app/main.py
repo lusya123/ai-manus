@@ -7,9 +7,8 @@ import asyncio
 from app.core.config import get_settings
 from app.infrastructure.storage.mongodb import get_mongodb
 from app.infrastructure.storage.redis import get_redis
-from app.interfaces.dependencies import get_agent_service, get_claw_service
+from app.interfaces.dependencies import get_agent_service
 from app.interfaces.api.routes import router
-from app.interfaces.api.openai_routes import router as openai_router
 from app.infrastructure.logging import setup_logging
 from app.infrastructure.external.docker_async import run_bounded_docker_call
 from app.infrastructure.external.runtime_network import (
@@ -28,12 +27,13 @@ from app.infrastructure.models.documents import (
     AgentDocument,
     SessionDocument,
     UserDocument,
-    ClawDocument,
     TurnSubmissionDocument,
     TurnQuotaDocument,
     TurnOutputEventDocument,
     ProjectDocument,
     FileFavoriteDocument,
+    SkillDocument,
+    UserSkillDocument,
 )
 from beanie import init_beanie
 
@@ -110,12 +110,13 @@ async def lifespan(app: FastAPI):
             AgentDocument,
             SessionDocument,
             UserDocument,
-            ClawDocument,
             TurnSubmissionDocument,
             TurnQuotaDocument,
             TurnOutputEventDocument,
             ProjectDocument,
             FileFavoriteDocument,
+            SkillDocument,
+            UserSkillDocument,
         ]
     )
     logger.info("Successfully initialized Beanie")
@@ -126,8 +127,6 @@ async def lifespan(app: FastAPI):
         _runtime_network_gc_loop(),
         name="runtime-network-gc",
     )
-    if settings.claw_enabled:
-        get_claw_service().start_maintenance()
     
     try:
         yield
@@ -150,19 +149,6 @@ async def lifespan(app: FastAPI):
                 "Error during AgentService cleanup: %s",
                 safe_exception_summary(e),
             )
-
-        if settings.claw_enabled:
-            logger.info("Cleaning up ClawService instance")
-            try:
-                await asyncio.wait_for(get_claw_service().shutdown(), timeout=10.0)
-                logger.info("ClawService shutdown completed successfully")
-            except asyncio.TimeoutError:
-                logger.warning("ClawService shutdown timed out after 10 seconds")
-            except Exception as e:
-                logger.error(
-                    "Error during ClawService cleanup: %s",
-                    safe_exception_summary(e),
-                )
 
         # Timed-out screenshots/artifact uploads may still be completing a
         # known Mongo publish or compensating a failed upload.  Drain them
@@ -188,7 +174,7 @@ app.add_middleware(
 app.add_middleware(
     UploadBodyLimitMiddleware,
     max_body_bytes=settings.multipart_upload_max_body_bytes,
-    paths={"/api/v1/files", "/api/v1/claw/upload"},
+    paths={"/api/v1/files"},
     error_detail="Upload request body is too large",
 )
 app.add_middleware(
@@ -208,5 +194,3 @@ async def health_check():
 
 # Register routes
 app.include_router(router, prefix="/api/v1")
-# OpenAI-compatible proxy (used by OpenClaw containers for LLM requests)
-app.include_router(openai_router)

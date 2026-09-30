@@ -1,200 +1,179 @@
-import { describe, expect, it, vi } from 'vitest';
-import { ref } from 'vue';
-import {
-  getLatestTurnId,
-  hasTerminalEventForLatestTurn,
-  hasTerminalEventForTurn,
-  useAgentEvents,
-} from '../useAgentEvents';
-import type { Message, ToolContent } from '../../types/message';
-import type { AgentEvent, PlanEventData } from '../../types/event';
+import { describe, it, expect } from 'vitest'
+import { ref } from 'vue'
+import { useAgentEvents } from '../useAgentEvents'
+import { isComputerPanelTool } from '../../constants/tool'
+import type { Message, StepContent, ToolContent } from '../../types/message'
+import type { PlanEventData, AgentEvent } from '../../types/event'
 
-const createHarness = () => {
-  const state = {
-    messages: ref<Message[]>([]),
-    title: ref('New Chat'),
-    plan: ref<PlanEventData>(),
-    lastEventId: ref<string>(),
-    lastTool: ref<ToolContent>(),
-    lastNoMessageTool: ref<ToolContent>(),
-  };
-  const onToolActivity = vi.fn();
-  const onStreamError = vi.fn();
+function makeToolEvent(overrides: Partial<{
+  name: string
+  function: string
+  tool_call_id: string
+  status: 'calling' | 'called'
+}> = {}): AgentEvent {
   return {
-    state,
-    onToolActivity,
-    onStreamError,
-    ...useAgentEvents(state, { onToolActivity, onStreamError }),
-  };
-};
+    event: 'tool',
+    data: {
+      event_id: 'e1',
+      timestamp: Math.floor(Date.now() / 1000),
+      tool_call_id: overrides.tool_call_id ?? 'tc-1',
+      name: overrides.name ?? 'file',
+      function: overrides.function ?? 'file_write',
+      args: { file: '/home/ubuntu/demo.txt' },
+      status: overrides.status ?? 'calling',
+      content: undefined,
+    },
+  } as AgentEvent
+}
 
-describe('useAgentEvents timeline projection', () => {
-  it.each(['done', 'wait'] as const)('records the %s cursor without owning session phase', (event) => {
-    const { state, handleEvent } = createHarness();
-    expect(handleEvent({
-      event,
-      data: { event_id: `${event}-id`, timestamp: 1 },
-    } as AgentEvent)).toBe(true);
-    expect(state.lastEventId.value).toBe(`${event}-id`);
-    expect(state.messages.value).toEqual([]);
-  });
+describe('isComputerPanelTool', () => {
+  it('includes shell/file/browser/search/mcp', () => {
+    expect(isComputerPanelTool('shell')).toBe(true)
+    expect(isComputerPanelTool('file')).toBe(true)
+    expect(isComputerPanelTool('browser')).toBe(true)
+    expect(isComputerPanelTool('search')).toBe(true)
+    expect(isComputerPanelTool('mcp')).toBe(true)
+    expect(isComputerPanelTool('skill')).toBe(true)
+  })
 
-  it('uses only the Redis transport cursor for reconnect state', () => {
-    const { state, handleEvent } = createHarness();
-    handleEvent({
-      event: 'done',
-      data: {
-        event_id: 'stable-logical-event',
-        transport_cursor: '1782506372223-0',
-      },
-    } as AgentEvent);
-    expect(state.lastEventId.value).toBe('1782506372223-0');
-  });
+  it('excludes soft-plan and message tools', () => {
+    expect(isComputerPanelTool('todo')).toBe(false)
+    expect(isComputerPanelTool('message')).toBe(false)
+    expect(isComputerPanelTool(undefined)).toBe(false)
+  })
+})
 
-  it('deduplicates Mongo replay and Redis live overlap by stable event id', () => {
-    const { state, handleEvent } = createHarness();
-    const event = {
-      event: 'message',
-      data: {
-        event_id: 'stable-message',
-        role: 'assistant',
-        content: 'hello',
-        attachments: [],
-        timestamp: 1,
-      },
-    } as AgentEvent;
-    expect(handleEvent(event)).toBe(true);
-    expect(handleEvent({
-      ...event,
-      data: { ...event.data, transport_cursor: '1-0' },
-    } as AgentEvent)).toBe(false);
-    expect(state.messages.value).toHaveLength(1);
-    expect(state.lastEventId.value).toBe('1-0');
-  });
+describe('useAgentEvents computer follow', () => {
+  it('ignores plan_report tool events in the chat timeline', () => {
+    const messages = ref<Message[]>([])
+    const title = ref('')
+    const plan = ref<PlanEventData | undefined>()
+    const lastEventId = ref<string | undefined>()
+    const lastTool = ref<ToolContent | undefined>()
+    const lastNoMessageTool = ref<ToolContent | undefined>()
+    const activity: ToolContent[] = []
 
-  it('advances the transport cursor when a terminal event is duplicated', () => {
-    const { state, handleEvent } = createHarness();
-    const terminal = {
-      event: 'done',
-      data: { event_id: 'stable-done', transport_cursor: '1-0', timestamp: 1 },
-    } as AgentEvent;
+    const { handleEvent } = useAgentEvents(
+      { messages, title, plan, lastEventId, lastTool, lastNoMessageTool },
+      { onToolActivity: (t) => activity.push(t) },
+    )
 
-    expect(handleEvent(terminal)).toBe(true);
-    expect(handleEvent({
-      ...terminal,
-      data: { ...terminal.data, transport_cursor: '2-0' },
-    } as AgentEvent)).toBe(false);
+    handleEvent(makeToolEvent({
+      name: 'todo',
+      function: 'plan_report',
+      tool_call_id: 'plan-report-1',
+      status: 'called',
+    }))
 
-    expect(state.lastEventId.value).toBe('2-0');
-    expect(state.messages.value).toEqual([]);
-  });
+    expect(messages.value).toHaveLength(0)
+    expect(lastTool.value).toBeUndefined()
+    expect(lastNoMessageTool.value).toBeUndefined()
+    expect(activity).toHaveLength(0)
+  })
 
-  it('does not duplicate an error message when a terminal error is replayed', () => {
-    const { state, handleEvent, onStreamError } = createHarness();
-    const terminal = {
-      event: 'error',
-      data: {
-        event_id: 'stable-error',
-        error: 'failed safely',
-        timestamp: 1,
-      },
-    } as AgentEvent;
+  it('ignores replan tool events in the chat timeline', () => {
+    const messages = ref<Message[]>([])
+    const title = ref('')
+    const plan = ref<PlanEventData | undefined>()
+    const lastEventId = ref<string | undefined>()
+    const lastTool = ref<ToolContent | undefined>()
+    const lastNoMessageTool = ref<ToolContent | undefined>()
+    const activity: ToolContent[] = []
 
-    handleEvent(terminal);
-    handleEvent(terminal);
+    const { handleEvent } = useAgentEvents(
+      { messages, title, plan, lastEventId, lastTool, lastNoMessageTool },
+      { onToolActivity: (t) => activity.push(t) },
+    )
 
-    expect(state.messages.value).toHaveLength(1);
-    expect(onStreamError).toHaveBeenCalledOnce();
-  });
+    handleEvent(makeToolEvent({
+      name: 'todo',
+      function: 'replan',
+      tool_call_id: 'replan-1',
+      status: 'called',
+    }))
 
-  it('resets logical event deduplication when the page changes sessions', () => {
-    const { state, handleEvent, resetEventHistory } = createHarness();
-    const event = {
-      event: 'message',
-      data: {
-        event_id: 'stable-message',
-        role: 'assistant',
-        content: 'hello',
-        attachments: [],
-        timestamp: 1,
-      },
-    } as AgentEvent;
+    expect(messages.value).toHaveLength(0)
+    expect(lastTool.value).toBeUndefined()
+    expect(lastNoMessageTool.value).toBeUndefined()
+    expect(activity).toHaveLength(0)
+  })
 
-    handleEvent(event);
-    resetEventHistory();
-    state.messages.value = [];
-    handleEvent(event);
+  it('ignores legacy todo tool events in the chat timeline', () => {
+    const messages = ref<Message[]>([])
+    const title = ref('')
+    const plan = ref<PlanEventData | undefined>()
+    const lastEventId = ref<string | undefined>()
+    const lastTool = ref<ToolContent | undefined>()
+    const lastNoMessageTool = ref<ToolContent | undefined>()
+    const activity: ToolContent[] = []
 
-    expect(state.messages.value).toHaveLength(1);
-  });
+    const { handleEvent } = useAgentEvents(
+      { messages, title, plan, lastEventId, lastTool, lastNoMessageTool },
+      { onToolActivity: (t) => activity.push(t) },
+    )
 
-  it('ignores terminal events from an older turn when the newest turn is running', () => {
-    const events = [
-      { event: 'message', data: { role: 'user', event_id: 'u1' } },
-      { event: 'done', data: { event_id: 'd1' } },
-      { event: 'message', data: { role: 'user', event_id: 'u2' } },
-      { event: 'step', data: { event_id: 's2' } },
-    ] as AgentEvent[];
-
-    expect(hasTerminalEventForLatestTurn(events)).toBe(false);
-  });
-
-  it('reconnects an active session when history has no user turn to identify', () => {
-    const events = [
-      { event: 'done', data: { event_id: 'orphan-terminal' } },
-    ] as AgentEvent[];
-
-    expect(hasTerminalEventForLatestTurn(events)).toBe(false);
-  });
-
-  it('detects a terminal event in the newest turn even when metadata follows it', () => {
-    const events = [
-      { event: 'done', data: { event_id: 'd1' } },
-      { event: 'message', data: { role: 'user', event_id: 'u2' } },
-      { event: 'done', data: { event_id: 'd2' } },
-      { event: 'title', data: { event_id: 'title2' } },
-    ] as AgentEvent[];
-
-    expect(hasTerminalEventForLatestTurn(events)).toBe(true);
-  });
-
-  it('does not let a late older terminal event complete a newer durable turn', () => {
-    const events = [
-      { event: 'message', data: { role: 'user', event_id: 'u1', turn_id: 'turn-1' } },
-      { event: 'message', data: { role: 'user', event_id: 'u2', turn_id: 'turn-2' } },
-      { event: 'done', data: { event_id: 'd1', turn_id: 'turn-1' } },
-    ] as AgentEvent[];
-
-    expect(hasTerminalEventForLatestTurn(events)).toBe(false);
-  });
-
-  it('matches a terminal event to the newest durable turn by turn id', () => {
-    const events = [
-      { event: 'message', data: { role: 'user', event_id: 'u1', turn_id: 'turn-1' } },
-      { event: 'message', data: { role: 'user', event_id: 'u2', turn_id: 'turn-2' } },
-      { event: 'done', data: { event_id: 'd1', turn_id: 'turn-1' } },
-      { event: 'done', data: { event_id: 'd2', turn_id: 'turn-2' } },
-    ] as AgentEvent[];
-
-    expect(hasTerminalEventForLatestTurn(events)).toBe(true);
-    expect(getLatestTurnId(events)).toBe('turn-2');
-    expect(hasTerminalEventForTurn(events, 'turn-1')).toBe(true);
-    expect(hasTerminalEventForTurn(events, 'turn-2')).toBe(true);
-  });
-
-  it('keeps tool activity routed through the shared upstream handler', () => {
-    const { state, onToolActivity, handleEvent } = createHarness();
-    const tool = {
-      event_id: 'tool-event',
-      tool_call_id: 'call-1',
-      name: 'browser',
-      function: 'browser_view',
-      args: {},
+    handleEvent(makeToolEvent({
+      name: 'todo',
+      function: 'todo_write',
+      tool_call_id: 'todo-1',
       status: 'calling',
-      timestamp: 1,
-    };
-    handleEvent({ event: 'tool', data: tool } as AgentEvent);
-    expect(state.lastNoMessageTool.value?.tool_call_id).toBe('call-1');
-    expect(onToolActivity).toHaveBeenCalledOnce();
-  });
-});
+    }))
+
+    expect(messages.value).toHaveLength(0)
+    expect(lastTool.value).toBeUndefined()
+    expect(lastNoMessageTool.value).toBeUndefined()
+    expect(activity).toHaveLength(0)
+  })
+
+  it('seeds a running chat step from plan events', () => {
+    const messages = ref<Message[]>([])
+    const title = ref('')
+    const plan = ref<PlanEventData | undefined>()
+    const lastEventId = ref<string | undefined>()
+    const lastTool = ref<ToolContent | undefined>()
+    const lastNoMessageTool = ref<ToolContent | undefined>()
+
+    const { handleEvent } = useAgentEvents(
+      { messages, title, plan, lastEventId, lastTool, lastNoMessageTool },
+    )
+
+    handleEvent({
+      event: 'plan',
+      data: {
+        event_id: 'p1',
+        timestamp: Math.floor(Date.now() / 1000),
+        steps: [
+          { event_id: 'p1', timestamp: 1, id: '1', description: 'Research topic', status: 'running' },
+          { event_id: 'p1', timestamp: 1, id: '2', description: 'Write report', status: 'pending' },
+        ],
+      },
+    } as AgentEvent)
+
+    expect(messages.value).toHaveLength(1)
+    expect(messages.value[0].type).toBe('step')
+    const step = messages.value[0].content as StepContent
+    expect(step.id).toBe('1')
+    expect(step.status).toBe('running')
+  })
+
+  it('follows file tools for the computer panel', () => {
+    const messages = ref<Message[]>([])
+    const title = ref('')
+    const plan = ref<PlanEventData | undefined>()
+    const lastEventId = ref<string | undefined>()
+    const lastTool = ref<ToolContent | undefined>()
+    const lastNoMessageTool = ref<ToolContent | undefined>()
+    const activity: ToolContent[] = []
+
+    const { handleEvent } = useAgentEvents(
+      { messages, title, plan, lastEventId, lastTool, lastNoMessageTool },
+      { onToolActivity: (t) => activity.push(t) },
+    )
+
+    handleEvent(makeToolEvent({ name: 'file', function: 'file_write', tool_call_id: 'file-1' }))
+
+    expect(lastNoMessageTool.value?.tool_call_id).toBe('file-1')
+    expect(activity).toHaveLength(1)
+    expect(activity[0].function).toBe('file_write')
+  })
+})

@@ -196,6 +196,11 @@ export interface ChatAttachment {
   filename: string;
 }
 
+export interface RequiredSkillRef {
+  id: string;
+  name: string;
+}
+
 /**
  * Chat with Session over persistent chat WS (join/leave).
  * Returns a cancel function that clears handlers for this call (does not close WS).
@@ -208,6 +213,7 @@ export const chatWithSession = async (
   callbacks?: ChatStreamCallbacks,
   /** Stable UUID to reuse when retrying the same durable user turn. */
   submissionId?: string,
+  requiredSkills?: RequiredSkillRef[],
 ): Promise<ChatSessionConnection> => {
   const { createChatSubmissionId, getChatWebSocket } = await import('./chatWs');
   const ws = getChatWebSocket();
@@ -240,6 +246,7 @@ export const chatWithSession = async (
       lastEventId: eventId,
       attachments,
       submissionId: stableSubmissionId,
+      requiredSkills,
     });
     acknowledgedRequestId = ack.requestId;
     acknowledgedSubmissionId = ack.submissionId;

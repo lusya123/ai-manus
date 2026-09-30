@@ -12,27 +12,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import requests
 
-
-def _load_root_env_value(key: str) -> str | None:
-    env_path = Path(__file__).resolve().parents[2] / ".env"
-    if not env_path.exists():
-        return None
-
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        name, value = line.split("=", 1)
-        if name == key:
-            return value.strip().strip("\"'")
-    return None
-
-
-# Base URL for API testing
-BASE_URL = (
-    "http://localhost:"
-    f"{os.getenv('SANDBOX_HOST_API_PORT') or _load_root_env_value('SANDBOX_HOST_API_PORT') or '8080'}"
-)
+# Base URL for API testing (override with SANDBOX_API_URL)
+BASE_URL = os.environ.get("SANDBOX_API_URL", "http://localhost:8080")
 
 @pytest.fixture
 def client():
@@ -51,15 +32,15 @@ def temp_test_file():
     import requests
     session = requests.Session()
     session.headers.update({"Content-Type": "application/json"})
-    
+
     content = "Line 1: Hello World\nLine 2: This is a test\nLine 3: Python testing"
     session.post(f"{BASE_URL}/api/v1/file/write", json={
         "file": temp_file,
         "content": content
     })
-    
+
     yield temp_file
-    
+
     # Cleanup via API
     try:
         session.post(f"{BASE_URL}/api/v1/file/write", json={

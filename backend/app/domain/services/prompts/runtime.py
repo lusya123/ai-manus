@@ -25,8 +25,6 @@ def build_runtime_environment_prompt(sandbox: Any = None) -> str:
         _line("Backend internal/container URL", settings.backend_internal_url),
         _line("Frontend URL reachable from sandbox browser/shell", settings.frontend_sandbox_url),
         _line("Backend URL reachable from sandbox browser/shell", settings.backend_sandbox_url),
-        _line("Claw public URL", settings.claw_public_url),
-        _line("Claw internal/container URL", settings.claw_internal_url),
         "",
         "Current sandbox:",
         _line("Sandbox provider", settings.sandbox_provider),

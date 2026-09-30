@@ -45,6 +45,7 @@ from app.infrastructure.external.runtime_network import (
 from app.domain.external.browser import Browser
 
 logger = logging.getLogger(__name__)
+_UNSET = object()
 
 class DockerSandbox(Sandbox):
     _DOCKER_SDK_TIMEOUT_SECONDS = 15.0
@@ -718,8 +719,9 @@ class DockerSandbox(Sandbox):
         )
         return ToolResult(**response.json())
 
-    async def file_read(self, file: str, start_line: int = None, 
-                        end_line: int = None, sudo: bool = False) -> ToolResult:
+    async def file_read(self, file: str, start_line: int = None,
+                        end_line: int = None, sudo: bool = False,
+                        max_length=_UNSET) -> ToolResult:
         """Read file content
         
         Args:
@@ -731,14 +733,17 @@ class DockerSandbox(Sandbox):
         Returns:
             File content
         """
-        response = await self.client.post(
-            self._api_url("/api/v1/file/read"),
-            json={
+        payload = {
                 "file": file,
                 "start_line": start_line,
                 "end_line": end_line,
                 "sudo": sudo
             }
+        if max_length is not _UNSET:
+            payload["max_length"] = max_length
+        response = await self.client.post(
+            self._api_url("/api/v1/file/read"),
+            json=payload,
         )
         return ToolResult(**response.json())
         
@@ -1266,12 +1271,12 @@ class DockerSandbox(Sandbox):
                         docker_client,
                         network_names=(
                             settings.sandbox_network or "bridge",
-                            settings.claw_network or "bridge",
+                            getattr(settings, "claw_network", None) or "bridge",
                         ),
                         sandbox_name_prefix=(
                             settings.sandbox_name_prefix or "None"
                         ),
-                        claw_name_prefix=settings.claw_name_prefix,
+                        claw_name_prefix=getattr(settings, "claw_name_prefix", None),
                     )
                 return cls._get_container_ip(container)
             finally:
@@ -1353,12 +1358,12 @@ class DockerSandbox(Sandbox):
                         docker_client,
                         network_names=(
                             settings.sandbox_network or "bridge",
-                            settings.claw_network or "bridge",
+                            getattr(settings, "claw_network", None) or "bridge",
                         ),
                         sandbox_name_prefix=(
                             settings.sandbox_name_prefix or "None"
                         ),
-                        claw_name_prefix=settings.claw_name_prefix,
+                        claw_name_prefix=getattr(settings, "claw_name_prefix", None),
                     )
                 return cls._get_container_ip(container)
             finally:

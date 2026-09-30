@@ -48,6 +48,7 @@ RUN apt-get \
     xvfb \
     x11vnc \
     xterm \
+    tmux \
     socat \
     supervisor \
     websockify \

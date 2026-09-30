@@ -119,15 +119,6 @@ def test_dynamic_docker_runtimes_cannot_disable_network_intent():
         _settings(
             runtime_network_isolation=False,
             sandbox_address=None,
-            claw_enabled=False,
-        ).validate()
-
-    with pytest.raises(ValueError, match="RUNTIME_NETWORK_ISOLATION=false"):
-        _settings(
-            runtime_network_isolation=False,
-            sandbox_address="fixed-sandbox",
-            claw_enabled=True,
-            claw_address=None,
         ).validate()
 
 
@@ -135,7 +126,6 @@ def test_fixed_or_non_docker_runtimes_may_use_external_isolation():
     _settings(
         runtime_network_isolation=False,
         sandbox_address="fixed-sandbox",
-        claw_enabled=False,
     ).validate()
 
     _settings(
@@ -144,7 +134,6 @@ def test_fixed_or_non_docker_runtimes_may_use_external_isolation():
         agentbay_api_key="provider-key",
         agentbay_image_id="image-id",
         agentbay_deployment_id="deployment-id",
-        claw_enabled=False,
     ).validate()
 
 
@@ -189,37 +178,6 @@ def test_agentbay_valid_configuration_passes_startup_validation():
         agentbay_image_id="image-id",
         agentbay_deployment_id="deployment-id",
     ).validate()
-
-
-def test_claw_hmac_keyring_rejects_weak_rotation_keys():
-    settings = _settings(
-        claw_api_key_hmac_keys=(
-            "current-secret-at-least-32-bytes,too-short"
-        )
-    )
-
-    with pytest.raises(ValueError, match="CLAW_API_KEY_HMAC_KEYS"):
-        settings.validate()
-
-
-def test_claw_history_budget_defaults_leave_mongo_document_headroom():
-    settings = _settings()
-
-    assert settings.claw_history_max_messages == 128
-    assert settings.claw_history_max_bytes == 8 * 1024 * 1024
-    assert settings.claw_history_max_bytes < 16 * 1024 * 1024
-
-
-def test_claw_history_budget_rejects_unsafe_or_internally_inconsistent_values():
-    with pytest.raises(ValueError, match="less than or equal to 12582912"):
-        _settings(claw_history_max_bytes=12 * 1024 * 1024 + 1)
-
-    with pytest.raises(ValueError, match="less than or equal to 128"):
-        _settings(claw_history_max_messages=129)
-
-    settings = _settings(claw_history_max_bytes=2 * 1024 * 1024)
-    with pytest.raises(ValueError, match="CLAW_HISTORY_MAX_BYTES"):
-        settings.validate()
 
 
 def test_session_history_budget_reserves_room_for_embedded_files():

@@ -12,14 +12,8 @@ from app.domain.external.sandbox import (
     SandboxProvisioningError,
     SandboxUnavailableError,
 )
-from app.domain.models.claw import Claw, ClawStatus
 from app.domain.models.session import Session
-from app.domain.services.claw_domain_service import ClawDomainService
-from app.infrastructure.external.claw import readiness as readiness_module
 from app.infrastructure.external import docker_async as docker_async_module
-from app.infrastructure.external.claw.docker_claw_runtime import (
-    DockerClawRuntime,
-)
 from app.infrastructure.external.sandbox.agentbay_sandbox import AgentBaySandbox
 from app.infrastructure.external.sandbox.docker_sandbox import DockerSandbox
 from app.infrastructure.external.sandbox.passthrough_provisioner import (
@@ -464,196 +458,18 @@ async def test_sandbox_readiness_has_one_total_deadline():
     assert elapsed < 0.15
 
 
-def _claw_settings() -> SimpleNamespace:
-    return SimpleNamespace(
-        runtime_network_isolation=False,
-        claw_network=None,
-        manus_api_base_url="http://gateway.internal:8000",
-        backend_sandbox_url=None,
-        backend_internal_url=None,
-        backend_public_url=None,
-        claw_name_prefix="bounded-claw",
-        claw_image="example/claw:test",
-        claw_ttl_seconds=0,
-        claw_memory_limit="1g",
-        claw_nano_cpus=1_000_000_000,
-        claw_pids_limit=128,
-        claw_publish_host_ports=False,
-        claw_http_container_port=18788,
-        claw_gateway_container_port=18789,
-        claw_host_bind_address="127.0.0.1",
-        claw_ready_timeout=1,
-    )
 
 
-async def test_claw_timeout_retains_name_and_destroy_never_claims_success(
-    monkeypatch,
-):
-    provider = _FakeDockerProvider()
-    monkeypatch.setattr("docker.from_env", provider.client)
-    monkeypatch.setattr(DockerClawRuntime, "_DOCKER_SDK_TIMEOUT_SECONDS", 0.02)
-    DockerClawRuntime._CREATE_OPERATIONS.clear()
-    runtime = object.__new__(DockerClawRuntime)
-    runtime.settings = _claw_settings()
-    monkeypatch.setattr(runtime, "_is_running_in_container", lambda: False)
-    stop = asyncio.Event()
-    ticks = [0]
-    ticker = asyncio.create_task(_count_event_loop_ticks(stop, ticks))
-
-    try:
-        with pytest.raises(Exception) as raised:
-            await runtime.create("claw-12345678", "runtime-secret")
-        instance_name = raised.value.claw_instance_name
-        assert instance_name == "bounded-claw-claw-123"
-        assert ticks[0] > 1
-        assert await runtime.destroy(instance_name) is False
-
-        provider.run_release.set()
-        await _wait_registry_clear(
-            DockerClawRuntime._CREATE_OPERATIONS, instance_name
-        )
-        assert await runtime.destroy(instance_name) is True
-        assert provider.removed is True
-        assert provider.run_count == 1
-    finally:
-        provider.run_release.set()
-        stop.set()
-        await ticker
-        DockerClawRuntime._CREATE_OPERATIONS.clear()
 
 
-async def test_claw_create_cancellation_carries_deterministic_name(monkeypatch):
-    provider = _FakeDockerProvider()
-    monkeypatch.setattr("docker.from_env", provider.client)
-    monkeypatch.setattr(DockerClawRuntime, "_DOCKER_SDK_TIMEOUT_SECONDS", 1.0)
-    DockerClawRuntime._CREATE_OPERATIONS.clear()
-    runtime = object.__new__(DockerClawRuntime)
-    runtime.settings = _claw_settings()
-
-    task = asyncio.create_task(runtime.create("claw-abcdefgh", "secret"))
-    await _wait_thread_event(provider.run_started)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError) as raised:
-        await task
-    assert raised.value.claw_instance_name == "bounded-claw-claw-abc"
-
-    provider.run_release.set()
-    await _wait_registry_clear(
-        DockerClawRuntime._CREATE_OPERATIONS,
-        raised.value.claw_instance_name,
-    )
-    assert await runtime.destroy(raised.value.claw_instance_name) is True
-    DockerClawRuntime._CREATE_OPERATIONS.clear()
 
 
-async def test_claw_same_generation_is_adopted_without_stale_replacement(
-    monkeypatch,
-):
-    provider = _FakeDockerProvider()
-    provider.created = True
-    provider.container.attrs["Config"] = {
-        "Labels": {
-            "ai-manus.kind": "claw",
-            "ai-manus.claw_id": "claw-stale-late",
-        }
-    }
-    provider.run_release.set()
-    monkeypatch.setattr("docker.from_env", provider.client)
-    monkeypatch.setattr(DockerClawRuntime, "_DOCKER_SDK_TIMEOUT_SECONDS", 0.02)
-    DockerClawRuntime._CREATE_OPERATIONS.clear()
-    runtime = object.__new__(DockerClawRuntime)
-    runtime.settings = _claw_settings()
-    instance_name = runtime.planned_id("claw-stale-late")
-
-    info = await runtime.create("claw-stale-late", "secret")
-
-    assert info.instance_name == instance_name
-    assert provider.get_count == 1
-    assert provider.run_count == 0
-    assert provider.created is True
-    assert provider.removed is False
-    assert await runtime.destroy(instance_name) is True
-    DockerClawRuntime._CREATE_OPERATIONS.clear()
 
 
-async def test_claw_never_replaces_or_deletes_a_different_owner(monkeypatch):
-    provider = _FakeDockerProvider()
-    provider.created = True
-    provider.run_release.set()
-    provider.container.attrs["Config"] = {
-        "Labels": {
-            "ai-manus.kind": "claw",
-            "ai-manus.claw_id": "different-claw-id",
-        }
-    }
-    monkeypatch.setattr("docker.from_env", provider.client)
-    DockerClawRuntime._CREATE_OPERATIONS.clear()
-    runtime = object.__new__(DockerClawRuntime)
-    runtime.settings = _claw_settings()
-    claw_id = "claw-owned-full-id"
-    instance_name = runtime.planned_id(claw_id)
-
-    with pytest.raises(PermissionError, match="another record"):
-        await runtime.create(claw_id, "secret")
-
-    assert provider.run_count == 0
-    assert provider.removed is False
-    assert await runtime.destroy_owned(instance_name, claw_id) is False
-    assert provider.removed is False
-    DockerClawRuntime._CREATE_OPERATIONS.clear()
 
 
-async def test_isolated_claw_resolver_never_reuses_stale_ip_when_missing(
-    monkeypatch,
-):
-    provider = _FakeDockerProvider()
-    monkeypatch.setattr("docker.from_env", provider.client)
-    monkeypatch.setattr(
-        "app.infrastructure.external.claw.docker_claw_runtime."
-        "require_containerized_runtime_gateway",
-        lambda: None,
-    )
-    runtime = object.__new__(DockerClawRuntime)
-    runtime.settings = SimpleNamespace(runtime_network_isolation=True)
-    DockerClawRuntime._CREATE_OPERATIONS.clear()
-
-    with pytest.raises(RuntimeError, match="no longer exists"):
-        await runtime.resolve_owned("bounded-claw-missing", "claw-owner")
-
-    DockerClawRuntime._CREATE_OPERATIONS.clear()
 
 
-async def test_shared_claw_readiness_uses_one_monotonic_deadline(monkeypatch):
-    calls = 0
-
-    class Client:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return None
-
-        async def get(self, url):
-            nonlocal calls
-            calls += 1
-            await asyncio.Event().wait()
-
-    monkeypatch.setattr(
-        readiness_module.httpx,
-        "AsyncClient",
-        lambda **kwargs: Client(),
-    )
-    started = asyncio.get_running_loop().time()
-    ready = await readiness_module.wait_for_http_health(
-        "http://claw",
-        total_timeout_seconds=0.025,
-        request_timeout_seconds=0.01,
-        retry_interval_seconds=0.002,
-    )
-
-    assert ready is False
-    assert calls >= 1
-    assert asyncio.get_running_loop().time() - started < 0.15
 
 
 async def test_agentbay_delete_timeout_retains_provider_id():
@@ -681,114 +497,14 @@ async def test_agentbay_delete_timeout_retains_provider_id():
     assert sandbox.client.is_closed is True
 
 
-class _ClawFailureRepository:
-    def __init__(
-        self,
-        *,
-        block_first_update: bool = False,
-        fail_update_count: int = 1,
-    ) -> None:
-        self.update_calls = 0
-        self.block_first_update = block_first_update
-        self.fail_update_count = fail_update_count
-        self.first_update_started = asyncio.Event()
-        self.release_first_update = asyncio.Event()
-        self.first_update_cancelled = False
-
-    async def update(self, claw):
-        self.update_calls += 1
-        if self.block_first_update and self.update_calls == 1:
-            self.first_update_started.set()
-            try:
-                await self.release_first_update.wait()
-            except asyncio.CancelledError:
-                self.first_update_cancelled = True
-                raise
-        elif self.update_calls <= self.fail_update_count:
-            raise ConnectionError("transient Mongo failure")
-        return claw
 
 
-class _FailedClawRuntime:
-    ready_timeout = 1
-
-    def __init__(
-        self,
-        *,
-        block_create: bool = False,
-        destroy_results: list[bool] | None = None,
-    ) -> None:
-        self.block_create = block_create
-        self.destroy_results = list(destroy_results or [False])
-        self.create_started = asyncio.Event()
-        self.destroyed = []
-
-    async def create(self, claw_id, api_key):
-        error = RuntimeError("Docker create indeterminate")
-        error.claw_instance_name = "bounded-claw-owned"
-        if not self.block_create:
-            raise error
-        self.create_started.set()
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError as cancelled:
-            cancelled.claw_instance_name = error.claw_instance_name
-            raise
-
-    async def destroy(self, instance_name):
-        self.destroyed.append(instance_name)
-        if len(self.destroy_results) > 1:
-            return self.destroy_results.pop(0)
-        return self.destroy_results[0]
 
 
-def _creating_claw() -> Claw:
-    return Claw(
-        id="claw-owned",
-        user_id="user",
-        api_key="runtime-key",
-        status=ClawStatus.CREATING,
-    )
 
 
-async def test_claw_failed_create_retries_ownership_persist_when_destroy_false():
-    repository = _ClawFailureRepository()
-    runtime = _FailedClawRuntime()
-    claw = _creating_claw()
-    service = ClawDomainService(repository, runtime, SimpleNamespace())
-
-    await service.provision_claw_instance(claw)
-
-    assert repository.update_calls == 2
-    assert runtime.destroyed == ["bounded-claw-owned"]
-    assert claw.container_name == "bounded-claw-owned"
-    assert "ownership was retained" in claw.error_message
 
 
-async def test_claw_repeated_cancel_does_not_cancel_ownership_persist():
-    repository = _ClawFailureRepository(
-        block_first_update=True,
-        fail_update_count=0,
-    )
-    runtime = _FailedClawRuntime(block_create=True)
-    claw = _creating_claw()
-    service = ClawDomainService(repository, runtime, SimpleNamespace())
-    task = asyncio.create_task(service.provision_claw_instance(claw))
-    await runtime.create_started.wait()
-
-    task.cancel()
-    await repository.first_update_started.wait()
-    task.cancel()
-    await asyncio.sleep(0)
-    assert repository.first_update_cancelled is False
-    repository.release_first_update.set()
-
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert repository.update_calls == 2
-    assert repository.first_update_cancelled is False
-    assert runtime.destroyed == ["bounded-claw-owned"]
-    assert claw.container_name == "bounded-claw-owned"
 
 
 async def test_passthrough_continuous_persist_failure_retries_exact_destroy(
@@ -909,26 +625,6 @@ async def test_passthrough_publish_failure_converges_on_exact_destroy(
     assert session.sandbox_provider is None
 
 
-async def test_claw_continuous_persist_failure_retries_exact_destroy(
-    monkeypatch,
-):
-    repository = _ClawFailureRepository(fail_update_count=100)
-    runtime = _FailedClawRuntime(destroy_results=[False, True])
-    claw = _creating_claw()
-    service = ClawDomainService(repository, runtime, SimpleNamespace())
-    monkeypatch.setattr(
-        service, "_OWNERSHIP_RECONCILE_INTERVAL_SECONDS", 0
-    )
-
-    await service.provision_claw_instance(claw)
-
-    assert repository.update_calls >= 3
-    assert runtime.destroyed == [
-        "bounded-claw-owned",
-        "bounded-claw-owned",
-    ]
-    assert claw.container_name is None
-    assert claw.container_ip is None
 
 
 async def test_passthrough_permanent_failure_has_bounded_foreground_reconcile(
@@ -987,130 +683,3 @@ async def test_passthrough_permanent_failure_has_bounded_foreground_reconcile(
 
     assert repository.calls == 0
     assert candidate.destroy_calls == 2
-
-
-async def test_claw_permanent_failure_defers_after_bounded_reconcile(
-    monkeypatch,
-):
-    repository = _ClawFailureRepository(fail_update_count=100)
-    runtime = _FailedClawRuntime(destroy_results=[False])
-    claw = _creating_claw()
-    service = ClawDomainService(repository, runtime, SimpleNamespace())
-    monkeypatch.setattr(
-        service, "_OWNERSHIP_RECONCILE_INTERVAL_SECONDS", 0
-    )
-    monkeypatch.setattr(
-        service, "_OWNERSHIP_RECONCILE_MAX_ATTEMPTS", 2
-    )
-
-    await asyncio.wait_for(service.provision_claw_instance(claw), timeout=0.2)
-
-    assert repository.update_calls == 3
-    assert runtime.destroyed == ["bounded-claw-owned"] * 3
-    assert claw.container_name == "bounded-claw-owned"
-    assert "deferred" in (claw.error_message or "")
-
-
-async def test_claw_prepare_prepublishes_deterministic_runtime_name():
-    class Repository:
-        def __init__(self):
-            self.claw = None
-
-        async def get_by_user_id(self, user_id):
-            return None
-
-        async def count_by_statuses(self, statuses):
-            return 0
-
-        async def create(self, claw):
-            self.claw = claw
-            return claw
-
-    class Runtime:
-        ready_timeout = 1
-
-        @staticmethod
-        def planned_id(claw_id):
-            return f"planned-{claw_id}"
-
-    repository = Repository()
-    service = ClawDomainService(repository, Runtime(), SimpleNamespace())
-
-    claw = await service.prepare_claw_for_creation("user-prepublished")
-
-    assert claw.container_name == f"planned-{claw.id}"
-    assert repository.claw.container_name == claw.container_name
-
-
-async def test_claw_bounded_failure_is_reconciled_from_durable_pointer(
-    monkeypatch,
-):
-    class Repository:
-        def __init__(self):
-            self.stored = None
-            self.fail_updates = False
-
-        async def get_by_user_id(self, user_id):
-            return None
-
-        async def count_by_statuses(self, statuses):
-            return 0
-
-        async def create(self, claw):
-            self.stored = claw.model_copy(deep=True)
-            return claw
-
-        async def update(self, claw):
-            if self.fail_updates:
-                raise ConnectionError("Mongo unavailable")
-            self.stored = claw.model_copy(deep=True)
-            return claw
-
-        async def list_by_statuses(self, statuses):
-            return [self.stored.model_copy(deep=True)]
-
-    class Runtime:
-        ready_timeout = 1
-
-        def __init__(self):
-            self.allow_destroy = False
-            self.destroy_calls = 0
-
-        @staticmethod
-        def planned_id(claw_id):
-            return f"planned-{claw_id}"
-
-        async def create(self, claw_id, api_key):
-            raise RuntimeError("indeterminate Docker create")
-
-        async def destroy(self, instance_name):
-            self.destroy_calls += 1
-            return self.allow_destroy
-
-    repository = Repository()
-    runtime = Runtime()
-    service = ClawDomainService(repository, runtime, SimpleNamespace())
-    monkeypatch.setattr(
-        service, "_OWNERSHIP_RECONCILE_INTERVAL_SECONDS", 0
-    )
-    monkeypatch.setattr(
-        service, "_OWNERSHIP_RECONCILE_MAX_ATTEMPTS", 2
-    )
-    claw = await service.prepare_claw_for_creation("durable-user")
-    durable_name = claw.container_name
-
-    repository.fail_updates = True
-    await asyncio.wait_for(service.provision_claw_instance(claw), timeout=0.2)
-
-    assert repository.stored.status == ClawStatus.CREATING
-    assert repository.stored.container_name == durable_name
-
-    repository.fail_updates = False
-    repository.stored.updated_at = datetime.now(UTC) - timedelta(minutes=5)
-    runtime.allow_destroy = True
-    result = await service.cleanup_instances()
-
-    assert result == {"removed": 0, "errored": 1}
-    assert repository.stored.status == ClawStatus.ERROR
-    assert repository.stored.container_name is None
-    assert runtime.destroy_calls == 4

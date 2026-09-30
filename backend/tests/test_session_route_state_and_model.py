@@ -264,6 +264,7 @@ async def test_chat_ws_accepts_attachment_only_submission(monkeypatch):
             "attachments": [
                 FileInfo(file_id="owned-file", filename="report.pdf")
             ],
+            "required_skills": None,
         }
     ]
     assert any(

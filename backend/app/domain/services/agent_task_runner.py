@@ -15,7 +15,7 @@ from glob import escape as escape_glob
 from pathlib import PurePosixPath
 import debugpy
 from pydantic import TypeAdapter
-from app.domain.models.message import Message, LLMMessage, Role
+from app.domain.models.message import Message, RequiredSkill, LLMMessage, Role
 from app.domain.models.event import (
     BaseEvent,
     ErrorEvent,
@@ -69,6 +69,7 @@ from app.domain.services.tools.mcp import MCPToolkit
 from app.domain.models.tool_result import ToolResult
 from app.domain.models.search import SearchResults
 from app.domain.services.prompts.system import format_project_instructions
+from app.application.services.skill_runtime_service import SkillRuntimeService
 
 logger = logging.getLogger(__name__)
 
@@ -511,6 +512,7 @@ class AgentTaskRunner(TaskRunner):
         turn_submission_repository: Optional[TurnSubmissionRepository] = None,
         cleanup_lease: Optional[_RunnerCleanupLease] = None,
         project_repository: Optional[ProjectRepository] = None,
+        skill_runtime_service: Optional[SkillRuntimeService] = None,
     ):
         self._session_id = session_id
         self._agent_id = agent_id
@@ -524,6 +526,7 @@ class AgentTaskRunner(TaskRunner):
         self._file_storage = file_storage
         self._mcp_repository = mcp_repository
         self._project_repository = project_repository
+        self._skill_runtime_service = skill_runtime_service
         self._llm = llm
         self._turn_submission_repository = turn_submission_repository
         self._worker_id = str(uuid.uuid4())
@@ -2176,6 +2179,10 @@ class AgentTaskRunner(TaskRunner):
                 await self._mcp_tool.initialized(
                     await self._mcp_repository.get_mcp_config()
                 )
+                if getattr(self, "_skill_runtime_service", None):
+                    await self._skill_runtime_service.sync_enabled_skills_to_sandbox(
+                        self._user_id, self._sandbox
+                    )
                 await self._sync_message_attachments_to_sandbox(input_event)
             logger.info(
                 "Agent received durable input: agent_id=%s session_id=%s submission_id=%s "
@@ -2192,7 +2199,16 @@ class AgentTaskRunner(TaskRunner):
                     for attachment in (input_event.attachments or [])
                     if attachment.file_path
                 ],
+                required_skills=[
+                    RequiredSkill(skill_id=item.get("id", ""), name=item.get("name", ""))
+                    for item in (input_event.required_skills or [])
+                    if isinstance(item, dict) and item.get("id") and item.get("name")
+                ],
             )
+            if getattr(self, "_skill_runtime_service", None):
+                message_obj = await self._skill_runtime_service.resolve_message(
+                    self._user_id, message_obj
+                )
             flow = (
                 self._run_chat(message_obj)
                 if is_chat
@@ -2377,6 +2393,10 @@ class AgentTaskRunner(TaskRunner):
                 if not is_chat:
                     await self._sandbox.ensure_sandbox()
                     await self._mcp_tool.initialized(await self._mcp_repository.get_mcp_config())
+                    if getattr(self, "_skill_runtime_service", None):
+                        await self._skill_runtime_service.sync_enabled_skills_to_sandbox(
+                            self._user_id, self._sandbox
+                        )
 
                 event = await self._pop_event(task)
                 if not isinstance(event, MessageEvent):
@@ -2405,7 +2425,16 @@ class AgentTaskRunner(TaskRunner):
                         for attachment in (event.attachments or [])
                         if attachment.file_path
                     ],
+                    required_skills=[
+                        RequiredSkill(skill_id=item.get("id", ""), name=item.get("name", ""))
+                        for item in (event.required_skills or [])
+                        if isinstance(item, dict) and item.get("id") and item.get("name")
+                    ],
                 )
+                if getattr(self, "_skill_runtime_service", None):
+                    message_obj = await self._skill_runtime_service.resolve_message(
+                        self._user_id, message_obj
+                    )
                 
                 flow = (
                     self._run_chat(message_obj)
@@ -2473,6 +2502,13 @@ class AgentTaskRunner(TaskRunner):
         project_section = format_project_instructions(project_instruction)
         if project_section:
             system_content = f"{system_content}\n\n{project_section}"
+        if getattr(self, "_skill_runtime_service", None):
+            catalog = await self._skill_runtime_service.build_skill_catalog_section(self._user_id)
+            if catalog:
+                system_content = f"{system_content}\n\n{catalog}"
+            marker = self._skill_runtime_service.format_chat_system_skill(message)
+            if marker:
+                system_content = f"{system_content}\n\n{marker}"
 
         history: List[LLMMessage] = [
             LLMMessage(
@@ -2503,6 +2539,12 @@ class AgentTaskRunner(TaskRunner):
         resumes_waiting: Optional[bool] = None,
     ) -> AsyncGenerator[BaseEvent, None]:
         """Process a single message through the agent's flow and yield events"""
+        if getattr(self, "_skill_runtime_service", None):
+            pairs = await self._skill_runtime_service.list_enabled_skill_pairs(self._user_id)
+            bodies = await self._skill_runtime_service.build_enabled_skill_bodies(self._user_id)
+            self._flow.set_enabled_skills(pairs, bodies)
+            catalog = await self._skill_runtime_service.build_skill_catalog_section(self._user_id)
+            self._flow.set_skill_catalog(catalog or None)
         if not message.message and not message.attachments:
             logger.warning(f"Agent {self._agent_id} received empty message")
             yield ErrorEvent(error="No message")
@@ -2676,6 +2718,7 @@ class AgentTaskRunnerFactory(TaskRunnerFactory):
         llm: Optional[LLM] = None,
         turn_submission_repository: Optional[TurnSubmissionRepository] = None,
         project_repository: Optional[ProjectRepository] = None,
+        skill_runtime_service: Optional[SkillRuntimeService] = None,
     ):
         self._agent_repository = agent_repository
         self._session_repository = session_repository
@@ -2687,6 +2730,7 @@ class AgentTaskRunnerFactory(TaskRunnerFactory):
         self._search_engine = search_engine
         self._turn_submission_repository = turn_submission_repository
         self._project_repository = project_repository
+        self._skill_runtime_service = skill_runtime_service
 
     @staticmethod
     def build_params(
@@ -2840,6 +2884,7 @@ class AgentTaskRunnerFactory(TaskRunnerFactory):
                 turn_submission_repository=self._turn_submission_repository,
                 cleanup_lease=cleanup_lease,
                 project_repository=self._project_repository,
+                skill_runtime_service=self._skill_runtime_service,
             )
         except BaseException:
             # A runner never took ownership, so release every constructed

@@ -950,7 +950,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        component: [frontend, backend, sandbox, claw]
+        component: [frontend, backend, sandbox]
     
     steps:
       - name: Checkout code

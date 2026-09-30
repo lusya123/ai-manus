@@ -1,97 +1,92 @@
-import asyncio
-import json
 import logging
+import json
+import asyncio
 import uuid
 from abc import ABC
-from typing import Any, AsyncGenerator, List, Literal, Optional
-
-from app.core.config import get_settings
-from app.domain.external.llm import LLM
+from typing import Any, List, Literal, Optional, AsyncGenerator
+from app.domain.models.message import Message, LLMMessage, Role, ToolCall
+from app.domain.services.tools.base import BaseToolkit, OutputTool, Tool, ValidationError, take_brief
 from app.domain.models.event import (
     BaseEvent,
-    ErrorEvent,
-    MessageEvent,
     ToolEvent,
     ToolStatus,
+    ErrorEvent,
+    MessageEvent,
     TerminalUpdateEvent,
 )
-from app.domain.models.message import LLMMessage, Message, Role, ToolCall
 from app.domain.models.tool_result import ToolResult
-from app.domain.repositories.agent_repository import AgentRepository
-from app.domain.services.tools.base import BaseToolkit, OutputTool, Tool, ValidationError
 from app.domain.utils.error_reporting import safe_exception_summary
+from app.core.config import get_settings
+from app.domain.repositories.agent_repository import AgentRepository
+from app.domain.external.llm import LLM
 
 
 logger = logging.getLogger(__name__)
 
 
 class StructuredOutputEvent(BaseEvent):
-    """Internal, validated output consumed by concrete agents only."""
+    """Internal event carrying validated structured output.
+
+    Emitted when the model submits its result through an :class:`OutputTool`.
+    Consumed by the concrete agents; never part of the public
+    ``AgentEvent`` union streamed to clients.
+    """
 
     type: Literal["structured_output"] = "structured_output"
     output: Any
 
 
 class BaseAgent(ABC):
-    """Shared native-tool agent loop with bounded, durable context."""
+    """
+    Base agent class, defining the basic behavior of the agent
+    """
 
     name: str = ""
-    # Compatibility for persisted agents and small test subclasses. New
-    # concrete agents override build_system_prompt instead.
-    system_prompt: str = ""
-    format: Optional[str] = None
     max_iterations: int = 100
     max_retries: int = 3
     retry_interval: float = 1.0
     tool_choice: Optional[str] = None
+    # Context engineering budgets: tool results are truncated at ingestion,
+    # and memory is compacted before each model call when over budget.
     max_tool_result_chars: int = 16000
     max_context_tokens: int = 100000
-    _EMPTY_RESPONSE_RETRY_PROMPT = (
-        "Your previous response was empty. Continue the task now. If a tool is "
-        "needed, call exactly one available tool with complete JSON arguments. "
-        "If no tool is needed, respond with the required final text."
-    )
-    _ASK_USER_TOOL_NAME = "message_ask_user"
-    _WAITING_FOR_USER_TOOL_RESULT = json.dumps(
-        {
-            "success": True,
-            "message": "Waiting for the user's response.",
-        }
-    )
-    _INTERRUPTED_TOOL_RESULT = (
-        "The previous execution was interrupted before this tool's result could "
-        "be confirmed. Do not repeat the operation automatically; inspect the "
-        "current state first."
-    )
 
     def __init__(
         self,
         agent_id: str,
         agent_repository: AgentRepository,
         llm: LLM,
-        tools: Optional[List[BaseToolkit]] = None,
+        tools: List[BaseToolkit] = []
     ):
         self._agent_id = agent_id
         self._repository = agent_repository
         self._llm = llm
-        self.toolkits = tools or []
+        self.toolkits = tools
         self.memory = None
         self._output_tool: Optional[OutputTool] = None
-        self._tool_call_timeout_seconds = get_settings().tool_call_timeout_seconds
         self._project_instruction: Optional[str] = None
+        self._skill_catalog: Optional[str] = None
+        self._skill_context: Optional[str] = None
+        self._tool_call_timeout_seconds = get_settings().tool_call_timeout_seconds
 
     def set_project_instruction(self, instruction: Optional[str]) -> None:
         """Bind project-level guidance used when assembling the system prompt."""
         text = (instruction or "").strip()
         self._project_instruction = text or None
 
-    def build_system_prompt(self) -> str:
-        """Return the current prompt; concrete agents assemble it dynamically."""
-        return self.system_prompt
+    def set_skill_catalog(self, catalog: Optional[str]) -> None:
+        """Bind L1 skill metadata catalog (name + description per enabled skill)."""
+        text = (catalog or "").strip()
+        self._skill_catalog = text or None
 
-    async def _parse_json(self, text: str) -> dict:
-        """Legacy rolling-upgrade helper; the native output loop does not use it."""
-        return await self._llm.parse_json(text)
+    def set_skill_context(self, context: Optional[str]) -> None:
+        """Bind active skill guidance for the current user turn."""
+        text = (context or "").strip()
+        self._skill_context = text or None
+
+    def build_system_prompt(self) -> str:
+        """Assemble the system prompt for this agent; overridden by subclasses."""
+        return getattr(self, "system_prompt", "")
 
     async def sync_system_prompt(self) -> None:
         """Insert or refresh the leading system message so project edits apply."""
@@ -107,7 +102,7 @@ class BaseAgent(ABC):
             await self._repository.save_memory(self._agent_id, self.name, self.memory)
 
     def get_tool(self, name: str) -> Optional[Tool]:
-        """Return an invocable work tool by name."""
+        """Get specified tool"""
         for toolkit in self.toolkits:
             tool = toolkit.get_tool(name)
             if tool:
@@ -115,15 +110,14 @@ class BaseAgent(ABC):
         return None
 
     def get_tool_schemas(self) -> List[dict]:
-        """Return work schemas plus the active structured-output contract."""
-        schemas = [
-            schema
-            for toolkit in self.toolkits
-            for schema in toolkit.get_tool_schemas()
-        ]
-        output_tool = getattr(self, "_output_tool", None)
-        if output_tool:
-            schemas.append(output_tool.to_openai_schema())
+        """Get OpenAI function schemas for all available tools.
+
+        Includes the active output tool, if any, so the model can submit
+        structured results through native function calling.
+        """
+        schemas = [schema for toolkit in self.toolkits for schema in toolkit.get_tool_schemas()]
+        if self._output_tool:
+            schemas.append(self._output_tool.to_openai_schema())
         return schemas
 
     def _truncate_tool_result(self, content: str) -> str:
@@ -210,336 +204,220 @@ class BaseAgent(ABC):
             content=last_error,
         )
 
-    def _handle_output_call(
-        self, tool_call: ToolCall
-    ) -> tuple[LLMMessage, Optional[Any]]:
-        """Validate structured output and provide safe self-repair feedback."""
-        output_tool = getattr(self, "_output_tool", None)
-        if output_tool is None:
-            raise RuntimeError("No structured output tool is active")
+    def _handle_output_call(self, tool_call: ToolCall) -> tuple[LLMMessage, Optional[Any]]:
+        """Validate a structured-output tool call.
+
+        Returns the tool response message to append to memory and, on
+        success, the validated output model. On validation failure the
+        response carries the error so the model can self-repair on the next
+        iteration.
+        """
         try:
-            output = output_tool.validate(tool_call.args)
-            return (
-                LLMMessage.tool(
-                    tool_call_id=tool_call.id,
-                    name=tool_call.name,
-                    content='{"success": true}',
-                ),
-                output,
+            output = self._output_tool.validate(tool_call.args)
+            response = LLMMessage.tool(
+                tool_call_id=tool_call.id,
+                name=tool_call.name,
+                content='{"success": true}',
             )
-        except ValidationError as exc:
-            # Pydantic's default string contains the rejected input. Exclude it
-            # from logs and feedback so a malformed secret is not duplicated.
-            details = exc.errors(include_url=False, include_input=False)
-            logger.warning(
-                "Structured output validation failed: operation=%s errors=%d",
-                tool_call.name,
-                len(details),
+            return response, output
+        except ValidationError as e:
+            logger.warning(f"Structured output validation failed for {tool_call.name}: {e}")
+            response = LLMMessage.tool(
+                tool_call_id=tool_call.id,
+                name=tool_call.name,
+                content=f"Invalid arguments, please correct and call {tool_call.name} again: {e}",
             )
-            feedback = json.dumps(details, ensure_ascii=False, default=str)
-            return (
-                LLMMessage.tool(
-                    tool_call_id=tool_call.id,
-                    name=tool_call.name,
-                    content=(
-                        "Invalid arguments; correct the schema errors and call "
-                        f"{tool_call.name} again: {feedback}"
-                    ),
-                ),
-                None,
-            )
-
-    @staticmethod
-    def _control_tool_must_be_called_alone(name: str) -> str:
-        """Return model feedback for a control call mixed with other calls."""
-        return (
-            f"The `{name}` control tool must be called alone in one assistant "
-            "response. Other work-tool calls in this response were handled once; "
-            "observe their results and then call the control tool alone if it is "
-            "still needed. Do not repeat successful work automatically."
-        )
-
-    @classmethod
-    def _ask_user_must_be_called_alone(cls) -> str:
-        """Require an authorization/input request before any sibling work."""
-        return (
-            f"The `{cls._ASK_USER_TOOL_NAME}` control tool must be called alone "
-            "in one assistant response. No calls in this mixed response were "
-            "executed. Ask the user first, then decide which work tools are still "
-            "needed after receiving the answer."
-        )
-
-    @classmethod
-    def _tool_deferred_for_user_input(cls, name: str) -> str:
-        """Protocol-valid result for work withheld pending user input."""
-        return (
-            f"The `{name}` call was not executed because this response also "
-            f"called `{cls._ASK_USER_TOOL_NAME}`. Request the required user "
-            "input in a separate assistant response, then call this tool again "
-            "only if it is still appropriate."
-        )
+            return response, None
 
     async def execute(
         self,
         request: str,
         output_tool: Optional[OutputTool] = None,
-        format: Optional[str] = None,
     ) -> AsyncGenerator[BaseEvent, None]:
-        """Run work tools until plain text or validated structured output."""
+        """Run the agent loop.
+
+        The model works with native tool calling. When ``output_tool`` is
+        provided, the loop finishes when the model calls it with valid
+        arguments, yielding a :class:`StructuredOutputEvent`. Otherwise a
+        plain assistant message ends the loop with a :class:`MessageEvent`.
+        """
         self._output_tool = output_tool
-        response_format = format or self.format
-        empty_response_retries = 0
         try:
-            message = await self.ask(request, response_format)
-            for _ in range(self.max_iterations):
-                if not message.tool_calls:
-                    if output_tool:
-                        if empty_response_retries >= self.max_retries:
-                            yield ErrorEvent(
-                                error="Model did not submit the required structured result."
-                            )
-                            return
-                        empty_response_retries += 1
-                        message = await self.ask_with_messages(
-                            [
-                                LLMMessage.user(
-                                    "Submit your result now by calling the "
-                                    f"`{output_tool.name}` tool."
-                                )
-                            ],
-                            response_format,
-                        )
-                        continue
-
-                    if message.content.strip():
-                        yield MessageEvent(message=message.content)
-                        return
-                    if empty_response_retries >= self.max_retries:
-                        yield ErrorEvent(
-                            error="Model returned an incomplete response after retries."
-                        )
-                        return
-                    empty_response_retries += 1
-                    logger.warning(
-                        "Empty model response in execute loop, retrying (%d/%d)",
-                        empty_response_retries,
-                        self.max_retries,
-                    )
-                    message = await self.ask_with_messages(
-                        [LLMMessage.user(self._EMPTY_RESPONSE_RETRY_PROMPT)],
-                        response_format,
-                    )
-                    continue
-
-                empty_response_retries = 0
-                tool_responses: List[LLMMessage] = []
-                structured_output: Optional[Any] = None
-                # ``message_ask_user`` means execution is blocked on essential
-                # input or authorization. If it appears in a parallel batch,
-                # executing any sibling would risk acting before consent. Pair
-                # every call with a deferred result and require a fresh, lone
-                # ask-user call. Structured output is different: sibling work
-                # may run once, but the premature output must be retried after
-                # the model has observed those results.
-                mixed_ask_user_call = len(message.tool_calls) > 1 and any(
-                    tool_call.name == self._ASK_USER_TOOL_NAME
-                    for tool_call in message.tool_calls
-                )
-                mixed_output_call = len(message.tool_calls) > 1 and any(
-                    output_tool is not None and tool_call.name == output_tool.name
-                    for tool_call in message.tool_calls
-                )
-                waiting_for_user = False
-                for tool_call in message.tool_calls:
-                    if not tool_call.id:
-                        tool_call.id = str(uuid.uuid4())
-                    function_name = tool_call.name
-
-                    is_output_call = bool(
-                        output_tool and function_name == output_tool.name
-                    )
-                    is_ask_user_call = function_name == self._ASK_USER_TOOL_NAME
-                    if mixed_ask_user_call:
-                        content = (
-                            self._ask_user_must_be_called_alone()
-                            if is_ask_user_call
-                            else self._tool_deferred_for_user_input(function_name)
-                        )
-                        tool_responses.append(
-                            LLMMessage.tool(
-                                tool_call_id=tool_call.id,
-                                name=function_name,
-                                content=content,
-                            )
-                        )
-                        continue
-
-                    if mixed_output_call and is_output_call:
-                        tool_responses.append(
-                            LLMMessage.tool(
-                                tool_call_id=tool_call.id,
-                                name=function_name,
-                                content=self._control_tool_must_be_called_alone(
-                                    function_name
-                                ),
-                            )
-                        )
-                        continue
-
-                    if is_output_call:
-                        response, candidate = self._handle_output_call(tool_call)
-                        tool_responses.append(response)
-                        if structured_output is None and candidate is not None:
-                            structured_output = candidate
-                        continue
-
-                    tool = self.get_tool(function_name)
-                    if not tool:
-                        # Always answer a tool call so persisted/API history is
-                        # structurally valid on the next model request. This is
-                        # recoverable model feedback, not a public task error.
-                        tool_responses.append(
-                            LLMMessage.tool(
-                                tool_call_id=tool_call.id,
-                                name=function_name,
-                                content=f"Unknown tool: {function_name}",
-                            )
-                        )
-                        continue
-
-                    yield ToolEvent(
-                        status=ToolStatus.CALLING,
-                        tool_call_id=tool_call.id,
-                        tool_name=tool.toolkit.name,
-                        function_name=function_name,
-                        function_args=tool_call.args,
-                    )
-                    # Stream changed terminal output while a shell call runs. The
-                    # actual invocation still goes through ``invoke_tool``, so the
-                    # configured timeout, retry policy, result bound, and safe error
-                    # handling remain authoritative.
-                    function_args = tool_call.args
-                    shell_id = (
-                        function_args.get("id")
-                        if tool.toolkit.name == "shell" and isinstance(function_args, dict)
-                        else None
-                    )
-                    if shell_id and hasattr(tool.toolkit, "sandbox"):
-                        invoke_task = asyncio.create_task(self.invoke_tool(tool, tool_call))
-                        last_fingerprint: Optional[str] = None
-
-                        def _console_fingerprint(console: Any) -> str:
-                            """Cheap change detector — avoid repr() on large consoles."""
-                            if console is None:
-                                return "0:"
-                            if isinstance(console, str):
-                                return f"s:{len(console)}:{console[-80:]}"
-                            if isinstance(console, list):
-                                if not console:
-                                    return "0:"
-                                last = console[-1]
-                                if isinstance(last, dict):
-                                    tail = f"{last.get('command', '')}|{str(last.get('output', ''))[-60:]}"
-                                else:
-                                    tail = str(last)[-80:]
-                                return f"l:{len(console)}:{tail}"
-                            return f"o:{type(console).__name__}:{str(console)[-80:]}"
-
-                        try:
-                            while not invoke_task.done():
-                                done, _ = await asyncio.wait(
-                                    {invoke_task}, timeout=1.0
-                                )
-                                if done:
-                                    break
-                                try:
-                                    view = await tool.toolkit.sandbox.view_shell(
-                                        shell_id, console=True
-                                    )
-                                    console = (
-                                        view.data.get("console", [])
-                                        if view and getattr(view, "data", None)
-                                        else []
-                                    )
-                                    fingerprint = _console_fingerprint(console)
-                                    if fingerprint != last_fingerprint:
-                                        last_fingerprint = fingerprint
-                                        yield TerminalUpdateEvent(
-                                            shell_id=shell_id,
-                                            output=console,
-                                        )
-                                except Exception as exc:
-                                    logger.debug(
-                                        "Shell live poll failed: agent_id=%s "
-                                        "operation=view_shell error=%s",
-                                        self._agent_id,
-                                        safe_exception_summary(exc),
-                                    )
-                            tool_result = await invoke_task
-                        finally:
-                            if not invoke_task.done():
-                                invoke_task.cancel()
-                                await asyncio.gather(
-                                    invoke_task, return_exceptions=True
-                                )
-                    else:
-                        tool_result = await self.invoke_tool(tool, tool_call)
-
-                    if is_ask_user_call:
-                        # Persist a structurally valid placeholder *before* the
-                        # CALLED event. ExecutionAgent turns that event into a
-                        # WaitEvent and closes this generator, so appending at
-                        # the bottom of the loop would lose the result.  The next
-                        # user turn replaces this exact call-id placeholder.
-                        tool_result = tool_result.model_copy(
-                            update={
-                                "content": self._WAITING_FOR_USER_TOOL_RESULT,
-                            }
-                        )
-                        tool_responses.append(tool_result)
-                        await self._add_to_memory(tool_responses)
-                        tool_responses = []
-                        waiting_for_user = True
-
-                    yield ToolEvent(
-                        status=ToolStatus.CALLED,
-                        tool_call_id=tool_call.id,
-                        tool_name=tool.toolkit.name,
-                        function_name=function_name,
-                        function_args=tool_call.args,
-                        function_result=tool_result.artifact,
-                    )
-                    if not is_ask_user_call:
-                        tool_responses.append(tool_result)
-
-                if waiting_for_user:
-                    # A lone ask-user call is a terminal control transition for
-                    # this execution turn. The concrete execution agent exposes
-                    # WaitEvent; never ask the model to continue without the
-                    # user's answer.
-                    return
-
-                if structured_output is not None:
-                    await self._add_to_memory(tool_responses)
-                    yield StructuredOutputEvent(output=structured_output)
-                    return
-
-                message = await self.ask_with_messages(
-                    tool_responses, response_format
-                )
-
-            yield ErrorEvent(
-                error="Maximum iteration count reached, failed to complete the task"
-            )
+            message = await self.ask(request)
+            async for event in self._tool_loop(message):
+                yield event
         finally:
             self._output_tool = None
 
-    async def _ensure_memory(self) -> None:
+    async def continue_execute(
+        self,
+        output_tool: Optional[OutputTool] = None,
+    ) -> AsyncGenerator[BaseEvent, None]:
+        """Resume the tool loop from current memory without adding a user turn."""
+        self._output_tool = output_tool
+        try:
+            await self._ensure_memory()
+            if self.memory.estimate_tokens() > self.max_context_tokens:
+                self.memory.compact(max_tokens=self.max_context_tokens)
+                await self._repository.save_memory(
+                    self._agent_id, self.name, self.memory
+                )
+
+            message = await self._llm.ask(
+                messages=list(self.memory.get_messages()),
+                tools=self.get_tool_schemas(),
+                tool_choice=self.tool_choice,
+            )
+            logger.debug(f"Response from model: {message}")
+            await self._add_to_memory([message])
+
+            async for event in self._tool_loop(message):
+                yield event
+        finally:
+            self._output_tool = None
+
+    async def _tool_loop(
+        self,
+        message: LLMMessage,
+    ) -> AsyncGenerator[BaseEvent, None]:
+        """Process model tool calls until the run produces a final event."""
+        for _ in range(self.max_iterations):
+            if not message.tool_calls:
+                # Plain message: final answer for unstructured runs; for
+                # structured runs, nudge the model to use the output tool.
+                if not self._output_tool:
+                    break
+                message = await self.ask(
+                    f"Submit your result by calling the `{self._output_tool.name}` tool."
+                )
+                continue
+
+            tool_responses = []
+            structured_output: Optional[Any] = None
+            for tool_call in message.tool_calls:
+                function_name = tool_call.name
+                if not tool_call.id:
+                    tool_call.id = str(uuid.uuid4())
+                tool_call_id = tool_call.id
+                brief, function_args = take_brief(tool_call.args)
+
+                if (
+                    self._output_tool
+                    and function_name == self._output_tool.name
+                ):
+                    response, structured_output = self._handle_output_call(tool_call)
+                    tool_responses.append(response)
+                    continue
+
+                tool = self.get_tool(function_name)
+                if not tool:
+                    yield ErrorEvent(error=f"Unknown tool: {function_name}")
+                    tool_responses.append(LLMMessage.tool(
+                        tool_call_id=tool_call_id,
+                        name=function_name,
+                        content=f"Unknown tool: {function_name}",
+                    ))
+                    continue
+
+                # Generate event before tool call
+                yield ToolEvent(
+                    status=ToolStatus.CALLING,
+                    tool_call_id=tool_call_id,
+                    tool_name=tool.toolkit.name,
+                    function_name=function_name,
+                    function_args=function_args,
+                    brief=brief,
+                )
+
+                # Official terminalUpdate: poll shell console while the tool runs
+                shell_id = (
+                    function_args.get("id")
+                    if tool.toolkit.name == "shell" and isinstance(function_args, dict)
+                    else None
+                )
+                if shell_id and hasattr(tool.toolkit, "sandbox"):
+                    invoke_task = asyncio.create_task(self.invoke_tool(tool, tool_call))
+                    last_fingerprint: Optional[str] = None
+
+                    def _console_fingerprint(console: Any) -> str:
+                        """Cheap change detector — avoid repr() on large consoles."""
+                        if console is None:
+                            return "0:"
+                        if isinstance(console, str):
+                            return f"s:{len(console)}:{console[-80:]}"
+                        if isinstance(console, list):
+                            if not console:
+                                return "0:"
+                            last = console[-1]
+                            if isinstance(last, dict):
+                                tail = f"{last.get('command', '')}|{str(last.get('output', ''))[-60:]}"
+                            else:
+                                tail = str(last)[-80:]
+                            return f"l:{len(console)}:{tail}"
+                        return f"o:{type(console).__name__}:{str(console)[-80:]}"
+
+                    while not invoke_task.done():
+                        done, _ = await asyncio.wait({invoke_task}, timeout=1.0)
+                        if done:
+                            break
+                        try:
+                            view = await tool.toolkit.sandbox.view_shell(
+                                shell_id, console=True
+                            )
+                            console = (
+                                view.data.get("console", [])
+                                if view and getattr(view, "data", None)
+                                else []
+                            )
+                            fingerprint = _console_fingerprint(console)
+                            if fingerprint != last_fingerprint:
+                                last_fingerprint = fingerprint
+                                yield TerminalUpdateEvent(
+                                    shell_id=shell_id,
+                                    output=console,
+                                )
+                        except Exception:
+                            logger.debug(
+                                "Shell live poll failed for %s",
+                                shell_id,
+                                exc_info=True,
+                            )
+                    tool_result = await invoke_task
+                else:
+                    tool_result = await self.invoke_tool(tool, tool_call)
+
+                # Generate event after tool call
+                yield ToolEvent(
+                    status=ToolStatus.CALLED,
+                    tool_call_id=tool_call_id,
+                    tool_name=tool.toolkit.name,
+                    function_name=function_name,
+                    function_args=function_args,
+                    function_result=tool_result.artifact,
+                    brief=brief,
+                )
+
+                tool_responses.append(tool_result)
+
+            if structured_output is not None:
+                # Persist the tool responses so the tool-call pairing in
+                # memory stays consistent, then finish.
+                await self._add_to_memory(tool_responses)
+                yield StructuredOutputEvent(output=structured_output)
+                return
+
+            message = await self.ask_with_messages(tool_responses)
+        else:
+            yield ErrorEvent(error="Maximum iteration count reached, failed to complete the task")
+
+        yield MessageEvent(message=message.content)
+
+    async def _ensure_memory(self):
         if not self.memory:
             self.memory = await self._repository.get_memory(self._agent_id, self.name)
 
     def _ensure_current_system_prompt(self) -> None:
-        """Insert or refresh the dynamic system prompt in persisted memory."""
+        """Refresh the dynamic prompt when project or skill guidance changes."""
         prompt = self.build_system_prompt()
         if not prompt:
             return
@@ -554,7 +432,7 @@ class BaseAgent(ABC):
         self.memory.messages.insert(0, LLMMessage.system(prompt))
 
     async def _add_to_memory(self, messages: List[LLMMessage]) -> None:
-        """Refresh the system prompt, append messages, and persist memory."""
+        """Update memory and save to repository"""
         await self._ensure_memory()
         self._ensure_current_system_prompt()
         self.memory.add_messages(messages)
@@ -565,94 +443,45 @@ class BaseAgent(ABC):
         self.memory.roll_back()
         await self._repository.save_memory(self._agent_id, self.name, self.memory)
 
-    async def ask_with_messages(
-        self,
-        messages: List[LLMMessage],
-        format: Optional[str] = None,
-    ) -> LLMMessage:
+    async def ask_with_messages(self, messages: List[LLMMessage]) -> LLMMessage:
         await self._add_to_memory(messages)
 
+        # Token-aware guard: reclaim budget from old tool results before the
+        # context is sent to the model.
         if self.memory.estimate_tokens() > self.max_context_tokens:
             self.memory.compact(max_tokens=self.max_context_tokens)
             await self._repository.save_memory(self._agent_id, self.name, self.memory)
 
+        context = list(self.memory.get_messages())
         message = await self._llm.ask(
-            messages=list(self.memory.get_messages()),
+            messages=context,
             tools=self.get_tool_schemas(),
-            response_format=format,
             tool_choice=self.tool_choice,
         )
-        logger.debug(
-            "Model response received: agent_id=%s role=%s content_chars=%d "
-            "tool_calls=%d",
-            getattr(self, "_agent_id", "unknown"),
-            message.role,
-            len(message.content or ""),
-            len(message.tool_calls or []),
-        )
+        logger.debug(f"Response from model: {message}")
+
         await self._add_to_memory([message])
         return message
 
-    async def ask(
-        self, request: str, format: Optional[str] = None
-    ) -> LLMMessage:
-        return await self.ask_with_messages([LLMMessage.user(request)], format)
+    async def ask(self, request: str) -> LLMMessage:
+        return await self.ask_with_messages([
+            LLMMessage.user(request)
+        ])
 
-    async def roll_back(self, message: Message) -> None:
+    async def roll_back(self, message: Message):
         await self._ensure_memory()
-
-        # Native runs persist a placeholder before yielding WaitEvent. Replace
-        # only the matching ask-user tool result so the provider sees one result
-        # for the correct call id and no side effect is replayed.
-        for index in range(len(self.memory.messages) - 1, -1, -1):
-            existing = self.memory.messages[index]
-            if (
-                existing.role == Role.TOOL
-                and existing.name == self._ASK_USER_TOOL_NAME
-                and existing.content == self._WAITING_FOR_USER_TOOL_RESULT
-            ):
-                self.memory.messages[index] = LLMMessage.tool(
-                    tool_call_id=existing.tool_call_id or "",
-                    name=self._ASK_USER_TOOL_NAME,
-                    content=message.message,
-                )
-                await self._repository.save_memory(
-                    self._agent_id, self.name, self.memory
-                )
-                return
-
         last_message = self.memory.get_last_message()
-        if (
-            not last_message
-            or last_message.role != Role.ASSISTANT
-            or not last_message.tool_calls
-        ):
+        if not last_message:
             return
-        ask_user_calls = [
-            tool_call
-            for tool_call in last_message.tool_calls
-            if tool_call.name == self._ASK_USER_TOOL_NAME
-        ]
-        if ask_user_calls:
-            # Rolling-upgrade compatibility for an older worker that persisted
-            # only the assistant batch. Complete every call exactly once so the
-            # history remains structurally valid, and bind the user's answer to
-            # the actual ask-user call rather than blindly using the first call.
-            answer_call = ask_user_calls[-1]
-            responses = []
-            for tool_call in last_message.tool_calls:
-                responses.append(
-                    LLMMessage.tool(
-                        tool_call_id=tool_call.id,
-                        name=tool_call.name,
-                        content=(
-                            message.message
-                            if tool_call is answer_call
-                            else self._INTERRUPTED_TOOL_RESULT
-                        ),
-                    )
-                )
-            self.memory.add_messages(responses)
+        if last_message.role != Role.ASSISTANT:
+            return
+        if not last_message.tool_calls:
+            return
+        tool_call = last_message.tool_calls[0]
+        function_name = tool_call.name
+        tool_call_id = tool_call.id
+        if function_name == "message_ask_user":
+            self.memory.add_message(LLMMessage.tool(tool_call_id=tool_call_id, name=function_name, content=message.message))
         else:
             self.memory.roll_back()
         await self._repository.save_memory(self._agent_id, self.name, self.memory)

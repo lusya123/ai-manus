@@ -124,6 +124,7 @@ class MessageEventData(BaseEventData):
     role: Literal["user", "assistant"]
     content: str
     attachments: Optional[List[FileInfoResponse]] = None
+    required_skills: Optional[List[dict]] = None
 
 class MessageStreamEvent(BaseStreamEvent):
     event: Literal["message"] = "message"
@@ -136,7 +137,8 @@ class MessageStreamEvent(BaseStreamEvent):
                 **BaseEventData.base_event_data(event),
                 role=event.role,
                 content=event.message,
-                attachments=[await FileInfoResponse.from_domain(attachment) for attachment in event.attachments] if event.attachments else None
+                attachments=[await FileInfoResponse.from_domain(attachment) for attachment in event.attachments] if event.attachments else None,
+                required_skills=event.required_skills or None,
             )
         )
 
@@ -160,6 +162,7 @@ class ToolEventData(BaseEventData):
     function: str
     args: Dict[str, Any]
     content: Optional[ToolContent] = None
+    brief: Optional[str] = None
 
 class ToolStreamEvent(BaseStreamEvent):
     event: Literal["tool"] = "tool"
@@ -193,7 +196,8 @@ class ToolStreamEvent(BaseStreamEvent):
                 status=event.status,
                 function=event.function_name,
                 args=event.function_args,
-                content=content
+                content=content,
+                brief=event.brief,
             )
         )
 
@@ -253,6 +257,7 @@ class StepEventData(BaseEventData):
     status: ExecutionStatus
     id: str
     description: str
+    result: Optional[str] = None
 
 class StepStreamEvent(BaseStreamEvent):
     event: Literal["step"] = "step"
@@ -265,7 +270,8 @@ class StepStreamEvent(BaseStreamEvent):
                 **BaseEventData.base_event_data(event),
                 status=event.step.status,
                 id=event.step.id,
-                description=event.step.description
+                description=event.step.description,
+                result=event.step.result,
             )
         )
 
@@ -292,7 +298,8 @@ class PlanStreamEvent(BaseStreamEvent):
                     **BaseEventData.base_event_data(event),
                     status=step.status,
                     id=step.id, 
-                    description=step.description
+                    description=step.description,
+                    result=step.result,
                 ) for step in event.plan.steps]
             )
         )

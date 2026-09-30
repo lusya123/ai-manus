@@ -113,6 +113,8 @@ class ToolEvent(BaseEvent):
     function_args: Dict[str, Any]
     status: ToolStatus
     function_result: Optional[Any] = None
+    # Official Manus StandardToolUsed prefers ``brief`` (NL action) over path/args.
+    brief: Optional[str] = None
 
 class TitleEvent(BaseEvent):
     """Title event"""
@@ -131,6 +133,7 @@ class MessageEvent(BaseEvent):
     role: Literal["user", "assistant"] = "assistant"
     message: str
     attachments: Optional[List[FileInfo]] = None
+    required_skills: Optional[List[dict]] = None
 
     _VISIBLE_CONTENT_TYPES: ClassVar[set[str]] = VISIBLE_CONTENT_TYPES
     _HIDDEN_CONTENT_TYPES: ClassVar[set[str]] = HIDDEN_CONTENT_TYPES

@@ -8,13 +8,9 @@ from app.infrastructure.models.memory_serialization import deserialize_memory, s
 from app.domain.models.session import Session, SessionStatus, TaskMode
 from app.domain.models.file import FileInfo
 from app.domain.models.user import User, UserRole
-from app.domain.models.claw import Claw, ClawStatus, ClawMessage
+from app.domain.models.skill import Skill, SkillOwnerType, SkillSource, UserSkill
 from app.domain.models.turn_submission import TurnSubmission, TurnSubmissionState
 from app.core.config import get_settings
-from app.domain.utils.claw_credentials import (
-    claw_api_key_digest,
-    claw_api_key_hmac_secrets,
-)
 from app.infrastructure.external.llm.security import (
     decrypt_model_api_key,
     encrypt_model_api_key,
@@ -234,6 +230,51 @@ class ProjectDocument(BaseDocument[Project], id_field="project_id", domain_model
         ]
 
 
+class SkillDocument(BaseDocument[Skill], id_field="skill_id", domain_model_class=Skill):
+    """MongoDB document for user-created personal skills."""
+    skill_id: str
+    name: str
+    description: str
+    body: Optional[str] = None
+    owner_type: SkillOwnerType = SkillOwnerType.PERSONAL
+    owner_user_id: Optional[str] = None
+    source: SkillSource = SkillSource.CATALOG
+    source_url: Optional[str] = None
+    package_file_id: Optional[str] = None
+    package_sha256: Optional[str] = None
+    created_at: datetime = datetime.now(timezone.utc)
+    updated_at: datetime = datetime.now(timezone.utc)
+
+    class Settings:
+        name = "skills"
+        indexes = [
+            "skill_id",
+            IndexModel([("owner_user_id", ASCENDING), ("updated_at", DESCENDING)], name="owner_user_updated"),
+        ]
+
+
+class UserSkillDocument(BaseDocument[UserSkill], id_field="user_skill_id", domain_model_class=UserSkill):
+    """MongoDB document for a user's skill subscription."""
+    user_skill_id: str
+    user_id: str
+    skill_id: str
+    enabled: bool = True
+    created_at: datetime = datetime.now(timezone.utc)
+    updated_at: datetime = datetime.now(timezone.utc)
+
+    class Settings:
+        name = "user_skills"
+        indexes = [
+            "user_skill_id",
+            IndexModel(
+                [("user_id", ASCENDING), ("skill_id", ASCENDING)],
+                unique=True,
+                name="user_id_skill_id",
+            ),
+            IndexModel([("user_id", ASCENDING), ("created_at", ASCENDING)], name="user_id_created"),
+        ]
+
+
 class FileFavoriteDocument(Document):
     """Per-user library file favorite (attachment-level, not session-level)."""
     user_id: str
@@ -376,57 +417,3 @@ class TurnOutputEventDocument(Document):
                 name="terminal_turn_output_ttl",
             ),
         ]
-
-
-class ClawDocument(BaseDocument[Claw], id_field="claw_id", domain_model_class=Claw):
-    """MongoDB document for Claw instance"""
-    claw_id: str
-    user_id: str
-    container_name: Optional[str] = None
-    container_ip: Optional[str] = None
-    # Legacy plaintext field, retained only so the repository can lazily
-    # migrate pre-HMAC records.  New serialization never writes it.
-    api_key: Optional[str] = Field(default=None, repr=False, exclude=True)
-    api_key_digest: Optional[str] = Field(default=None, repr=False)
-    status: ClawStatus = ClawStatus.CREATING
-    revision: int = Field(default=0, ge=0)
-    error_message: Optional[str] = None
-    expires_at: Optional[datetime] = None
-    last_activity_at: Optional[datetime] = None
-    messages: List[ClawMessage] = Field(default_factory=list)
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-    class Settings:
-        name = "claws"
-        indexes = [
-            "claw_id",
-            "api_key_digest",
-            IndexModel([("user_id", ASCENDING)], unique=True),  # One claw per user
-        ]
-
-    def to_domain(self) -> Claw:
-        """Convert without ever reconstructing or exposing key material."""
-
-        data = self.model_dump(
-            exclude={"id", "api_key", "api_key_digest", "messages"}
-        )
-        data["id"] = data.pop(self._ID_FIELD)
-        data["api_key"] = None
-        return Claw.model_validate(data)
-
-    @classmethod
-    def from_domain(cls, claw: Claw) -> "ClawDocument":
-        """Persist only the server-keyed digest of an ephemeral runtime key."""
-
-        if not claw.api_key:
-            raise ValueError("A new Claw record requires a runtime API key")
-        data = claw.model_dump()
-        data[cls._ID_FIELD] = data.pop("id")
-        data["api_key"] = None
-        current_hmac_secret = claw_api_key_hmac_secrets(get_settings())[0]
-        data["api_key_digest"] = claw_api_key_digest(
-            claw.api_key,
-            current_hmac_secret,
-        )
-        return cls.model_validate(data)

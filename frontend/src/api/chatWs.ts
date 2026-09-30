@@ -384,6 +384,7 @@ export class ChatWebSocket {
     attachments?: ChatAttachment[];
     /** Stable UUID reused for every transport attempt of this durable turn. */
     submissionId?: string;
+    requiredSkills?: { id: string; name: string }[];
   }): Promise<ChatSubmissionAck> {
     const submissionId = params.submissionId || createChatSubmissionId();
     let lastError: unknown;
@@ -403,6 +404,7 @@ export class ChatWebSocket {
             message: params.message || '',
             last_event_id: params.lastEventId,
             attachments: params.attachments || [],
+            required_skills: params.requiredSkills || [],
           },
           ['ack'],
           CHAT_WS_REQUEST_TIMEOUT_MS,

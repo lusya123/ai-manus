@@ -818,6 +818,7 @@ class AgentDomainService:
         message: str,
         timestamp: Optional[datetime] = None,
         attachments: Optional[List[FileInfo]] = None,
+        required_skills: Optional[List[dict[str, str]]] = None,
     ) -> TurnSubmission:
         """Persist acceptance, project history once, then dispatch at least once."""
         if self._turn_submission_repository is None:
@@ -833,6 +834,20 @@ class AgentDomainService:
                 "A durable submission requires a message or at least one attachment"
             )
 
+        normalized_skills: list[dict[str, str]] = []
+        for item in required_skills or []:
+            if not isinstance(item, dict):
+                raise ValueError("Invalid required skill")
+            skill_id = item.get("id") or item.get("skill_id")
+            name = item.get("name")
+            if not isinstance(skill_id, str) or not isinstance(name, str):
+                raise ValueError("Invalid required skill")
+            if not skill_id or not name or len(skill_id) > 128 or len(name) > 128:
+                raise ValueError("Invalid required skill")
+            normalized_skills.append({"id": skill_id, "name": name})
+        if len(normalized_skills) > 20:
+            raise ValueError("Too many required skills")
+
         async with self._get_session_lock(session_id):
             async def submit() -> TurnSubmission:
                 session = await self._session_repository.find_by_id_and_user_id(
@@ -846,8 +861,7 @@ class AgentDomainService:
                     )
 
                 requested_file_infos = self._to_file_infos(attachments)
-                canonical = json.dumps(
-                    {
+                canonical_input = {
                         "message": message,
                         "timestamp": (
                             timestamp.isoformat() if timestamp is not None else None
@@ -856,7 +870,11 @@ class AgentDomainService:
                             self._canonical_attachment(attachment)
                             for attachment in (requested_file_infos or [])
                         ],
-                    },
+                    }
+                if normalized_skills:
+                    canonical_input["required_skills"] = normalized_skills
+                canonical = json.dumps(
+                    canonical_input,
                     sort_keys=True,
                     separators=(",", ":"),
                     ensure_ascii=False,
@@ -898,6 +916,7 @@ class AgentDomainService:
                     role="user",
                     timestamp=timestamp or datetime.now(UTC),
                     attachments=file_infos,
+                    required_skills=normalized_skills or None,
                 )
                 candidate = TurnSubmission(
                     session_id=session_id,

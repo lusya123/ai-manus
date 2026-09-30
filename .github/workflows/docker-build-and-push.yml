@@ -201,107 +201,6 @@ jobs:
           tests/test_file_service_unit.py
           tests/test_shell_service_unit.py
 
-  claw-runtime-smoke:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    if: >-
-      github.event_name != 'workflow_dispatch' ||
-      inputs.server_maintenance == 'none'
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: claw/manus-claw/package-lock.json
-
-      - name: Install Claw plugin dependencies
-        working-directory: claw/manus-claw
-        run: npm ci
-
-      - name: Run Claw plugin unit tests
-        working-directory: claw/manus-claw
-        run: npm test
-
-      - name: Build and smoke test the real Claw image
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          image="ai-manus-claw-smoke:${GITHUB_SHA}"
-          container="ai-manus-claw-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          report="${RUNNER_TEMP}/manus-claw-plugin-runtime.json"
-
-          cleanup() {
-            status=$?
-            if [ "$status" -ne 0 ]; then
-              docker logs --tail 300 "$container" 2>/dev/null || true
-            fi
-            docker rm -f "$container" >/dev/null 2>&1 || true
-            docker image rm "$image" >/dev/null 2>&1 || true
-            exit "$status"
-          }
-          trap cleanup EXIT
-
-          docker build --platform linux/amd64 --tag "$image" ./claw
-          docker run --detach --name "$container" \
-            --env MANUS_API_BASE_URL=http://127.0.0.1:9 \
-            --env MANUS_API_KEY=ci-runtime-smoke-only \
-            "$image"
-
-          ready=false
-          for _ in $(seq 1 60); do
-            if [ "$(docker inspect --format '{{.State.Running}}' \
-              "$container" 2>/dev/null || true)" != true ]; then
-              echo "Claw smoke container exited before becoming ready." >&2
-              exit 1
-            fi
-            if docker exec "$container" node -e '
-              fetch("http://127.0.0.1:18788/health")
-                .then(async (response) => {
-                  const body = await response.json();
-                  if (response.status !== 200 || body.gateway_ready !== true) {
-                    process.exit(1);
-                  }
-                })
-                .catch(() => process.exit(1));
-            '; then
-              ready=true
-              break
-            fi
-            sleep 1
-          done
-          if [ "$ready" != true ]; then
-            echo "Claw plugin HTTP service did not become Gateway-ready." >&2
-            exit 1
-          fi
-
-          docker exec "$container" openclaw --version |
-            grep -Fx 'OpenClaw 2026.7.1'
-          docker exec "$container" \
-            openclaw plugins inspect manus-claw --runtime --json > "$report"
-          python3 - "$report" <<'PY'
-          import json
-          import sys
-
-          with open(sys.argv[1], encoding="utf-8") as report_file:
-              report = json.load(report_file)
-
-          plugin = report["plugin"]
-          assert plugin["status"] == "loaded", plugin
-          assert plugin["imported"] is True, plugin
-          assert report["diagnostics"] == [], report["diagnostics"]
-          assert "manus-claw" in report["services"], report["services"]
-          assert any(
-              "manus_upload_file" in entry.get("names", [])
-              for entry in report["tools"]
-          ), report["tools"]
-          PY
-
   server-maintenance-preflight:
     runs-on: ubuntu-latest
     environment: fork-production
@@ -929,7 +828,7 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     needs:
-      [frontend-smoke, backend-unit-security, sandbox-unit, claw-runtime-smoke]
+      [frontend-smoke, backend-unit-security, sandbox-unit]
     # An explicit fork publish/deploy builds and pushes the exact amd64
     # artifacts below. Avoid doing the upstream multi-arch dry-run first; it
     # duplicates the expensive Sandbox build without strengthening the
@@ -1008,7 +907,6 @@ jobs:
       - frontend-smoke
       - backend-unit-security
       - sandbox-unit
-      - claw-runtime-smoke
       - build-and-push
     if: >-
       always() &&
@@ -1022,7 +920,6 @@ jobs:
       needs.frontend-smoke.result == 'success' &&
       needs.backend-unit-security.result == 'success' &&
       needs.sandbox-unit.result == 'success' &&
-      needs.claw-runtime-smoke.result == 'success' &&
       (
         (
           github.repository == 'Simpleyyt/ai-manus' &&
@@ -1076,7 +973,7 @@ jobs:
       matrix:
         # mockserver is fork-publication-only; the upstream Docker Hub matrix
         # intentionally remains unchanged above.
-        component: [frontend, backend, sandbox, claw, mockserver]
+        component: [frontend, backend, sandbox, mockserver]
     env:
       REGISTRY: ghcr.io
       IMAGE_TAG: sha-${{ github.sha }}
@@ -1232,7 +1129,7 @@ jobs:
         run: |
           owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
           echo "owner=${owner}" >> "$GITHUB_OUTPUT"
-          for component in frontend backend sandbox claw mockserver; do
+          for component in frontend backend sandbox mockserver; do
             digest="$(cat "image-digests/${component}.txt")"
             if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
               echo "::error::Invalid immutable digest for ${component}."
@@ -1252,7 +1149,6 @@ jobs:
           FRONTEND_IMAGE: ${{ steps.deploy.outputs.frontend_image }}
           BACKEND_IMAGE: ${{ steps.deploy.outputs.backend_image }}
           SANDBOX_IMAGE: ${{ steps.deploy.outputs.sandbox_image }}
-          CLAW_IMAGE: ${{ steps.deploy.outputs.claw_image }}
           MOCKSERVER_IMAGE: ${{ steps.deploy.outputs.mockserver_image }}
           DEPLOY_PATH: ${{ env.DEPLOY_PATH }}
           FRONTEND_HOST_PORT: ${{ env.FRONTEND_HOST_PORT }}
@@ -1272,7 +1168,7 @@ jobs:
           password: ${{ secrets.SERVER_PASSWORD }}
           fingerprint: ${{ secrets.SERVER_HOST_FINGERPRINT }}
           command_timeout: 30m
-          envs: REGISTRY,OWNER,IMAGE_TAG,FRONTEND_IMAGE,BACKEND_IMAGE,SANDBOX_IMAGE,CLAW_IMAGE,MOCKSERVER_IMAGE,DEPLOY_PATH,FRONTEND_HOST_PORT,GHCR_TOKEN,GHCR_USER,COMPOSE_B64,DEPLOY_REF,EXPECTED_SHA,FORK_SEARCH_PROVIDER,PUBLIC_HOST,CORE_RESOURCE_PREFIX,HOTPATCH_ENABLED,HOTPATCH_TARGET
+          envs: REGISTRY,OWNER,IMAGE_TAG,FRONTEND_IMAGE,BACKEND_IMAGE,SANDBOX_IMAGE,MOCKSERVER_IMAGE,DEPLOY_PATH,FRONTEND_HOST_PORT,GHCR_TOKEN,GHCR_USER,COMPOSE_B64,DEPLOY_REF,EXPECTED_SHA,FORK_SEARCH_PROVIDER,PUBLIC_HOST,CORE_RESOURCE_PREFIX,HOTPATCH_ENABLED,HOTPATCH_TARGET
           script: |
             set -eu
             cd "$DEPLOY_PATH"
@@ -1550,7 +1446,6 @@ jobs:
                 frontend) verify_expected_image="$FRONTEND_IMAGE" ;;
                 backend) verify_expected_image="$BACKEND_IMAGE" ;;
                 sandbox) verify_expected_image="$SANDBOX_IMAGE" ;;
-                claw) verify_expected_image="$CLAW_IMAGE" ;;
                 mockserver) verify_expected_image="$MOCKSERVER_IMAGE" ;;
                 *)
                   echo "Unknown image component: ${verify_image_component}." >&2
@@ -3221,21 +3116,15 @@ jobs:
                   - REDIS_HOST=redis
                   - REDIS_PORT=6379
                   - SANDBOX_NETWORK=manus-network
-                  - CLAW_NETWORK=manus-network
                   - RUNTIME_NETWORK_ISOLATION=true
                   - RUNTIME_DEPLOYMENT_ID=ai-manus
-                  - CLAW_PUBLISH_HOST_PORTS=false
                   - MANUS_API_BASE_URL=http://backend:8000
                   - SANDBOX_IMAGE=${SANDBOX_IMAGE}
-                  - CLAW_IMAGE=${CLAW_IMAGE}
                   - SEARCH_PROVIDER=${deploy_search_provider_value}
             ${anthropic_web_search_bindings}
 
               sandbox:
                 image: ${SANDBOX_IMAGE}
-
-              claw:
-                image: ${CLAW_IMAGE}
 
               mockserver:
                 image: ${MOCKSERVER_IMAGE}
@@ -3266,16 +3155,13 @@ jobs:
                   - .env
                 environment:
                   - SANDBOX_IMAGE=${SANDBOX_IMAGE}
-                  - CLAW_IMAGE=${CLAW_IMAGE}
                   - MONGODB_URI=mongodb://mongodb:27017
                   - REDIS_HOST=redis
                   - REDIS_PORT=6379
                   - MANUS_API_BASE_URL=http://backend:8000
                   - SANDBOX_NETWORK=manus-network
-                  - CLAW_NETWORK=manus-network
                   - RUNTIME_NETWORK_ISOLATION=true
                   - RUNTIME_DEPLOYMENT_ID=ai-manus
-                  - CLAW_PUBLISH_HOST_PORTS=false
                   - RUNTIME_GATEWAY_CONTAINER=deployment-pending-backend
                   - SEARCH_PROVIDER=${deploy_search_provider_value}
             ${anthropic_web_search_bindings}
@@ -3354,7 +3240,7 @@ jobs:
             # and Compose topology are being replaced. The EXIT trap restores
             # its previous state if any later deployment step fails.
             compose stop worker >/dev/null 2>&1 || true
-            compose pull frontend backend sandbox claw mockserver
+            compose pull frontend backend sandbox mockserver
             if [ -n "$mongodb_id_before" ] && [ -n "$redis_id_before" ]; then
               # The test server already has stateful services. Recreate only
               # application containers and keep both datastore IDs untouched.
@@ -3430,7 +3316,7 @@ jobs:
                 exit 1
               fi
             fi
-            compose up --no-start sandbox claw
+            compose up --no-start sandbox
             run_dynamic_sandbox_hotpatch
 
             compose up -d --no-deps backend
@@ -3479,7 +3365,6 @@ jobs:
             verify_expected_container backend backend true
             verify_expected_container mockserver mockserver true
             verify_expected_container sandbox sandbox false
-            verify_expected_container claw claw false
             if [ "${task_backend:-local}" = celery ]; then
               verify_expected_container worker backend true
               worker_runtime_gateway="$(

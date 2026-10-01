@@ -77,10 +77,9 @@ class SkillRuntimeService:
 
     @staticmethod
     async def _delete_tree(sandbox, path: str) -> None:
-        await SkillRuntimeService._exec_skill_command(
-            sandbox,
-            f"rm -rf {shlex.quote(path)}",
-        )
+        result = await sandbox.file_delete(path)
+        if not result or getattr(result, "success", False) is False:
+            raise RuntimeError(f"Sandbox skill package removal failed: {path}")
 
     @classmethod
     async def _remove_disabled_skill_dirs(

@@ -5,12 +5,18 @@ from fastapi import APIRouter, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from app.schemas.file import (
     FileReadRequest, FileWriteRequest, FileReplaceRequest,
-    FileSearchRequest, FileFindRequest
+    FileSearchRequest, FileFindRequest, FileDeleteRequest
 )
 from app.schemas.response import Response
 from app.services.file import file_service
 
 router = APIRouter()
+
+
+@router.post("/delete", response_model=Response)
+async def delete_skill_package(request: FileDeleteRequest):
+    await file_service.delete_skill_tree(request.path)
+    return Response(success=True, message="Skill package removed", data={"path": request.path})
 
 @router.post("/read", response_model=Response)
 async def read_file(request: FileReadRequest):

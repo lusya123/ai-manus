@@ -3077,8 +3077,23 @@ jobs:
             # Seed new operator files; never replace an operator-edited catalog
             # or skill package on a subsequent image rollout.
             python3 - <<'PYCONFIG'
-            import base64, io, os, tarfile
+            import base64, io, os, tarfile, time
             from pathlib import Path
+            legacy = Path("mcp.json")
+            if legacy.is_symlink():
+                raise SystemExit("Legacy MCP path must not be a symlink")
+            if legacy.is_dir():
+                if any(legacy.iterdir()):
+                    raise SystemExit("Legacy MCP directory is not empty; preserve and repair it manually")
+                backup = Path("recovery-backups") / ("mcp-path-repair-" + str(time.time_ns()))
+                backup.mkdir(parents=True, mode=0o700)
+                legacy.rename(backup / "mcp.json.empty-directory")
+            if not legacy.exists():
+                with legacy.open("x") as stream:
+                    stream.write('{"mcpServers": {}}\n')
+                legacy.chmod(0o600)
+            if not legacy.is_file():
+                raise SystemExit("Legacy MCP path must be a regular file")
             archive = tarfile.open(fileobj=io.BytesIO(base64.b64decode(os.environ["OPERATOR_CONFIG_B64"])), mode="r:gz")
             for member in archive.getmembers():
                 path = Path(member.name)
@@ -3169,6 +3184,8 @@ jobs:
                   - redis
                 volumes:
                   - /var/run/docker.sock:/var/run/docker.sock:ro
+                  - ./mcp.json:/etc/mcp.json:ro
+                  - ./config:/etc/ai-manus:ro
                 sysctls:
                   - net.ipv4.ip_forward=0
                   - net.ipv4.conf.all.forwarding=0

@@ -48,3 +48,7 @@ class FileFindRequest(BaseModel):
     """File find request"""
     path: str = Field(..., description="Directory path to search")
     glob: str = Field(..., description="Filename pattern (glob syntax)")
+
+
+class FileDeleteRequest(BaseModel):
+    path: str = Field(..., description="Absolute path of one skill package directory")

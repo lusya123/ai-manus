@@ -572,6 +572,102 @@ async def test_write_allows_nested_workspace_create_overwrite_and_append(tmp_pat
     assert target.read_text() == "second+tail"
 
 
+@pytest.mark.asyncio
+async def test_delete_skill_tree_replaces_api_written_package_and_cleans_up(tmp_path):
+    """A second sync replaces API-created 0755 dirs shell UIDs cannot remove."""
+    service = FileService(writable_roots=(str(tmp_path),))
+    skills = tmp_path / "skills"
+    tree = skills / "demo-skill"
+    nested = tree / "scripts"
+    await service.write_file(str(tree / "SKILL.md"), "# Old")
+    await service.write_file(str(nested / "run.py"), "print('old')")
+    assert stat.S_IMODE(tree.stat().st_mode) == 0o755
+    assert stat.S_IMODE(nested.stat().st_mode) == 0o755
+    assert tree.stat().st_uid == os.geteuid()
+
+    await service.delete_skill_tree(str(tree))
+    assert not tree.exists()
+    assert skills.is_dir()
+
+    await service.write_file(str(tree / "SKILL.md"), "# New")
+    assert (tree / "SKILL.md").read_text() == "# New"
+    assert not nested.exists()
+    await service.delete_skill_tree(str(tree))
+    assert not tree.exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_skill_tree_does_not_follow_nested_or_final_symlink(tmp_path):
+    service = FileService(writable_roots=(str(tmp_path),))
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    protected = outside / "protected.txt"
+    protected.write_text("untouched")
+    tree = skills / "demo-skill"
+    tree.mkdir()
+    (tree / "outside-link").symlink_to(outside, target_is_directory=True)
+
+    await service.delete_skill_tree(str(tree))
+
+    assert not tree.exists()
+    assert protected.read_text() == "untouched"
+
+    final_link = skills / "linked-skill"
+    final_link.symlink_to(outside, target_is_directory=True)
+    await service.delete_skill_tree(str(final_link))
+    assert not final_link.is_symlink()
+    assert protected.read_text() == "untouched"
+
+    # The configured skills directory itself is untrusted and must not be followed.
+    skills.rename(tmp_path / "real-skills")
+    skills.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(BadRequestException):
+        await service.delete_skill_tree(str(skills / "demo-skill"))
+    assert protected.read_text() == "untouched"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suffix", [
+    "skills",
+    "skills/demo/child",
+    "other/demo",
+    "skills/../outside",
+    "skills/demo/../../outside",
+])
+async def test_delete_skill_tree_rejects_paths_outside_one_skill_dir(tmp_path, suffix):
+    service = FileService(writable_roots=(str(tmp_path),))
+    (tmp_path / "skills").mkdir()
+    (tmp_path / "other").mkdir()
+    outside = tmp_path / "outside"
+    outside.write_text("protected")
+
+    with pytest.raises(BadRequestException):
+        await service.delete_skill_tree(str(tmp_path / suffix))
+
+    assert outside.read_text() == "protected"
+
+
+@pytest.mark.asyncio
+async def test_delete_skill_tree_rejects_nonowned_tree(monkeypatch, tmp_path):
+    service = FileService(writable_roots=(str(tmp_path),))
+    tree = tmp_path / "skills" / "foreign-skill"
+    tree.mkdir(parents=True)
+    protected = tree / "SKILL.md"
+    protected.write_text("protected")
+    actual_uid = tree.stat().st_uid
+    fake_uid = actual_uid + 1000
+    if service._FIRST_SHELL_UID <= fake_uid < service._FIRST_SHELL_UID + service._SHELL_UID_COUNT:
+        fake_uid += 1000
+    monkeypatch.setattr(os, "geteuid", lambda: fake_uid)
+
+    with pytest.raises(BadRequestException):
+        await service.delete_skill_tree(str(tree))
+
+    assert protected.read_text() == "protected"
+
+
 def test_sandbox_sudoers_does_not_grant_tee():
     dockerfile = Path(__file__).resolve().parents[1] / "Dockerfile"
 

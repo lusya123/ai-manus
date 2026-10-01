@@ -100,9 +100,11 @@ class _FakeUserSkillRepository:
 
 
 class _FakeSandbox:
-    def __init__(self, skill_directories=None):
+    def __init__(self, skill_directories=None, failed_deletes=None):
         self.writes: list[tuple[str, str]] = []
         self.skill_directories = skill_directories or []
+        self.failed_deletes = set(failed_deletes or [])
+        self.deletes: list[str] = []
         self.exec_calls: list[tuple[str, str, str]] = []
         self.operations: list[tuple[str, str]] = []
 
@@ -110,6 +112,11 @@ class _FakeSandbox:
         self.writes.append((file, content))
         self.operations.append(("write", file))
         return SimpleNamespace(success=True)
+
+    async def file_delete(self, path: str):
+        self.deletes.append(path)
+        self.operations.append(("delete", path))
+        return SimpleNamespace(success=path not in self.failed_deletes)
 
     async def exec_command(self, session_id: str, exec_dir: str, command: str):
         self.exec_calls.append((session_id, exec_dir, command))
@@ -236,11 +243,33 @@ async def test_sync_clears_enabled_skill_and_removes_stale_skill_directories(
         for session_id, exec_dir, _ in sandbox.exec_calls
     )
     commands = [command for _, _, command in sandbox.exec_calls]
-    assert f"rm -rf {slides_dir}" in commands
-    assert sandbox.operations.index(("exec", f"rm -rf {slides_dir}")) < next(
+    assert not any("rm -rf" in command for command in commands)
+    assert sandbox.operations.index(("delete", slides_dir)) < next(
         index
         for index, (operation, path) in enumerate(sandbox.operations)
         if operation == "write" and path.startswith(f"{slides_dir}/")
     )
     assert any("find " in command for command in commands)
-    assert f"rm -rf {stale_dir}" in commands
+    assert slides_dir in sandbox.deletes
+    assert stale_dir in sandbox.deletes
+    assert sandbox.deletes.count(slides_dir) == 1
+    assert sandbox.deletes.count(stale_dir) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_skill_directory_delete_prevents_overwriting_existing_skill(
+    fake_file_storage,
+):
+    skill_repo = _FakeSkillRepository()
+    user_skill_repo = _FakeUserSkillRepository()
+    service = SkillService(skill_repo, user_skill_repo, fake_file_storage)
+    runtime = SkillRuntimeService(service)
+    await service.add_skills("user-1", ["skill_slides"])
+    slides_dir = f"{SKILLS_ROOT}/slides"
+    sandbox = _FakeSandbox(["slides"], failed_deletes=[slides_dir])
+
+    count = await runtime.sync_enabled_skills_to_sandbox("user-1", sandbox)
+
+    assert count >= 1  # Other seeded skills can still sync.
+    assert slides_dir in sandbox.deletes
+    assert not any(path.startswith(f"{slides_dir}/") for path, _ in sandbox.writes)

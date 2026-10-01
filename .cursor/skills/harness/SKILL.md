@@ -165,6 +165,7 @@ same PR.
 
 - `AGENT_FLOW=agent_loop` selects Manus for new sessions. Persist `Session.agent_flow`; absent legacy fields mean `plan_act`. Do not change waiting legacy sessions across flows.
 - Both flows load the per-user skill catalog/body and preserve selected skills. Durable turn claims pass `resumes_waiting` even though the claimed session already says running.
+- Skill package refresh uses the sandbox file API's scoped deletion, not isolated shell `rm`: API-owned 0755 directories are not writable by shell UIDs. Deletion is confined to one owned package below a writable root's `skills/`, with pinned no-follow directory descriptors and bounded traversal; symlinks are unlinked without touching their targets.
 - Manus must report a full snapshot of known plan ids, at most one running step, and successful tool work before completing a step. `deliver_result` is rejected while plan work remains. Errors/iteration exhaustion never silently complete open steps.
 - Persist completed tool responses before emitting CALLED. On resume, pair every outstanding tool call; never replay a completed side effect. Cancel and reap shell invocation/poll tasks when the generator closes.
 - LangChain `ask_stream` emits visible chat text or only `deliver_result.message`, never planner/step JSON, ordinary tool arguments, or thinking blocks. On retry emit a reset. Canonical `MessageEvent.message_id` replaces the provisional bubble. Deltas use offsets, share the turn id, and are ignored by public-share projection. Final responses retain existing sanitization.

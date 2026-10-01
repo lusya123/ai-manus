@@ -212,6 +212,80 @@ print(json.dumps({"matches": matches, "line_numbers": line_numbers}))
             < cls._FIRST_SHELL_UID + cls._SHELL_UID_COUNT
         )
 
+    async def delete_skill_tree(self, path: str) -> None:
+        """Remove one owned skill package using pinned, no-follow directories.
+
+        This control-plane operation runs as the file API owner: isolated
+        shell UIDs cannot remove the API's 0755 package directories.
+        """
+        root, parts, _ = self._writable_target(path)
+        if len(parts) != 2 or parts[0] != "skills" or not parts[1] or len(parts[1]) > 128:
+            raise BadRequestException("Deletion is limited to one skill package")
+        await asyncio.to_thread(self._delete_skill_tree_sync, root, parts[1])
+
+    def _delete_skill_tree_sync(self, root: str, name: str) -> None:
+        flags = self._directory_open_flags()
+        visited = 0
+        deadline = time.monotonic() + 5.0
+
+        def owned(info):
+            if not self._is_owned_sandbox_file(info.st_uid):
+                raise BadRequestException("Skill tree contains a file owned by another user")
+
+        def same_node(parent, child, expected):
+            current = os.stat(child, dir_fd=parent, follow_symlinks=False)
+            if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
+                raise BadRequestException("Skill tree changed during deletion")
+            owned(current)
+
+        def remove(parent, child, depth):
+            nonlocal visited
+            visited += 1
+            if visited > 10000 or depth > 32 or time.monotonic() > deadline:
+                raise BadRequestException("Skill tree exceeds deletion limits")
+            try:
+                info = os.stat(child, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            owned(info)
+            if stat.S_ISDIR(info.st_mode):
+                descriptor = os.open(child, flags, dir_fd=parent)
+                try:
+                    pinned = os.fstat(descriptor)
+                    owned(pinned)
+                    if (pinned.st_dev, pinned.st_ino) != (info.st_dev, info.st_ino):
+                        raise BadRequestException("Skill tree changed during deletion")
+                    with os.scandir(descriptor) as children:
+                        for entry in children:
+                            remove(descriptor, entry.name, depth + 1)
+                    same_node(parent, child, pinned)
+                    os.rmdir(child, dir_fd=parent)
+                finally:
+                    os.close(descriptor)
+            elif stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                # Unlink the link itself, never traverse its target.
+                same_node(parent, child, info)
+                os.unlink(child, dir_fd=parent)
+            else:
+                raise BadRequestException("Skill tree contains an unsupported file type")
+
+        root_fd = skills_fd = None
+        try:
+            root_fd = os.open(root, flags)
+            try:
+                skills_fd = os.open("skills", flags, dir_fd=root_fd)
+            except FileNotFoundError:
+                return
+            owned(os.fstat(skills_fd))
+            remove(skills_fd, name, 0)
+        except OSError as exc:
+            raise BadRequestException("Skill tree is unsafe or not writable") from exc
+        finally:
+            if skills_fd is not None:
+                os.close(skills_fd)
+            if root_fd is not None:
+                os.close(root_fd)
+
     @staticmethod
     def _open_temporary_file(directory_fd: int) -> tuple[int, str]:
         flags = (

@@ -127,8 +127,16 @@ class StepEvent(BaseEvent):
     step: Step
     status: StepStatus
 
+class MessageDeltaEvent(BaseEvent):
+    type: Literal["message_delta"] = "message_delta"
+    message_id: str
+    delta: str = ""
+    offset: int = Field(default=0, ge=0)
+    reset: bool = False
+
 class MessageEvent(BaseEvent):
     """Message event"""
+    message_id: Optional[str] = None
     type: Literal["message"] = "message"
     role: Literal["user", "assistant"] = "assistant"
     message: str
@@ -189,7 +197,7 @@ AgentEvent = Union[
     PlanEvent, 
     ToolEvent,
     StepEvent,
-    MessageEvent,
+    MessageEvent, MessageDeltaEvent,
     DoneEvent,
     TitleEvent,
     WaitEvent,

@@ -33,6 +33,10 @@ from app.infrastructure.repositories.mongo_agent_repository import MongoAgentRep
 from app.infrastructure.repositories.mongo_session_repository import MongoSessionRepository
 from app.infrastructure.repositories.mongo_turn_submission_repository import MongoTurnSubmissionRepository
 from app.infrastructure.repositories.file_mcp_repository import FileMCPRepository
+from app.infrastructure.repositories.file_connector_catalog import FileConnectorCatalog
+from app.infrastructure.repositories.composite_mcp_repository import ConnectorMCPRepository
+from app.infrastructure.repositories.mongo_connector_repository import MongoConnectorRepository
+from app.application.services.connector_service import ConnectorService
 from app.infrastructure.repositories.user_repository import MongoUserRepository
 from app.application.services.project_service import ProjectService
 from app.application.services.skill_service import SkillService
@@ -87,7 +91,7 @@ def get_agent_service() -> AgentService:
     task_cls = _get_task_cls()
     file_storage = get_file_storage()
     search_engine = get_search_engine()
-    mcp_repository = FileMCPRepository()
+    mcp_repository = ConnectorMCPRepository(get_connector_service(), FileMCPRepository())
     llm_factory = get_llm_factory()
     if (settings.sandbox_provider or "docker").strip().lower() == "agentbay":
         from app.infrastructure.external.sandbox.agentbay_provisioner import (
@@ -170,6 +174,16 @@ def get_file_service() -> FileService:
     return FileService(
         file_storage=file_storage,
         token_service=token_service,
+    )
+
+
+@lru_cache()
+def get_connector_service() -> ConnectorService:
+    """Get connector service instance"""
+    logger.info("Creating ConnectorService instance")
+    return ConnectorService(
+        connector_repository=MongoConnectorRepository(),
+        catalog=FileConnectorCatalog(),
     )
 
 

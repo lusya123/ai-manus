@@ -242,7 +242,8 @@ class FakeMCPTool:
 
 
 class FakeMCPRepository:
-    async def get_mcp_config(self):
+    async def get_mcp_config(self, user_id):
+        assert user_id == USER_ID
         return {}
 
 

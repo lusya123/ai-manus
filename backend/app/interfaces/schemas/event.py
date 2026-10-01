@@ -19,6 +19,7 @@ from app.domain.models.event import (
     ErrorEvent,
     PlanEvent,
     MessageEvent,
+    MessageDeltaEvent,
     TitleEvent,
     ToolEvent,
     StepEvent,
@@ -121,10 +122,21 @@ class BaseStreamEvent(BaseModel):
         )
 
 class MessageEventData(BaseEventData):
+    message_id: Optional[str] = None
     role: Literal["user", "assistant"]
     content: str
     attachments: Optional[List[FileInfoResponse]] = None
     required_skills: Optional[List[dict]] = None
+
+class MessageDeltaEventData(BaseEventData):
+    message_id: str
+    delta: str = ""
+    offset: int = Field(default=0, ge=0)
+    reset: bool = False
+
+class MessageDeltaStreamEvent(BaseStreamEvent):
+    event: Literal["message_delta"] = "message_delta"
+    data: MessageDeltaEventData
 
 class MessageStreamEvent(BaseStreamEvent):
     event: Literal["message"] = "message"
@@ -137,6 +149,7 @@ class MessageStreamEvent(BaseStreamEvent):
                 **BaseEventData.base_event_data(event),
                 role=event.role,
                 content=event.message,
+                message_id=event.message_id,
                 attachments=[await FileInfoResponse.from_domain(attachment) for attachment in event.attachments] if event.attachments else None,
                 required_skills=event.required_skills or None,
             )
@@ -318,6 +331,7 @@ class AcceptedStreamEvent(BaseStreamEvent):
     data: AcceptedEventData
 
 AgentStreamEvent = Union[
+    MessageDeltaStreamEvent,
     AcceptedStreamEvent,
     PlanStreamEvent,
     MessageStreamEvent,
@@ -353,6 +367,7 @@ _EVENT_TYPE_TO_STREAM_CLASS: Dict[str, Type[BaseStreamEvent]] = {
     "accepted": AcceptedStreamEvent,
     "plan": PlanStreamEvent,
     "message": MessageStreamEvent,
+    "message_delta": MessageDeltaStreamEvent,
     "title": TitleStreamEvent,
     "tool": ToolStreamEvent,
     "step": StepStreamEvent,
@@ -398,6 +413,9 @@ class EventMapper:
         usable after the owner unshares the session.
         """
 
+        if isinstance(event, MessageDeltaEvent):
+            # Public shares display only canonical, validated final answers.
+            return None
         if isinstance(event, MessageEvent):
             attachments: List[SharedFileInfoResponse] = []
             for attachment in event.attachments or []:

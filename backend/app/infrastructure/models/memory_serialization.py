@@ -8,7 +8,7 @@ its own native shape.
 Supported inbound (persisted) message shapes:
 
 * Native domain shape: ``{"role", "content", "tool_calls":[{"id","name","args"}],
-  "tool_call_id", "name"}``.
+  "tool_call_id", "name", "tool_success"}``.
 * LangChain ``model_dump`` shape: discriminated by a ``type`` field
   (``system`` / ``human`` / ``ai`` / ``tool``) with extra keys such as
   ``additional_kwargs``, ``invalid_tool_calls`` and ``status``. Historical
@@ -114,7 +114,7 @@ def _upgrade_message(raw: Any) -> Dict[str, Any]:
 
     # Keep only fields the domain model recognises; drop framework extras
     # (additional_kwargs, response_metadata, invalid_tool_calls, status, ...).
-    allowed = {"role", "content", "tool_calls", "tool_call_id", "name"}
+    allowed = {"role", "content", "tool_calls", "tool_call_id", "name", "tool_success"}
     return {k: v for k, v in data.items() if k in allowed}
 
 

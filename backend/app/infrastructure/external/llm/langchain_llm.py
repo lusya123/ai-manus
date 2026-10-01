@@ -8,6 +8,8 @@ inside the infrastructure layer, so the domain agents depend only on the
 import logging
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
+from app.domain.utils.streaming import LLMStreamChunk, partial_message_argument, visible_stream_text
+from langchain_core.messages import message_chunk_to_message
 
 from langchain.chat_models import init_chat_model
 from langchain.messages import (
@@ -260,6 +262,40 @@ class LangchainLLM:
             len(message.tool_calls or []),
         )
         return self._from_langchain(message)
+
+    async def ask_stream(self, messages, tools=None, response_format=None, tool_choice=None, output_tool=None):
+        """Stream visible text, then return the same validated domain message."""
+        options = {}
+        if response_format and self._model_provider != "anthropic":
+            options["response_format"] = {"type": response_format}
+        if tool_choice is not None:
+            options["tool_choice"] = "any" if self._model_provider == "anthropic" and tool_choice == "required" else tool_choice
+        model = self._model.bind_tools(tools, **options) if tools else self._model.bind(**options)
+        combined = None
+        try:
+            async for chunk in model.astream(self._to_langchain(messages)):
+                combined = chunk if combined is None else combined + chunk
+                if output_tool:
+                    calls = getattr(combined, "tool_call_chunks", []) or []
+                    # Multiple calls in a batch may still perform work first;
+                    # preview only a sole, explicit final-delivery call.
+                    text = partial_message_argument(calls[0].get("args", "")) if len(calls) == 1 and calls[0].get("name") == output_tool else ""
+                else:
+                    content = combined.content
+                    if isinstance(content, list):
+                        content = "".join(block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") in {"text", "output_text"})
+                    text = visible_stream_text(content) if isinstance(content, str) else ""
+                yield LLMStreamChunk(text=text)
+            if combined is None:
+                raise ValueError("Empty model stream")
+            raw = message_chunk_to_message(combined)
+            if getattr(raw, "invalid_tool_calls", None) or self._is_empty_tool_use_response(raw):
+                raise ValueError("Incomplete streamed tool call")
+            yield LLMStreamChunk(message=self._from_langchain(raw))
+        except Exception as exc:
+            logger.warning("Model stream fallback: error_type=%s", type(exc).__name__)
+            yield LLMStreamChunk(reset=True)
+            yield LLMStreamChunk(message=await self.ask(messages, tools, response_format, tool_choice))
 
     async def parse_json(self, text: str) -> Dict[str, Any]:
         """Extract/repair a JSON object from raw model output."""

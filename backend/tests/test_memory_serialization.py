@@ -49,6 +49,22 @@ class TestLegacyOpenAIFormat:
         assert m.messages[0].tool_calls[0].args == {}
 
 
+def test_trusted_tool_outcome_survives_persistence_and_compaction():
+    from app.domain.models.tool_result import ToolResult
+
+    memory = Memory(messages=[
+        LLMMessage.tool("failed", "file_read", '{"success":false}',
+                        artifact=ToolResult(success=False)),
+        LLMMessage.tool("passed", "shell_exec", '{"success":true}',
+                        artifact=ToolResult(success=True)),
+    ])
+    memory.compact(keep_recent=0)
+    restored = deserialize_memory(serialize_memory(memory))
+
+    assert [message.tool_success for message in restored.messages] == [False, True]
+    assert all("elided" in message.content for message in restored.messages)
+
+
 class TestLegacyLangChainFormat:
     def test_type_discriminator_mapped_to_role(self):
         raw = {

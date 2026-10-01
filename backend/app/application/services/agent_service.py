@@ -148,7 +148,7 @@ class AgentService:
     async def create_session(self, user_id: str, model_config: Optional[Any] = None) -> Session:
         logger.info(f"Creating new session for user: {user_id}")
         agent = await self._create_agent(model_config)
-        session = Session(agent_id=agent.id, user_id=user_id)
+        session = Session(agent_id=agent.id, user_id=user_id, agent_flow=get_settings().agent_flow)
         logger.info(f"Created new Session with ID: {session.id} for user: {user_id}")
         try:
             await self._session_repository.save(session)

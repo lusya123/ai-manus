@@ -1,4 +1,5 @@
 import os
+from typing import Literal
 import ipaddress
 from urllib.parse import urlsplit
 import json
@@ -107,6 +108,9 @@ def _parse_extra_headers() -> dict | None:
 
 
 class Settings(BaseSettings):
+    agent_flow: Literal["plan_act", "agent_loop"] = "plan_act"
+    stream_responses: bool = True
+
     
     # Model provider configuration
     api_key: str | None = None
@@ -365,8 +369,15 @@ class Settings(BaseSettings):
     # e.g. "redis://:password@redis:6379/0" or "amqp://user:pass@rabbitmq:5672//"
     celery_broker_url: str | None = None
 
-    # MCP configuration
+    # Operator config directory (connectors.json + skills/). Empty uses /etc/ai-manus
+    # when mounted, else repo-root config/.
+    config_dir: str = ""
+    # Operator-defined legacy MCP configuration remains readable during migration.
     mcp_config_path: str = "/etc/mcp.json"
+    # Optional override for the Apps file inside that directory.
+    connector_catalog_path: str = ""
+    # Optional override for the official skills directory inside that directory.
+    skills_path: str = ""
     
     # Logging configuration
     log_level: str = "INFO"

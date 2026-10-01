@@ -32,6 +32,7 @@ class Scenario:
     user_message: str
     responses: List[LLMMessage]
     checks: List[tuple[str, Check]] = field(default_factory=list)
+    flow: str = "plan_act"
 
 
 def _create_plan(steps: List[dict], call_id: str = "plan-1") -> LLMMessage:
@@ -80,6 +81,20 @@ def _deliver(call_id: str, message: str) -> LLMMessage:
     ])
 
 
+def _notify(text: str) -> LLMMessage:
+    return LLMMessage.assistant(tool_calls=[
+        ToolCall(id="notify-1", name="message_notify_user", args={"text": text}),
+    ])
+
+
+def _plan_report(call_id: str) -> LLMMessage:
+    return LLMMessage.assistant(tool_calls=[
+        ToolCall(id=call_id, name="plan_report", args={
+            "steps": [{"id": "1", "status": "completed"}],
+        }),
+    ])
+
+
 def _has_final_message(text: str) -> Check:
     return lambda r: any(
         isinstance(e, MessageEvent) and e.message == text for e in r.events
@@ -111,6 +126,50 @@ BASE_CHECKS: List[tuple[str, Check]] = [
 
 
 SCENARIOS: List[Scenario] = [
+    Scenario(
+        name="single_loop_premature_delivery_repaired",
+        description="Single-loop final delivery waits for verified work and plan_report.",
+        user_message="Verify the file",
+        flow="agent_loop",
+        responses=[
+            _create_plan([{"id": "1", "description": "Read the file"}]),
+            _notify("Checking the file."),
+            _deliver("early", "Unverified"),
+            _file_write("work-1"),
+            _plan_report("report-1"),
+            _deliver("final", "Verified"),
+        ],
+        checks=BASE_CHECKS + [
+            ("done", _done),
+            ("final_message", _has_final_message("Verified")),
+            ("no_premature_message", lambda r: not _has_final_message("Unverified")(r)),
+            ("early_delivery_rejected", lambda r: any(
+                "Complete or fail all authoritative plan steps" in text
+                for text in r.tool_feedback
+            )),
+        ],
+    ),
+    Scenario(
+        name="single_loop_report_requires_work",
+        description="Single-loop step completion needs a successful work tool.",
+        user_message="Do the work",
+        flow="agent_loop",
+        responses=[
+            _create_plan([{"id": "1", "description": "Write the file"}]),
+            _notify("Starting the work."),
+            _plan_report("early-report"),
+            _file_write("work-1"),
+            _plan_report("verified-report"),
+            _deliver("final", "Work verified"),
+        ],
+        checks=BASE_CHECKS + [
+            ("done", _done),
+            ("final_message", _has_final_message("Work verified")),
+            ("early_report_rejected", lambda r: any(
+                "perform successful work" in text for text in r.tool_feedback
+            )),
+        ],
+    ),
     Scenario(
         name="single_step_success",
         description="One successful step: no planner round-trip, summarize delivers.",

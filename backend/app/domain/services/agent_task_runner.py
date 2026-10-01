@@ -1,3 +1,4 @@
+from contextlib import aclosing
 from typing import Any, Dict, Optional, AsyncGenerator, List, Type
 import asyncio
 from contextlib import asynccontextmanager
@@ -21,6 +22,7 @@ from app.domain.models.event import (
     ErrorEvent,
     TitleEvent,
     MessageEvent,
+    MessageDeltaEvent,
     DoneEvent,
     ToolEvent,
     WaitEvent,
@@ -36,6 +38,8 @@ from app.domain.models.event import (
     FileUpdateEvent,
 )
 from app.domain.services.flows.plan_act import PlanActFlow
+from app.domain.services.flows.agent_loop import AgentLoopFlow
+from app.domain.models.session import AgentFlowType
 from app.domain.external.sandbox import Sandbox
 from app.domain.external.sandbox_provisioner import (
     SandboxProvisioningRequiredError,
@@ -513,6 +517,7 @@ class AgentTaskRunner(TaskRunner):
         cleanup_lease: Optional[_RunnerCleanupLease] = None,
         project_repository: Optional[ProjectRepository] = None,
         skill_runtime_service: Optional[SkillRuntimeService] = None,
+        agent_flow: AgentFlowType = AgentFlowType.PLAN_ACT,
     ):
         self._session_id = session_id
         self._agent_id = agent_id
@@ -549,7 +554,8 @@ class AgentTaskRunner(TaskRunner):
         self._artifact_cleanup_tasks: set[asyncio.Task[Any]] = set()
         self._artifact_ownership_changed = asyncio.Event()
         self._mcp_tool = MCPToolkit()
-        self._flow = PlanActFlow(
+        flow_class = AgentLoopFlow if agent_flow == AgentFlowType.AGENT_LOOP else PlanActFlow
+        self._flow = flow_class(
             self._agent_id,
             self._repository,
             self._session_id,
@@ -2177,7 +2183,7 @@ class AgentTaskRunner(TaskRunner):
             if not is_chat:
                 await self._sandbox.ensure_sandbox()
                 await self._mcp_tool.initialized(
-                    await self._mcp_repository.get_mcp_config()
+                    await self._mcp_repository.get_mcp_config(self._user_id)
                 )
                 if getattr(self, "_skill_runtime_service", None):
                     await self._skill_runtime_service.sync_enabled_skills_to_sandbox(
@@ -2217,27 +2223,28 @@ class AgentTaskRunner(TaskRunner):
                     resumes_waiting=claim.turn.resumes_waiting,
                 )
             )
-            async for output_event in flow:
-                persisted_event = await self._put_and_add_event(
-                    task, output_event, turn_id=submission_id
-                )
-                if isinstance(output_event, TitleEvent):
-                    await self._session_repository.update_title(
-                        self._session_id, output_event.title
+            async with aclosing(flow):
+                async for output_event in flow:
+                    persisted_event = await self._put_and_add_event(
+                        task, output_event, turn_id=submission_id
                     )
-                elif isinstance(output_event, MessageEvent):
-                    await self._session_repository.update_latest_message(
-                        self._session_id,
-                        output_event.message,
-                        output_event.timestamp,
-                    )
-                    await self._session_repository.increment_unread_message_count(
-                        self._session_id
-                    )
-                if isinstance(output_event, (DoneEvent, ErrorEvent, WaitEvent)):
-                    terminal_event = persisted_event or output_event
-                if isinstance(output_event, WaitEvent):
-                    break
+                    if isinstance(output_event, TitleEvent):
+                        await self._session_repository.update_title(
+                            self._session_id, output_event.title
+                        )
+                    elif isinstance(output_event, MessageEvent):
+                        await self._session_repository.update_latest_message(
+                            self._session_id,
+                            output_event.message,
+                            output_event.timestamp,
+                        )
+                        await self._session_repository.increment_unread_message_count(
+                            self._session_id
+                        )
+                    if isinstance(output_event, (DoneEvent, ErrorEvent, WaitEvent)):
+                        terminal_event = persisted_event or output_event
+                    if isinstance(output_event, WaitEvent):
+                        break
 
             if terminal_event is None:
                 terminal_event = await self._put_and_add_event(
@@ -2392,7 +2399,9 @@ class AgentTaskRunner(TaskRunner):
 
                 if not is_chat:
                     await self._sandbox.ensure_sandbox()
-                    await self._mcp_tool.initialized(await self._mcp_repository.get_mcp_config())
+                    await self._mcp_tool.initialized(
+                        await self._mcp_repository.get_mcp_config(self._user_id)
+                    )
                     if getattr(self, "_skill_runtime_service", None):
                         await self._skill_runtime_service.sync_enabled_skills_to_sandbox(
                             self._user_id, self._sandbox
@@ -2441,18 +2450,19 @@ class AgentTaskRunner(TaskRunner):
                     if is_chat
                     else self._run_flow(message_obj)
                 )
-                async for event in flow:
-                    await self._put_and_add_event(
-                        task, event, turn_id=active_turn_id
-                    )
-                    if isinstance(event, TitleEvent):
-                        await self._session_repository.update_title(self._session_id, event.title)
-                    elif isinstance(event, MessageEvent):
-                        await self._session_repository.update_latest_message(self._session_id, event.message, event.timestamp)
-                        await self._session_repository.increment_unread_message_count(self._session_id)
-                    elif isinstance(event, WaitEvent):
-                        await self._session_repository.update_status(self._session_id, SessionStatus.WAITING)
-                        return
+                async with aclosing(flow):
+                    async for event in flow:
+                        await self._put_and_add_event(
+                            task, event, turn_id=active_turn_id
+                        )
+                        if isinstance(event, TitleEvent):
+                            await self._session_repository.update_title(self._session_id, event.title)
+                        elif isinstance(event, MessageEvent):
+                            await self._session_repository.update_latest_message(self._session_id, event.message, event.timestamp)
+                            await self._session_repository.increment_unread_message_count(self._session_id)
+                        elif isinstance(event, WaitEvent):
+                            await self._session_repository.update_status(self._session_id, SessionStatus.WAITING)
+                            return
 
             await self._session_repository.update_status(self._session_id, SessionStatus.COMPLETED)
         except asyncio.CancelledError:
@@ -2521,7 +2531,27 @@ class AgentTaskRunner(TaskRunner):
                 role = Role.USER if ev.role == "user" else Role.ASSISTANT
                 history.append(LLMMessage(role=role, content=ev.message))
 
-        reply = await self._llm.ask(history)
+        message_id = str(uuid.uuid4())
+        stream = getattr(self._llm, "ask_stream", None)
+        if stream and get_settings().stream_responses:
+            previous = ""
+            reply = None
+            async with aclosing(stream(messages=history)) as chunks:
+                async for chunk in chunks:
+                    if chunk.reset:
+                        yield MessageDeltaEvent(message_id=message_id, reset=True)
+                        previous = ""
+                    elif chunk.message is not None:
+                        reply = chunk.message
+                    elif chunk.text != previous:
+                        reset = not chunk.text.startswith(previous)
+                        if reset or len(chunk.text) - len(previous) >= 64:
+                            yield MessageDeltaEvent(message_id=message_id, delta=chunk.text if reset else chunk.text[len(previous):], offset=0 if reset else len(previous), reset=reset)
+                            previous = chunk.text
+            if reply is None:
+                raise RuntimeError("Chat stream ended without a response")
+        else:
+            reply = await self._llm.ask(history)
         content = (reply.content or "").strip() or "(No response)"
 
         if session and not session.title:
@@ -2529,7 +2559,7 @@ class AgentTaskRunner(TaskRunner):
             if title:
                 yield TitleEvent(title=title)
 
-        yield MessageEvent(role="assistant", message=content)
+        yield MessageEvent(role="assistant", message=content, message_id=message_id)
         yield DoneEvent()
         logger.info(f"Agent {self._agent_id} completed chat-mode reply")
 
@@ -2550,48 +2580,50 @@ class AgentTaskRunner(TaskRunner):
             yield ErrorEvent(error="No message")
             return
 
-        async for event in self._flow.run(
+        events = self._flow.run(
             message,
             resumes_waiting=resumes_waiting,
-        ):
-            if isinstance(event, ToolEvent):
-                # TODO: move to tool function
-                await self._handle_tool_event(event)
-                yield event
-                # Official: terminalUpdate / text_editor file panel push after tool settles
-                if event.status == ToolStatus.CALLED:
-                    if event.tool_name == "shell" and event.function_args.get("id"):
-                        console = None
-                        if isinstance(event.tool_content, ShellToolContent):
-                            console = event.tool_content.console
-                        yield TerminalUpdateEvent(
-                            shell_id=event.function_args["id"],
-                            output=console if console is not None else [],
-                        )
-                    elif event.tool_name == "file" and event.function_args.get("file"):
-                        path = event.function_args["file"]
-                        content = ""
-                        old_content = None
-                        if isinstance(event.tool_content, FileToolContent):
-                            content = event.tool_content.content or ""
-                            old_content = event.tool_content.old_content
-                        file_info = await self._session_repository.get_file_by_path(
-                            self._session_id, path
-                        )
-                        yield FileUpdateEvent(
-                            path=path,
-                            content=content,
-                            old_content=old_content,
-                            file=file_info,
-                        )
-            elif isinstance(event, MessageEvent):
-                await self._sync_message_attachments_to_storage(event)
-                yield event
-            elif isinstance(event, TerminalUpdateEvent):
-                # Already emitted from BaseAgent live poll
-                yield event
-            else:
-                yield event
+        )
+        async with aclosing(events):
+            async for event in events:
+                if isinstance(event, ToolEvent):
+                    # TODO: move to tool function
+                    await self._handle_tool_event(event)
+                    yield event
+                    # Official: terminalUpdate / text_editor file panel push after tool settles
+                    if event.status == ToolStatus.CALLED:
+                        if event.tool_name == "shell" and event.function_args.get("id"):
+                            console = None
+                            if isinstance(event.tool_content, ShellToolContent):
+                                console = event.tool_content.console
+                            yield TerminalUpdateEvent(
+                                shell_id=event.function_args["id"],
+                                output=console if console is not None else [],
+                            )
+                        elif event.tool_name == "file" and event.function_args.get("file"):
+                            path = event.function_args["file"]
+                            content = ""
+                            old_content = None
+                            if isinstance(event.tool_content, FileToolContent):
+                                content = event.tool_content.content or ""
+                                old_content = event.tool_content.old_content
+                            file_info = await self._session_repository.get_file_by_path(
+                                self._session_id, path
+                            )
+                            yield FileUpdateEvent(
+                                path=path,
+                                content=content,
+                                old_content=old_content,
+                                file=file_info,
+                            )
+                elif isinstance(event, MessageEvent):
+                    await self._sync_message_attachments_to_storage(event)
+                    yield event
+                elif isinstance(event, TerminalUpdateEvent):
+                    # Already emitted from BaseAgent live poll
+                    yield event
+                else:
+                    yield event
 
         logger.info(f"Agent {self._agent_id} completed processing one message")
 
@@ -2885,6 +2917,7 @@ class AgentTaskRunnerFactory(TaskRunnerFactory):
                 cleanup_lease=cleanup_lease,
                 project_repository=self._project_repository,
                 skill_runtime_service=self._skill_runtime_service,
+                agent_flow=getattr(session, "agent_flow", AgentFlowType.PLAN_ACT),
             )
         except BaseException:
             # A runner never took ownership, so release every constructed

@@ -10,6 +10,7 @@ import {
   StepEventData,
   ToolEventData,
   MessageEventData,
+  MessageDeltaEventData,
   ErrorEventData,
   TitleEventData,
   PlanEventData,
@@ -82,6 +83,30 @@ export function useAgentEvents(state: AgentEventState, options: AgentEventOption
     return messages.value.filter(message => message.type === 'step').pop()?.content as StepContent;
   };
 
+  const findStreamMessage = (id: string): MessageContent | undefined => messages.value
+    .filter(message => message.type === 'assistant')
+    .map(message => message.content as MessageContent)
+    .find(content => content.message_id === id);
+
+  const handleDeltaEvent = (data: MessageDeltaEventData) => {
+    let content = findStreamMessage(data.message_id);
+    if (content && !content.streaming) return; // Canonical answer wins on replay.
+    if (data.reset) {
+      if (content) content.content = '';
+    }
+    if (!data.delta) return;
+    if (!content) {
+      if (data.offset !== 0) return; // Wait for canonical final after a history gap.
+      content = { content: '', message_id: data.message_id, streaming: true, timestamp: data.timestamp, turn_id: data.turn_id };
+      messages.value.push({ type: 'assistant', content });
+    }
+    if (data.offset === Array.from(content.content).length) content.content += data.delta;
+  };
+
+  const clearProvisionalMessages = (turnId?: string) => {
+    messages.value = messages.value.filter(message => !(message.type === 'assistant' && (message.content as MessageContent).streaming && (!turnId || message.content.turn_id === turnId)));
+  };
+
   const handleMessageEvent = (messageData: MessageEventData) => {
     // Skip blank assistant bubbles (e.g. empty create_plan.message from LLM)
     const text = (messageData.content ?? '').trim();
@@ -109,7 +134,10 @@ export function useAgentEvents(state: AgentEventState, options: AgentEventOption
       return;
     }
 
-    messages.value.push({
+    const streamed = messageData.message_id ? findStreamMessage(messageData.message_id) : undefined;
+    if (streamed) {
+      Object.assign(streamed, messageData, { streaming: false });
+    } else messages.value.push({
       type: messageData.role,
       content: {
         ...messageData
@@ -266,17 +294,21 @@ export function useAgentEvents(state: AgentEventState, options: AgentEventOption
       lastEventId.value = event.data.transport_cursor ?? event.data.event_id;
       return true;
     }
-    if (event.event === 'message') {
+    if (event.event === 'message_delta') {
+      handleDeltaEvent(event.data as MessageDeltaEventData);
+    } else if (event.event === 'message') {
       handleMessageEvent(event.data as MessageEventData);
     } else if (event.event === 'tool') {
       handleToolEvent(event.data as ToolEventData);
     } else if (event.event === 'step') {
       handleStepEvent(event.data as StepEventData);
     } else if (event.event === 'done') {
+      clearProvisionalMessages(event.data.turn_id);
       // Loading state is cleared when the stream ends / status_update arrives
     } else if (event.event === 'wait') {
       // TODO: handle wait event
     } else if (event.event === 'error') {
+      clearProvisionalMessages(event.data.turn_id);
       handleErrorEvent(event.data as ErrorEventData);
     } else if (event.event === 'title') {
       handleTitleEvent(event.data as TitleEventData);

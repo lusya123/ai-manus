@@ -1,0 +1,62 @@
+# Durable single-loop resume: shell succeeds, ask_user waits, resume reports
+# the already-completed work and delivers without invoking shell again.
+- choices:
+    - index: 0
+      message:
+        role: assistant
+        content: null
+        tool_calls:
+          - type: function
+            function:
+              name: create_plan
+              arguments: '{"message":"I will verify the sandbox, then ask you.","language":"en","title":"Single Loop Wait Task","goal":"Verify and use your choice","steps":[{"id":"1","description":"Run the wait smoke command"}]}'
+- choices:
+    - index: 0
+      message:
+        role: assistant
+        content: null
+        tool_calls:
+          - type: function
+            function:
+              name: message_notify_user
+              arguments: '{"text":"Checking the sandbox before asking."}'
+- choices:
+    - index: 0
+      message:
+        role: assistant
+        content: null
+        tool_calls:
+          - type: function
+            function:
+              name: shell_exec
+              arguments: '{"id":"e2e-single-loop-wait","exec_dir":"/home/ubuntu","command":"echo single-loop-wait-ok"}'
+- choices:
+    - index: 0
+      message:
+        role: assistant
+        content: null
+        tool_calls:
+          - type: function
+            function:
+              name: message_ask_user
+              arguments: '{"text":"Which option do you want, A or B?"}'
+- choices:
+    - index: 0
+      message:
+        role: assistant
+        content: null
+        tool_calls:
+          - type: function
+            function:
+              name: plan_report
+              arguments: '{"steps":[{"id":"1","status":"completed","reflection":"single-loop-wait-ok returned before waiting"}],"reflection":"Verified work was retained across resume."}'
+- choices:
+    - index: 0
+      message:
+        role: assistant
+        content: null
+        tool_calls:
+          - type: function
+            function:
+              name: deliver_result
+              arguments: '{"message":"Single loop wait resumed with option B; the previously verified shell command was not repeated.","attachments":[]}'

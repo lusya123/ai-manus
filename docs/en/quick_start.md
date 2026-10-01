@@ -56,7 +56,8 @@ services:
       net.ipv6.conf.default.forwarding: "0"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      #- ./mcp.json:/etc/mcp.json # Mount MCP servers directory
+      - ./mcp.json:/etc/mcp.json:ro
+      - ./config:/etc/ai-manus:ro # connectors.json and skills/; edit the repo-root config/ directory
     networks:
       - manus-network
       - manus-data-network
@@ -324,11 +325,21 @@ JWT_REFRESH_TOKEN_EXPIRE_DAYS=7
 # Optional custom Celery broker URL (defaults to the Redis settings above)
 #CELERY_BROKER_URL=
 
-# MCP configuration
-#MCP_CONFIG_PATH=/etc/mcp.json
+# Operator config directory. connectors.json and skills/ live here together.
+# Edit ./config at the repo root. When unset, the backend reads /etc/ai-manus
+# if that directory exists, otherwise ./config.
+#CONFIG_DIR=/etc/ai-manus
+# Optional overrides for one piece of that directory.
+#CONNECTOR_CATALOG_PATH=
+#SKILLS_PATH=
 
 # Log configuration
 LOG_LEVEL=INFO
+# Flow for NEW Agent sessions. Existing sessions keep their persisted flow.
+# plan_act uses Planner/Executor; agent_loop uses a continuous Manus tool loop.
+AGENT_FLOW=plan_act
+# Gradually render visible final answers when the configured gateway supports it.
+STREAM_RESPONSES=true
 ```
 <!-- /.env.example -->
 

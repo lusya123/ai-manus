@@ -8,6 +8,11 @@ from app.domain.models.plan import Plan
 from app.domain.models.file import FileInfo
 
 
+class AgentFlowType(str, Enum):
+    PLAN_ACT = "plan_act"
+    AGENT_LOOP = "agent_loop"
+
+
 class SessionStatus(str, Enum):
     """Session status enum"""
     PENDING = "pending"
@@ -42,6 +47,7 @@ class Session(BaseModel):
     """Session model"""
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:16])
     user_id: str  # User ID that owns this session
+    agent_flow: AgentFlowType = AgentFlowType.PLAN_ACT
     sandbox_id: Optional[str] = Field(default=None)  # Identifier for the sandbox environment
     # Persist the allocator identity so changing the deployment-wide provider
     # cannot silently overwrite an existing billable sandbox pointer.

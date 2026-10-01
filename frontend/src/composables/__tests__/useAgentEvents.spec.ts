@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { ref } from 'vue'
 import { useAgentEvents } from '../useAgentEvents'
 import { isComputerPanelTool } from '../../constants/tool'
-import type { Message, StepContent, ToolContent } from '../../types/message'
+import type { Message, MessageContent, StepContent, ToolContent } from '../../types/message'
 import type { PlanEventData, AgentEvent } from '../../types/event'
 
 function makeToolEvent(overrides: Partial<{
@@ -175,5 +175,60 @@ describe('useAgentEvents computer follow', () => {
     expect(lastNoMessageTool.value?.tool_call_id).toBe('file-1')
     expect(activity).toHaveLength(1)
     expect(activity[0].function).toBe('file_write')
+  })
+})
+
+describe('useAgentEvents streamed final answer', () => {
+  it('deduplicates replayed deltas and replaces the preview with the canonical final', () => {
+    const messages = ref<Message[]>([])
+    const lastEventId = ref<string | undefined>()
+    const { handleEvent } = useAgentEvents({
+      messages,
+      title: ref(''),
+      plan: ref<PlanEventData | undefined>(),
+      lastEventId,
+      lastTool: ref<ToolContent | undefined>(),
+      lastNoMessageTool: ref<ToolContent | undefined>(),
+    })
+    const delta = (eventId: string, text: string, offset: number, reset = false) => ({
+      event: 'message_delta',
+      data: {
+        event_id: eventId,
+        transport_cursor: `${eventId}-0`,
+        timestamp: 1,
+        turn_id: 'turn-1',
+        message_id: 'answer-1',
+        delta: text,
+        offset,
+        reset,
+      },
+    } as AgentEvent)
+
+    expect(handleEvent(delta('d1', 'Draft', 0))).toBe(true)
+    expect(handleEvent(delta('d1', 'Draft', 0))).toBe(false)
+    expect(handleEvent(delta('d2', 'Draft', 0))).toBe(true)
+    expect(messages.value).toHaveLength(1)
+    expect((messages.value[0].content as MessageContent).content).toBe('Draft')
+    expect((messages.value[0].content as MessageContent).streaming).toBe(true)
+
+    handleEvent(delta('reset', '', 0, true))
+    handleEvent(delta('d3', 'Revised', 0))
+    handleEvent({
+      event: 'message',
+      data: {
+        event_id: 'final', timestamp: 2, turn_id: 'turn-1',
+        message_id: 'answer-1', role: 'assistant',
+        content: 'Authoritative final answer', attachments: [],
+      },
+    } as AgentEvent)
+    handleEvent(delta('late', ' stale', 7))
+
+    expect(messages.value).toHaveLength(1)
+    expect(messages.value[0].content).toMatchObject({
+      content: 'Authoritative final answer',
+      message_id: 'answer-1',
+      streaming: false,
+    })
+    expect(lastEventId.value).toBe('late-0')
   })
 })

@@ -19,6 +19,7 @@ class ScenarioResult:
     invalid_output_feedback: int = 0
     rejected_complete_step: int = 0
     unknown_tool_responses: int = 0
+    tool_feedback: List[str] = field(default_factory=list)
     check_failures: List[str] = field(default_factory=list)
 
     @property
@@ -41,11 +42,13 @@ def build_result(
     invalid_feedback = 0
     rejected = 0
     unknown = 0
+    tool_feedback = []
     for memory in memories.values():
         for message in memory.get_messages():
             if message.role != Role.TOOL:
                 continue
             content = message.content or ""
+            tool_feedback.append(content)
             if content.startswith("Invalid arguments"):
                 invalid_feedback += 1
             elif content.startswith("Rejected:"):
@@ -67,4 +70,5 @@ def build_result(
         invalid_output_feedback=invalid_feedback,
         rejected_complete_step=rejected,
         unknown_tool_responses=unknown,
+        tool_feedback=tool_feedback,
     )

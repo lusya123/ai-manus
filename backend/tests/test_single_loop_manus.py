@@ -1,3 +1,5 @@
+import asyncio
+from types import SimpleNamespace
 from typing import Optional
 
 import pytest
@@ -5,6 +7,7 @@ import pytest
 from app.domain.models.agent_output import FinalResult
 from app.domain.models.event import (
     DoneEvent,
+    MessageDeltaEvent,
     MessageEvent,
     PlanEvent,
     PlanStatus,
@@ -15,7 +18,7 @@ from app.domain.models.event import (
     WaitEvent,
 )
 from app.domain.models.memory import Memory
-from app.domain.models.message import LLMMessage, Message, Role, ToolCall
+from app.domain.models.message import LLMMessage, Message, Role, SkillContext, ToolCall
 from app.domain.models.plan import ExecutionStatus, Plan, Step
 from app.domain.models.session import SessionStatus
 from app.domain.models.tool_result import ToolResult
@@ -26,6 +29,7 @@ from app.domain.services.tools.base import OutputTool
 from app.domain.services.tools.file import FileToolkit
 from app.domain.services.tools.message import MessageToolkit
 from app.domain.services.tools.plan import PlanToolkit
+from app.domain.utils.streaming import LLMStreamChunk
 
 from tests.harness import (
     FakeAgentRepository,
@@ -41,6 +45,12 @@ DELIVER_RESULT = OutputTool(
     description="Deliver the final result.",
     schema=FinalResult,
 )
+
+
+def _work_response(call_id: str = "work-1") -> LLMMessage:
+    return LLMMessage.assistant(tool_calls=[ToolCall(
+        id=call_id, name="file_read", args={"file": "/home/ubuntu/task.txt"},
+    )])
 
 def _flow(
     llm: ScriptedLLM,
@@ -76,6 +86,7 @@ async def test_agent_loop_flow_create_plan_then_manus_deliver():
                 args={"text": "Starting now."},
             ),
         ]),
+        _work_response(),
         LLMMessage.assistant(tool_calls=[
             ToolCall(
                 id="report-1",
@@ -165,6 +176,7 @@ async def test_agent_loop_blocks_work_tools_after_plan_finished():
                 args={"text": "Starting."},
             ),
         ]),
+        _work_response(),
         LLMMessage.assistant(tool_calls=[
             ToolCall(
                 id="report-1",
@@ -218,7 +230,7 @@ async def test_agent_loop_blocks_work_tools_after_plan_finished():
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_flow_empty_plan_skips_manus():
+async def test_agent_loop_flow_empty_plan_requires_manus_delivery():
     llm = ScriptedLLM([
         LLMMessage.assistant(tool_calls=[
             ToolCall(
@@ -233,6 +245,10 @@ async def test_agent_loop_flow_empty_plan_skips_manus():
                 },
             ),
         ]),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="result-1", name="deliver_result",
+            args={"message": "This needs no tool work.", "attachments": []},
+        )]),
     ])
     flow = _flow(llm)
 
@@ -293,6 +309,11 @@ async def test_agent_loop_flow_replan_is_intercepted_and_uses_planner():
                 },
             ),
         ]),
+        _work_response(),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="report-1", name="plan_report",
+            args={"steps": [{"id": "2", "status": "completed"}]},
+        )]),
         LLMMessage.assistant(tool_calls=[
             ToolCall(
                 id="result-1",
@@ -346,6 +367,7 @@ async def test_agent_loop_flow_invalid_plan_report_allows_model_repair():
                 args={"text": "Starting."},
             ),
         ]),
+        _work_response(),
         LLMMessage.assistant(tool_calls=[
             ToolCall(
                 id="bad-report",
@@ -407,6 +429,18 @@ async def test_agent_loop_flow_invalid_replan_allows_model_repair():
         LLMMessage.assistant(tool_calls=[
             ToolCall(id="bad-replan", name="replan", args={"reason": ""}),
         ]),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="good-replan", name="replan", args={"reason": "Need a better route"},
+        )]),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="update-1", name="update_plan",
+            args={"steps": [{"id": "2", "description": "Use the better route"}]},
+        )]),
+        _work_response(),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="report-1", name="plan_report",
+            args={"steps": [{"id": "2", "status": "completed"}]},
+        )]),
         LLMMessage.assistant(tool_calls=[
             ToolCall(
                 id="result-1",
@@ -451,6 +485,7 @@ async def test_agent_loop_flow_replan_after_all_steps_completed_keeps_new_steps(
                 args={"text": "Starting."},
             ),
         ]),
+        _work_response(),
         LLMMessage.assistant(tool_calls=[
             ToolCall(
                 id="report-1",
@@ -472,6 +507,14 @@ async def test_agent_loop_flow_replan_after_all_steps_completed_keeps_new_steps(
                 args={"steps": [{"id": "2", "description": "Follow up"}]},
             ),
         ]),
+        _work_response("work-2"),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="report-2", name="plan_report",
+            args={"steps": [
+                {"id": "1", "status": "completed"},
+                {"id": "2", "status": "completed"},
+            ]},
+        )]),
         LLMMessage.assistant(tool_calls=[
             ToolCall(
                 id="result-1",
@@ -531,7 +574,11 @@ async def test_agent_loop_flow_wait_does_not_emit_done():
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_waiting_resume_skips_create_plan():
+@pytest.mark.parametrize(("session_status", "resumes_waiting"), [
+    (SessionStatus.WAITING, None),
+    (SessionStatus.RUNNING, True),
+])
+async def test_agent_loop_waiting_resume_skips_create_plan(session_status, resumes_waiting):
     agent_repository = FakeAgentRepository()
     memory = Memory(messages=[
         LLMMessage.system("old system prompt"),
@@ -557,6 +604,11 @@ async def test_agent_loop_waiting_resume_skips_create_plan():
         ],
     )
     llm = ScriptedLLM([
+            _work_response(),
+            LLMMessage.assistant(tool_calls=[ToolCall(
+                id="report-1", name="plan_report",
+                args={"steps": [{"id": "choose", "status": "completed"}]},
+            )]),
             LLMMessage.assistant(
                 tool_calls=[
                     ToolCall(
@@ -569,12 +621,14 @@ async def test_agent_loop_waiting_resume_skips_create_plan():
         ])
     flow = _flow(
         llm,
-        session=FakeSession(status=SessionStatus.WAITING, plan=plan),
+        session=FakeSession(status=session_status, plan=plan),
         agent_repository=agent_repository,
     )
 
     events = [
-        event async for event in flow.run(Message(message="Use option B"))
+        event async for event in flow.run(
+            Message(message="Use option B"), resumes_waiting=resumes_waiting
+        )
     ]
 
     assert any(
@@ -848,6 +902,7 @@ async def test_manus_blocks_work_tools_until_notify():
 
     class StubWorkTool:
         name = "file_write"
+        toolkit = SimpleNamespace(name="file")
         called = False
 
         async def invoke(self, args):
@@ -882,13 +937,12 @@ async def test_manus_notify_surfaces_as_message_event():
                     name="message_notify_user",
                     args={"text": "好的，我来写一个 Python 示例。"},
                 ),
-                ToolCall(
-                    id="r1",
-                    name="deliver_result",
-                    args={"message": "完成", "attachments": []},
-                ),
             ]
         ),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="r1", name="deliver_result",
+            args={"message": "完成", "attachments": []},
+        )]),
     ])
     agent = ManusAgent(
         agent_id="agent-1",
@@ -909,3 +963,421 @@ async def test_manus_notify_surfaces_as_message_event():
         isinstance(event, ToolEvent) and event.function_name == "message_notify_user"
         for event in events
     )
+
+
+@pytest.mark.asyncio
+async def test_single_loop_rejects_early_delivery_until_plan_is_reported():
+    llm = ScriptedLLM([
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="plan-1", name="create_plan", args={
+                "message": "I'll check the file.", "language": "en",
+                "title": "Check file", "goal": "Check the requested file",
+                "steps": [{"id": "1", "description": "Read the file"}],
+            },
+        )]),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="notify-1", name="message_notify_user", args={"text": "Checking."},
+        )]),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="early", name="deliver_result",
+            args={"message": "Unverified", "attachments": []},
+        )]),
+        _work_response(),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="report-1", name="plan_report",
+            args={"steps": [{"id": "1", "status": "completed"}]},
+        )]),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="final", name="deliver_result",
+            args={"message": "Verified", "attachments": []},
+        )]),
+    ])
+    flow = _flow(llm)
+
+    events = [event async for event in flow.run(Message(message="Check it"))]
+
+    assert not any(isinstance(event, MessageEvent) and event.message == "Unverified" for event in events)
+    assert any(isinstance(event, MessageEvent) and event.message == "Verified" for event in events)
+    assert any(
+        message.role == Role.TOOL and message.name == "deliver_result"
+        and "Complete or fail all authoritative plan steps" in message.content
+        for call in llm.calls for message in call
+    )
+    assert isinstance(events[-1], DoneEvent)
+    assert llm.responses == []
+
+
+@pytest.mark.asyncio
+async def test_single_loop_rejects_completed_report_without_successful_work():
+    llm = ScriptedLLM([
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="plan-1", name="create_plan", args={
+                "message": "I'll do the task.", "language": "en",
+                "title": "Do task", "goal": "Finish task",
+                "steps": [{"id": "1", "description": "Read the file"}],
+            },
+        )]),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="notify-1", name="message_notify_user", args={"text": "Starting."},
+        )]),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="premature-report", name="plan_report",
+            args={"steps": [{"id": "1", "status": "completed"}]},
+        )]),
+        _work_response(),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="valid-report", name="plan_report",
+            args={"steps": [{"id": "1", "status": "completed"}]},
+        )]),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="final", name="deliver_result",
+            args={"message": "Finished after reading", "attachments": []},
+        )]),
+    ])
+    flow = _flow(llm)
+
+    events = [event async for event in flow.run(Message(message="Do it"))]
+
+    assert any(
+        message.role == Role.TOOL and message.name == "plan_report"
+        and "perform successful work" in message.content
+        for call in llm.calls for message in call
+    )
+    assert [event.status for event in events if isinstance(event, PlanEvent)] == [
+        PlanStatus.CREATED, PlanStatus.UPDATED, PlanStatus.COMPLETED,
+    ]
+    assert isinstance(events[-1], DoneEvent)
+    assert llm.responses == []
+
+
+@pytest.mark.asyncio
+async def test_single_loop_loads_enabled_skill_before_reporting_completion():
+    llm = ScriptedLLM([
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="plan-1", name="create_plan", args={
+                "message": "I'll load the skill.", "language": "en",
+                "title": "Use skill", "goal": "Follow the skill",
+                "steps": [{"id": "1", "description": "Research the task"}],
+            },
+        )]),
+    ])
+    flow = _flow(llm)
+    flow.set_enabled_skills(
+        [("demo-skill", "Demo instructions")],
+        {"demo-skill": "# Demo Skill\nFollow the verified steps."},
+    )
+
+    events = []
+    async for event in flow.run(Message(
+        message="Use the skill",
+        skill=SkillContext(skill_id="skill_demo_skill", name="demo-skill", body=""),
+    )):
+        events.append(event)
+        if isinstance(event, PlanEvent) and event.status == PlanStatus.CREATED:
+            skill_step, research_step = event.plan.steps
+            assert skill_step.description == "Load demo-skill skill"
+            llm.responses.extend([
+                LLMMessage.assistant(tool_calls=[ToolCall(
+                    id="notify-1", name="message_notify_user", args={"text": "Loading skill."},
+                )]),
+                LLMMessage.assistant(tool_calls=[ToolCall(
+                    id="skill-1", name="load_skill", args={"name": "demo-skill"},
+                )]),
+                LLMMessage.assistant(tool_calls=[ToolCall(
+                    id="skill-report", name="plan_report", args={"steps": [
+                        {"id": skill_step.id, "status": "completed"},
+                        {"id": research_step.id, "status": "running"},
+                    ]},
+                )]),
+                _work_response(),
+                LLMMessage.assistant(tool_calls=[ToolCall(
+                    id="research-report", name="plan_report", args={"steps": [
+                        {"id": skill_step.id, "status": "completed"},
+                        {"id": research_step.id, "status": "completed"},
+                    ]},
+                )]),
+                LLMMessage.assistant(tool_calls=[ToolCall(
+                    id="final", name="deliver_result",
+                    args={"message": "Skill used and research finished", "attachments": []},
+                )]),
+            ])
+
+    assert any(
+        message.role == Role.TOOL and message.name == "load_skill"
+        and "Follow the verified steps" in message.content
+        for call in llm.calls for message in call
+    )
+    assert any(isinstance(event, ToolEvent) and event.function_name == "load_skill" for event in events)
+    assert isinstance(events[-1], DoneEvent)
+    assert llm.responses == []
+
+
+@pytest.mark.asyncio
+async def test_single_loop_deltas_share_id_with_authoritative_final_message():
+    final_text = "Verified result: " + "x" * 90
+
+    class StreamingLLM(ScriptedLLM):
+        stream_calls = 0
+
+        async def ask_stream(self, messages, tools=None, response_format=None,
+                             tool_choice=None, output_tool=None):
+            self.stream_calls += 1
+            assert output_tool == "deliver_result"
+            yield LLMStreamChunk(text=final_text[:70])
+            yield LLMStreamChunk(text=final_text)
+            yield LLMStreamChunk(message=LLMMessage.assistant(tool_calls=[ToolCall(
+                id="final", name="deliver_result",
+                args={"message": final_text, "attachments": []},
+            )]))
+
+    llm = StreamingLLM([
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="plan-1", name="create_plan", args={
+                "message": "I'll read the file.", "language": "en",
+                "title": "Read file", "goal": "Verify the result",
+                "steps": [{"id": "1", "description": "Read the file"}],
+            },
+        )]),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="notify-1", name="message_notify_user", args={"text": "Reading."},
+        )]),
+        _work_response(),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="report-1", name="plan_report",
+            args={"steps": [{"id": "1", "status": "completed"}]},
+        )]),
+    ])
+    flow = _flow(llm)
+
+    events = [event async for event in flow.run(Message(message="Verify"))]
+
+    deltas = [event for event in events if isinstance(event, MessageDeltaEvent)]
+    final = next(event for event in events if isinstance(event, MessageEvent) and event.message == final_text)
+    assert llm.stream_calls == 1
+    assert deltas
+    assert all(event.message_id == final.message_id for event in deltas)
+    assert final.message_id
+    assert isinstance(events[-1], DoneEvent)
+
+
+@pytest.mark.asyncio
+async def test_single_loop_rebuild_after_wait_reports_prior_work_without_repeating_it():
+    repository = FakeAgentRepository()
+    first_llm = ScriptedLLM([
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="plan-1", name="create_plan", args={
+                "message": "I'll inspect the file, then ask.", "language": "en",
+                "title": "Inspect and ask", "goal": "Use the selected option",
+                "steps": [{"id": "1", "description": "Read and decide"}],
+            },
+        )]),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="notify-1", name="message_notify_user", args={"text": "Reading."},
+        )]),
+        _work_response(),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="ask-1", name="message_ask_user", args={"text": "Which option?"},
+        )]),
+    ])
+    first_flow = _flow(first_llm, agent_repository=repository)
+
+    first_events = [event async for event in first_flow.run(Message(message="Choose"))]
+    await asyncio.sleep(0)
+    assert any(isinstance(event, WaitEvent) for event in first_events)
+    assert not any(isinstance(event, DoneEvent) for event in first_events)
+    assert first_flow.agent._output_tool is None
+    assert not first_flow.agent._stream_queue._getters
+
+    resumed = FakeSession(
+        status=SessionStatus.RUNNING,
+        plan=first_flow.plan.model_copy(deep=True),
+    )
+    second_llm = ScriptedLLM([
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="report-1", name="plan_report",
+            args={"steps": [{"id": "1", "status": "completed"}]},
+        )]),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="final", name="deliver_result",
+            args={"message": "Used option B after checking the file", "attachments": []},
+        )]),
+    ])
+    second_flow = _flow(second_llm, session=resumed, agent_repository=repository)
+    second_events = [event async for event in second_flow.run(
+        Message(message="Use option B"), resumes_waiting=True,
+    )]
+
+    assert isinstance(second_events[-1], DoneEvent)
+    assert second_flow.plan.steps[0].status == ExecutionStatus.COMPLETED
+    assert all(
+        all(call.name != "file_read" for call in response.tool_calls)
+        for response in second_llm.responses
+    )
+    assert not any(
+        isinstance(event, ToolEvent) and event.function_name == "file_read"
+        for event in second_events
+    )
+    assert second_llm.responses == []
+
+
+@pytest.mark.asyncio
+async def test_replan_to_empty_steps_without_work_cannot_complete_the_task():
+    llm = ScriptedLLM([
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="plan-1", name="create_plan", args={
+                "message": "I'll verify the task.", "language": "en",
+                "title": "Verify", "goal": "Verify the file",
+                "steps": [{"id": "1", "description": "Read the file"}],
+            },
+        )]),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="notify-1", name="message_notify_user", args={"text": "Checking."},
+        )]),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="replan-1", name="replan", args={"reason": "Maybe no work is needed"},
+        )]),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="update-1", name="update_plan", args={"steps": []},
+        )]),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="early", name="deliver_result",
+            args={"message": "Unverified", "attachments": []},
+        )]),
+        _work_response(),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="report-1", name="plan_report",
+            args={"steps": [{"id": "1", "status": "completed"}]},
+        )]),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="final", name="deliver_result",
+            args={"message": "Verified", "attachments": []},
+        )]),
+    ])
+    flow = _flow(llm)
+
+    events = [event async for event in flow.run(Message(message="Verify"))]
+
+    assert not any(isinstance(event, MessageEvent) and event.message == "Unverified" for event in events)
+    assert any(isinstance(event, MessageEvent) and event.message == "Verified" for event in events)
+    assert flow.plan.steps[0].id == "1"
+    assert flow.plan.steps[0].status == ExecutionStatus.COMPLETED
+    assert isinstance(events[-1], DoneEvent)
+    assert llm.responses == []
+
+
+@pytest.mark.asyncio
+async def test_deliver_result_and_replan_same_batch_cannot_finish_before_new_work():
+    llm = ScriptedLLM([
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="plan-1", name="create_plan", args={
+                "message": "I'll verify the task.", "language": "en",
+                "title": "Verify", "goal": "Verify all work",
+                "steps": [{"id": "1", "description": "Read first file"}],
+            },
+        )]),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="notify-1", name="message_notify_user", args={"text": "Checking."},
+        )]),
+        _work_response(),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="report-1", name="plan_report",
+            args={"steps": [{"id": "1", "status": "completed"}]},
+        )]),
+        LLMMessage.assistant(tool_calls=[
+            ToolCall(id="early", name="deliver_result",
+                     args={"message": "Premature", "attachments": []}),
+            ToolCall(id="replan-1", name="replan",
+                     args={"reason": "A second file also needs checking"}),
+        ]),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="update-1", name="update_plan",
+            args={"steps": [{"id": "2", "description": "Read second file"}]},
+        )]),
+        _work_response("work-2"),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="report-2", name="plan_report",
+            args={"steps": [
+                {"id": "1", "status": "completed"},
+                {"id": "2", "status": "completed"},
+            ]},
+        )]),
+        LLMMessage.assistant(tool_calls=[ToolCall(
+            id="final", name="deliver_result",
+            args={"message": "Both files verified", "attachments": []},
+        )]),
+    ])
+    flow = _flow(llm)
+
+    events = [event async for event in flow.run(Message(message="Verify"))]
+
+    assert not any(isinstance(event, MessageEvent) and event.message == "Premature" for event in events)
+    assert any(isinstance(event, MessageEvent) and event.message == "Both files verified" for event in events)
+    assert any(
+        message.role == Role.TOOL and message.name == "deliver_result"
+        and "alone" in message.content
+        for call in llm.calls for message in call
+    )
+    assert [step.id for step in flow.plan.steps] == ["1", "2"]
+    assert isinstance(events[-1], DoneEvent)
+    assert llm.responses == []
+
+
+def test_restore_compacted_failed_work_does_not_authorize_plan_report():
+    agent = _flow(ScriptedLLM([])).agent
+    memory = Memory(messages=[
+        LLMMessage.user("<authoritative_plan>current plan</authoritative_plan>"),
+        LLMMessage.tool("failed", "file_read", '{"success":false,"message":"permission denied"}',
+                        artifact=ToolResult(success=False, message="permission denied")),
+    ])
+    memory.compact(keep_recent=0)
+    agent.memory = memory
+
+    agent.restore_work_since_report()
+
+    assert memory.messages[-1].tool_success is False
+    assert not agent._work_since_report
+
+
+def test_restore_compacted_successful_work_after_current_plan_allows_report():
+    agent = _flow(ScriptedLLM([])).agent
+    memory = Memory(messages=[
+        LLMMessage.tool("old", "file_read", '{"success":true}',
+                        artifact=ToolResult(success=True)),
+        LLMMessage.user("<authoritative_plan>current plan</authoritative_plan>"),
+        LLMMessage.tool("current", "file_read", '{"success":true,"data":"verified"}',
+                        artifact=ToolResult(success=True, data="verified")),
+    ])
+    memory.compact(keep_recent=0)
+    agent.memory = memory
+
+    agent.restore_work_since_report()
+
+    assert memory.messages[-1].tool_success is True
+    assert agent._work_since_report
+
+
+def test_restore_old_compacted_work_before_current_plan_cannot_authorize_report():
+    agent = _flow(ScriptedLLM([])).agent
+    agent.memory = Memory(messages=[
+        LLMMessage.tool("old", "file_read", '{"success":true}',
+                        artifact=ToolResult(success=True)),
+        LLMMessage.user("<authoritative_plan>current plan</authoritative_plan>"),
+    ])
+
+    agent.restore_work_since_report()
+
+    assert not agent._work_since_report
+
+
+def test_restore_report_with_completion_hint_resets_work_state():
+    agent = _flow(ScriptedLLM([])).agent
+    agent.memory = Memory(messages=[
+        LLMMessage.user("<authoritative_plan>current plan</authoritative_plan>"),
+        LLMMessage.tool("work", "file_read", '{"success":true,"data":"verified"}'),
+        LLMMessage.tool("report", "plan_report",
+                        '{"success":true,"data":{"steps":[]}}\n\nPlan complete; use deliver_result.'),
+    ])
+
+    agent.restore_work_since_report()
+
+    assert not agent._work_since_report

@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import json
 import yaml
@@ -9,6 +10,7 @@ from pathlib import Path
 import asyncio
 import logging
 import sys
+import time
 
 # Configure logging
 logger = logging.getLogger()
@@ -112,6 +114,45 @@ async def reset_scenario():
     current_index = 0
     return {"file": current_mock_file(), "index": 0}
 
+def _stream_chunks(response: dict, model: str, index: int):
+    """Replay a scripted completion as OpenAI-compatible SSE chunks."""
+    choice = response["choices"][0]
+    message = choice["message"]
+    envelope = {
+        "id": f"chatcmpl-mock-{index}",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+    }
+
+    def event(delta: dict, finish_reason=None):
+        payload = {**envelope, "choices": [{
+            "index": 0, "delta": delta, "finish_reason": finish_reason,
+        }]}
+        return f"data: {json.dumps(payload)}\n\n"
+
+    yield event({"role": "assistant"})
+    content = message.get("content") or ""
+    for offset in range(0, len(content), 32):
+        yield event({"content": content[offset:offset + 32]})
+    calls = message.get("tool_calls") or []
+    for tool_index, call in enumerate(calls):
+        function = call["function"]
+        call_id = call.get("id") or f"call-mock-{index}-{tool_index}"
+        arguments = function.get("arguments", "")
+        yield event({"tool_calls": [{
+            "index": tool_index, "id": call_id, "type": "function",
+            "function": {"name": function["name"], "arguments": ""},
+        }]})
+        for offset in range(0, len(arguments), 32):
+            yield event({"tool_calls": [{
+                "index": tool_index,
+                "function": {"arguments": arguments[offset:offset + 32]},
+            }]})
+    yield event({}, "tool_calls" if calls else "stop")
+    yield "data: [DONE]\n\n"
+
+
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def chat_completions(request: ChatCompletionRequest):
     global current_index
@@ -130,7 +171,13 @@ async def chat_completions(request: ChatCompletionRequest):
         logger.debug(f"Applying mock delay of {delay} seconds")
         await asyncio.sleep(delay)
     
+    response_index = current_index
     response = mock_data[current_index]
     current_index = (current_index + 1) % len(mock_data)
     logger.info(f"Returning mock response {current_index}/{len(mock_data)}")
+    if request.stream:
+        return StreamingResponse(
+            _stream_chunks(response, request.model, response_index),
+            media_type="text/event-stream",
+        )
     return response

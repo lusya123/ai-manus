@@ -123,7 +123,8 @@ services:
       net.ipv6.conf.default.forwarding: "0"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      #- ./mcp.json:/etc/mcp.json # Mount MCP servers directory
+      - ./mcp.json:/etc/mcp.json:ro
+      - ./config:/etc/ai-manus:ro # connectors.json and skills/; edit the repo-root config/ directory
     networks:
       - manus-network
       - manus-data-network

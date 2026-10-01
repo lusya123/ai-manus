@@ -183,7 +183,8 @@ async def test_runner_finishes_current_turn_before_processing_queued_message():
             return None
 
     class MCPRepository:
-        async def get_mcp_config(self):
+        async def get_mcp_config(self, user_id):
+            assert user_id == "user-1"
             return {}
 
     input_stream = InputStream()
@@ -196,6 +197,7 @@ async def test_runner_finishes_current_turn_before_processing_queued_message():
     runner = object.__new__(AgentTaskRunner)
     runner._agent_id = "agent-1"
     runner._session_id = "session-1"
+    runner._user_id = "user-1"
     runner._sandbox = Sandbox()
     runner._mcp_tool = MCPTool()
     runner._mcp_repository = MCPRepository()

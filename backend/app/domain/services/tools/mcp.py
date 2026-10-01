@@ -1,4 +1,7 @@
 import os
+import asyncio
+import re
+import hashlib
 import logging
 from typing import Dict, Any, List, Optional
 from contextlib import AsyncExitStack
@@ -26,29 +29,41 @@ class MCPClientManager:
         self._tools_cache: Dict[str, List[MCPToolkit]] = {}
         self._initialized = False
         self._config = config
+        self._tool_routes = {}
+        self._owner_task = None
+        self._stop = asyncio.Event()
     
     async def initialize(self):
-        """初始化 MCP 客户端管理器"""
         if self._initialized:
             return
-        
+        ready = asyncio.get_running_loop().create_future()
+        self._owner_task = asyncio.create_task(self._own_connections(ready))
         try:
-            logger.info(f"从配置加载了 {len(self._config.mcpServers)} 个 MCP 服务器配置")
-            
-            # 连接到所有启用的服务器
-            await self._connect_servers()
-            
-            self._initialized = True
-            logger.info("MCP 客户端管理器初始化成功")
-            
-        except Exception as e:
-            logger.error(
-                "MCP 客户端管理器初始化失败: %s",
-                safe_exception_summary(e),
-            )
+            await ready
+        except BaseException as exc:
+            if isinstance(exc, Exception):
+                logger.error("MCP initialization failed: %s", safe_exception_summary(exc))
+            self._stop.set()
+            await self._owner_task
             raise
+        self._initialized = True
 
-    
+    async def _own_connections(self, ready):
+        # MCP transports contain AnyIO cancel scopes; enter and exit them in
+        # one owner task even when successive turns use different worker tasks.
+        try:
+            await self._connect_servers()
+            if not ready.done():
+                ready.set_result(None)
+            await self._stop.wait()
+        except BaseException as exc:
+            if not ready.done():
+                ready.set_exception(exc)
+            else:
+                raise
+        finally:
+            await self._exit_stack.aclose()
+
     async def _connect_servers(self):
         """连接到所有启用的 MCP 服务器"""
         for server_name, server_config in self._config.mcpServers.items():
@@ -88,6 +103,8 @@ class MCPClientManager:
     
     async def _connect_stdio_server(self, server_name: str, server_config: MCPServerConfig):
         """连接到 stdio MCP 服务器"""
+        if server_config.user_managed:
+            raise ValueError("User connectors cannot execute backend commands")
         command = server_config.command
         args = server_config.args or []
         env = server_config.env or {}
@@ -133,6 +150,14 @@ class MCPClientManager:
             )
             raise
     
+    @staticmethod
+    def _http_security_options(config: MCPServerConfig) -> dict:
+        if not config.user_managed:
+            return {}
+        if not config.http_client_factory:
+            raise ValueError("User connector is missing a validated endpoint client")
+        return {"httpx_client_factory": config.http_client_factory}
+
     async def _connect_http_server(self, server_name: str, server_config: MCPServerConfig):
         """连接到 HTTP MCP 服务器"""
         url = server_config.url
@@ -142,7 +167,7 @@ class MCPClientManager:
         try:
             # 建立 SSE 连接
             sse_transport = await self._exit_stack.enter_async_context(
-                sse_client(url)
+                sse_client(url, headers=server_config.headers, **self._http_security_options(server_config))
             )
             read_stream, write_stream = sse_transport
             
@@ -185,7 +210,7 @@ class MCPClientManager:
         
         try:
             # 准备连接参数
-            client_params = {"url": url}
+            client_params = {"url": url, **self._http_security_options(server_config)}
             
             # 添加自定义 headers
             if headers:
@@ -243,6 +268,8 @@ class MCPClientManager:
     async def get_all_tools(self) -> List[Dict[str, Any]]:
         """获取所有 MCP 工具"""
         all_tools = []
+        self._tool_routes = {}
+        ambiguous = set()
         
         for server_name, tools in self._tools_cache.items():
             for tool in tools:
@@ -252,6 +279,16 @@ class MCPClientManager:
                 else:
                     tool_name = f"mcp_{server_name}_{tool.name}"
                 
+                if len(tool_name) > 64 or not re.fullmatch(r"[A-Za-z0-9_-]+", tool_name):
+                    digest = hashlib.sha256(f"{server_name}\0{tool.name}".encode()).hexdigest()[:12]
+                    prefix = re.sub(r"[^A-Za-z0-9_-]", "_", tool_name)[:47]
+                    tool_name = f"{prefix}_{digest}"
+                if tool_name in self._tool_routes or tool_name in ambiguous:
+                    self._tool_routes.pop(tool_name, None)
+                    ambiguous.add(tool_name)
+                    all_tools = [schema for schema in all_tools if schema["function"]["name"] != tool_name]
+                    continue
+                self._tool_routes[tool_name] = (server_name, tool.name)
                 # 转换为标准工具格式
                 tool_schema = {
                     "type": "function",
@@ -268,21 +305,11 @@ class MCPClientManager:
     async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> ToolResult:
         """调用 MCP 工具"""
         try:
-            # 解析工具名称
-            server_name = None
-            original_tool_name = None
-            
-            # 查找匹配的服务器名称
-            for srv_name in self._config.mcpServers.keys():
-                expected_prefix = srv_name if srv_name.startswith('mcp_') else f"mcp_{srv_name}"
-                if tool_name.startswith(f"{expected_prefix}_"):
-                    server_name = srv_name
-                    original_tool_name = tool_name[len(expected_prefix) + 1:]
-                    break
-            
-            if not server_name or not original_tool_name:
-                raise ValueError(f"无法解析 MCP 工具名称: {tool_name}")
-            
+            route = self._tool_routes.get(tool_name)
+            if not route:
+                return ToolResult(success=False, message="MCP tool is unavailable or ambiguous")
+            server_name, original_tool_name = route
+
             # 获取客户端会话
             session = self._clients.get(server_name)
             if not session:
@@ -335,8 +362,14 @@ class MCPClientManager:
     async def cleanup(self):
         """清理资源"""
         try:
-            await self._exit_stack.aclose()
+            if self._owner_task is not None:
+                self._stop.set()
+                await self._owner_task
+                self._owner_task = None
+            else:
+                await self._exit_stack.aclose()
             self._clients.clear()
+            self._tool_routes.clear()
             self._tools_cache.clear()
             self._initialized = False
             logger.info("MCP 客户端管理器已清理")
@@ -368,14 +401,19 @@ class MCPToolkit(BaseToolkit):
         super().__init__()
         self._initialized = False
         self.manager: Optional[MCPClientManager] = None
+        self._config_snapshot = None
 
     async def initialized(self, config: Optional[MCPConfig] = None):
         """确保管理器已初始化"""
+        snapshot = config.model_dump() if config else None
+        if self._initialized and snapshot != self._config_snapshot:
+            await self.cleanup()
         if not self._initialized:
             self.manager = MCPClientManager(config)
             await self.manager.initialize()
             self.tools = self._build_tools(await self.manager.get_all_tools())
             self._initialized = True
+            self._config_snapshot = snapshot
 
     def _build_tools(self, schemas: List[Dict[str, Any]]) -> List[Tool]:
         """Wrap MCP schemas in the same invocable abstraction as built-ins."""
@@ -412,3 +450,4 @@ class MCPToolkit(BaseToolkit):
             self.manager = None
         self.tools = []
         self._initialized = False
+        self._config_snapshot = None

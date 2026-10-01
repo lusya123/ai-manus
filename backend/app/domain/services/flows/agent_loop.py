@@ -1,3 +1,4 @@
+from contextlib import aclosing
 from typing import AsyncGenerator, Optional
 
 from pydantic import ValidationError
@@ -9,6 +10,7 @@ from app.domain.external.search import SearchEngine
 from app.domain.models.event import (
     BaseEvent,
     DoneEvent,
+    ErrorEvent,
     MessageEvent,
     PlanEvent,
     PlanStatus,
@@ -42,6 +44,7 @@ from app.domain.services.tools.message import MessageToolkit
 from app.domain.services.tools.plan import PlanToolkit
 from app.domain.services.tools.search import SearchToolkit
 from app.domain.services.tools.shell import ShellToolkit
+from app.domain.services.tools.skill import SkillToolkit
 
 
 def format_plan_for_manus(plan: Plan) -> str:
@@ -92,11 +95,13 @@ class AgentLoopFlow(BaseFlow):
         self._project_repository = project_repository
         self._done = False
 
+        self._skill_toolkit = SkillToolkit()
         tools = [
             ShellToolkit(sandbox),
             BrowserToolkit(browser),
             FileToolkit(sandbox),
             MessageToolkit(),
+            self._skill_toolkit,
             mcp_tool,
         ]
         if search_engine:
@@ -116,6 +121,50 @@ class AgentLoopFlow(BaseFlow):
         )
         self.plan: Plan | None = None
 
+    def set_skill_catalog(self, catalog: Optional[str]) -> None:
+        """Inject L1 skill metadata into planner and executor system prompts."""
+        self.planner.set_skill_catalog(catalog)
+        self.agent.set_skill_catalog(catalog)
+
+    def set_enabled_skills(
+        self,
+        skills: Optional[list[tuple[str, str]]] = None,
+        bodies: Optional[dict[str, str]] = None,
+    ) -> None:
+        """Refresh ``load_skill`` catalog + bodies from the user's enabled skills."""
+        self._skill_toolkit.set_skills(list(skills or []))
+        self._skill_toolkit.set_bodies(dict(bodies or {}))
+
+    async def _apply_skill_context(self, message: Message) -> None:
+        from app.domain.services.prompts.system import (
+            format_skill_context,
+            format_skill_planner_context,
+        )
+
+        if not message.skill:
+            self.planner.set_skill_context(None)
+            self.agent.set_skill_context(None)
+            return
+
+        # Planner: activation only — must schedule a first load_skill step.
+        # Executor: soft MUST call load_skill before other work.
+        self.planner.set_skill_context(
+            format_skill_planner_context(
+                name=message.skill.name,
+                task=message.message,
+            )
+        )
+        self.agent.set_skill_context(
+            format_skill_context(
+                name=message.skill.name,
+                task=message.message,
+            )
+        )
+
+    async def _sync_agent_prompts(self) -> None:
+        await self.planner.sync_system_prompt()
+        await self.agent.sync_system_prompt()
+
     async def _apply_project_instruction(self, project_id: Optional[str]) -> None:
         instruction: Optional[str] = None
         if project_id and self._project_repository:
@@ -126,18 +175,27 @@ class AgentLoopFlow(BaseFlow):
             agent.set_project_instruction(instruction)
             await agent.sync_system_prompt()
 
-    async def run(self, message: Message) -> AsyncGenerator[BaseEvent, None]:
+    async def run(self, message: Message, resumes_waiting: Optional[bool] = None) -> AsyncGenerator[BaseEvent, None]:
         self._done = False
         session = await self._session_repository.find_by_id(self._session_id)
         if not session:
             raise ValueError(f"Session {self._session_id} not found")
 
+        await self._apply_skill_context(message)
         await self._apply_project_instruction(session.project_id)
         initial_status = session.status
+        waiting = initial_status == SessionStatus.WAITING if resumes_waiting is None else resumes_waiting
+        self.plan = None
+        self.agent._delivered = False
+        self.agent._work_since_report = False
+        self.agent._skill_work_since_report = False
+        self.agent._active_skill_name = message.skill.name if message.skill else None
+        self.agent._plan = None
         self.agent._plan_finished = False
         self.agent._injected_plan_complete_hint = None
         if initial_status != SessionStatus.PENDING:
             await self.agent.roll_back(message)
+            await self.planner.roll_back(message)
 
         await self._session_repository.update_status(
             self._session_id,
@@ -145,9 +203,12 @@ class AgentLoopFlow(BaseFlow):
         )
 
         last_plan = session.get_last_plan()
-        if initial_status != SessionStatus.WAITING:
+        if not waiting:
             async for event in self.planner.create_plan(message):
                 if isinstance(event, PlanEvent) and event.status == PlanStatus.CREATED:
+                    if message.skill:
+                        from app.domain.services.skills.plan_steps import ensure_skill_read_first_step
+                        ensure_skill_read_first_step(event.plan, message.skill.name)
                     self.plan = (
                         mark_first_step_running(event.plan)
                         if event.plan.steps
@@ -167,22 +228,27 @@ class AgentLoopFlow(BaseFlow):
                         yield step_event
                 yield event
 
-            if not self.plan or not self.plan.steps:
-                if self.plan:
-                    yield PlanEvent(
-                        status=PlanStatus.COMPLETED,
-                        plan=complete_plan(self.plan),
-                    )
-                self._done = True
-                yield DoneEvent()
+            if not self.plan:
+                yield ErrorEvent(error="Planner did not produce a valid plan")
                 return
+            self.agent._plan_finished = not self.plan.steps
+            self.agent._plan = self.plan
 
             manus_message = Message(
                 message=f"{message.message}\n\n{format_plan_for_manus(self.plan)}",
                 attachments=message.attachments,
+                skill=message.skill,
+                required_skills=message.required_skills,
             )
         else:
             self.plan = last_plan
+            await self.agent._ensure_memory()
+            if not self.plan or not any(m.role.value == "assistant" for m in self.agent.memory.messages):
+                yield ErrorEvent(error="Waiting task has no resumable plan or agent memory")
+                return
+            self.agent._plan = self.plan
+            self.agent.restore_work_since_report()
+            self.agent._plan_finished = is_plan_finished(self.plan)
             if self.plan:
                 self.agent._plan_title = self.plan.title
                 self.agent._plan_goal = self.plan.goal
@@ -193,84 +259,91 @@ class AgentLoopFlow(BaseFlow):
         waited = False
         events = (
             self.agent.resume()
-            if initial_status == SessionStatus.WAITING
+            if waiting
             else self.agent.run(manus_message)
         )
-        async for event in events:
-            if isinstance(event, ToolEvent) and event.function_name == "plan_report":
-                if event.status == ToolStatus.CALLED and self.plan:
-                    result = event.function_result
-                    if (
-                        not result
-                        or not getattr(result, "success", False)
-                        or getattr(result, "data", None) is None
-                    ):
-                        continue
-                    try:
-                        report = PlanReportOutput.model_validate(result.data)
-                    except ValidationError:
-                        continue
-                    for plan_event in apply_plan_report(self.plan, report):
-                        yield plan_event
-                    if is_plan_finished(self.plan):
-                        self.agent._plan_finished = True
-                        self.agent._injected_plan_complete_hint = PLAN_COMPLETE_HINT
-                continue
-
-            if isinstance(event, ToolEvent) and event.function_name == "replan":
-                if event.status == ToolStatus.CALLED and self.plan:
-                    result = event.function_result
-                    if (
-                        not result
-                        or not getattr(result, "success", False)
-                        or getattr(result, "data", None) is None
-                    ):
-                        continue
-                    try:
-                        reason = ReplanOutput.model_validate(result.data).reason
-                    except ValidationError:
-                        continue
-                    step = self.plan.get_next_step()
-                    if step is None and self.plan.steps:
-                        step = self.plan.steps[-1]
-                    if step is not None:
-                        finished_step = step.model_copy(update={
-                            "result": reason,
-                            "status": ExecutionStatus.COMPLETED,
-                            "success": True,
-                        })
-                        async for plan_event in self.planner.update_plan(
-                            self.plan,
-                            finished_step,
+        async with aclosing(events):
+            async for event in events:
+                if isinstance(event, ToolEvent) and event.function_name == "plan_report":
+                    if event.status == ToolStatus.CALLED and self.plan:
+                        result = event.function_result
+                        if (
+                            not result
+                            or not getattr(result, "success", False)
+                            or getattr(result, "data", None) is None
                         ):
-                            if (
-                                isinstance(plan_event, PlanEvent)
-                                and plan_event.status == PlanStatus.UPDATED
-                            ):
-                                self.plan = plan_event.plan
-                                self.agent._injected_plan_text = (
-                                    format_plan_for_manus(self.plan)
-                                )
-                                self.agent._plan_finished = is_plan_finished(self.plan)
-                                if self.agent._plan_finished:
-                                    self.agent._injected_plan_complete_hint = (
-                                        PLAN_COMPLETE_HINT
-                                    )
-                                else:
-                                    self.agent._injected_plan_complete_hint = None
+                            continue
+                        try:
+                            report = PlanReportOutput.model_validate(result.data)
+                        except ValidationError:
+                            continue
+                        for plan_event in apply_plan_report(self.plan, report):
                             yield plan_event
-                continue
+                        if is_plan_finished(self.plan):
+                            self.agent._plan_finished = True
+                            self.agent._injected_plan_complete_hint = PLAN_COMPLETE_HINT
+                    continue
 
-            if isinstance(event, WaitEvent):
-                waited = True
-            yield event
+                if isinstance(event, ToolEvent) and event.function_name == "replan":
+                    if event.status == ToolStatus.CALLED and self.plan:
+                        result = event.function_result
+                        if (
+                            not result
+                            or not getattr(result, "success", False)
+                            or getattr(result, "data", None) is None
+                        ):
+                            continue
+                        try:
+                            reason = ReplanOutput.model_validate(result.data).reason
+                        except ValidationError:
+                            continue
+                        step = self.plan.get_next_step()
+                        if step is None and self.plan.steps:
+                            step = self.plan.steps[-1]
+                        if step is not None:
+                            unfinished = any(not item.is_done() for item in self.plan.steps)
+                            finished_step = step.model_copy(update={"result": reason})
+                            candidate = self.plan.model_copy(deep=True)
+                            async for plan_event in self.planner.update_plan(
+                                candidate,
+                                finished_step,
+                            ):
+                                if (
+                                    isinstance(plan_event, PlanEvent)
+                                    and plan_event.status == PlanStatus.UPDATED
+                                ):
+                                    proposed = plan_event.plan
+                                    ids = [item.id for item in proposed.steps]
+                                    if len(ids) != len(set(ids)) or (unfinished and is_plan_finished(proposed)):
+                                        self.agent._injected_plan_text = "Replan rejected: retain unfinished work. Complete verified work or explicitly report failure before delivering." + "\n" + format_plan_for_manus(self.plan)
+                                        continue
+                                    self.plan = proposed
+                                    self.agent._plan = self.plan
+                                    self.agent._injected_plan_text = (
+                                        format_plan_for_manus(self.plan)
+                                    )
+                                    self.agent._plan_finished = is_plan_finished(self.plan)
+                                    if self.agent._plan_finished:
+                                        self.agent._injected_plan_complete_hint = (
+                                            PLAN_COMPLETE_HINT
+                                        )
+                                    else:
+                                        self.agent._injected_plan_complete_hint = None
+                                yield plan_event
+                    continue
 
-        if not waited and self.plan:
-            for plan_event in complete_plan_events(self.plan):
-                yield plan_event
-        self._done = not waited
-        if not waited:
+                if isinstance(event, WaitEvent):
+                    waited = True
+                yield event
+
+        if not waited and self.agent._delivered:
+            if self.plan:
+                self.plan.status = ExecutionStatus.FAILED if any(step.status == ExecutionStatus.FAILED for step in self.plan.steps) else ExecutionStatus.COMPLETED
+                yield PlanEvent(status=PlanStatus.COMPLETED, plan=self.plan)
+            self._done = True
             yield DoneEvent()
+        elif not waited:
+            yield ErrorEvent(error="Agent ended without delivering a valid result")
 
     def is_done(self) -> bool:
         return self._done

@@ -15,13 +15,19 @@ from app.domain.models.message import Message
 
 from evals.metrics import ScenarioResult, build_result
 from evals.scenarios import SCENARIOS, Scenario
-from tests.harness import FakeAgentRepository, ScriptedLLM, build_plan_act_flow
+from tests.harness import (
+    FakeAgentRepository, ScriptedLLM, build_agent_loop_flow, build_plan_act_flow,
+)
 
 
 async def run_scenario(scenario: Scenario) -> ScenarioResult:
     llm = ScriptedLLM(list(scenario.responses))
     repository = FakeAgentRepository()
-    flow = build_plan_act_flow(llm, agent_repository=repository)
+    flow = (
+        build_agent_loop_flow(llm, agent_repository=repository)
+        if scenario.flow == "agent_loop"
+        else build_plan_act_flow(llm, agent_repository=repository)
+    )
 
     events = [
         event async for event in flow.run(Message(message=scenario.user_message))

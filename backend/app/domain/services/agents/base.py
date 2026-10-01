@@ -2,6 +2,9 @@ import logging
 import json
 import asyncio
 import uuid
+import contextlib
+from contextlib import aclosing
+from app.domain.utils.streaming import merge_stream_events
 from abc import ABC
 from typing import Any, List, Literal, Optional, AsyncGenerator
 from app.domain.models.message import Message, LLMMessage, Role, ToolCall
@@ -12,6 +15,7 @@ from app.domain.models.event import (
     ToolStatus,
     ErrorEvent,
     MessageEvent,
+    MessageDeltaEvent,
     TerminalUpdateEvent,
 )
 from app.domain.models.tool_result import ToolResult
@@ -34,6 +38,7 @@ class StructuredOutputEvent(BaseEvent):
 
     type: Literal["structured_output"] = "structured_output"
     output: Any
+    message_id: Optional[str] = None
 
 
 class BaseAgent(ABC):
@@ -64,10 +69,44 @@ class BaseAgent(ABC):
         self.toolkits = tools
         self.memory = None
         self._output_tool: Optional[OutputTool] = None
+        self._stream_queue = asyncio.Queue(maxsize=64)
+        self._stream_message_id = None
         self._project_instruction: Optional[str] = None
         self._skill_catalog: Optional[str] = None
         self._skill_context: Optional[str] = None
         self._tool_call_timeout_seconds = get_settings().tool_call_timeout_seconds
+
+    def stream_events(self, events):
+        return merge_stream_events(events, self._stream_queue)
+
+    async def _ask_model(self, context):
+        self._stream_message_id = None
+        stream = getattr(self._llm, "ask_stream", None)
+        # Planner/step JSON and tool instructions remain private. Single-loop
+        # final results become visible only after the plan completion guard.
+        can_stream = self._output_tool and self._output_tool.name == "deliver_result" and getattr(self, "_plan_finished", False)
+        if not stream or not can_stream or not get_settings().stream_responses:
+            return await self._llm.ask(messages=context, tools=self.get_tool_schemas(), tool_choice=self.tool_choice)
+        message_id = str(uuid.uuid4())
+        previous = ""
+        reply = None
+        async with aclosing(stream(messages=context, tools=self.get_tool_schemas(), tool_choice=self.tool_choice, output_tool="deliver_result")) as chunks:
+            async for chunk in chunks:
+                if chunk.reset:
+                    await self._stream_queue.put(MessageDeltaEvent(message_id=message_id, reset=True))
+                    previous = ""
+                elif chunk.message is not None:
+                    reply = chunk.message
+                elif chunk.text != previous:
+                    # Bound event volume; small trailing chunks flush at the end.
+                    reset = not chunk.text.startswith(previous)
+                    if reset or len(chunk.text) - len(previous) >= 64:
+                        await self._stream_queue.put(MessageDeltaEvent(message_id=message_id, delta=chunk.text if reset else chunk.text[len(previous):], offset=0 if reset else len(previous), reset=reset))
+                        previous = chunk.text
+        if reply is None:
+            raise RuntimeError("Model stream ended without a canonical response")
+        self._stream_message_id = message_id
+        return reply
 
     def set_project_instruction(self, instruction: Optional[str]) -> None:
         """Bind project-level guidance used when assembling the system prompt."""
@@ -244,8 +283,9 @@ class BaseAgent(ABC):
         self._output_tool = output_tool
         try:
             message = await self.ask(request)
-            async for event in self._tool_loop(message):
-                yield event
+            async with aclosing(self._tool_loop(message)) as events:
+                async for event in events:
+                    yield event
         finally:
             self._output_tool = None
 
@@ -263,16 +303,13 @@ class BaseAgent(ABC):
                     self._agent_id, self.name, self.memory
                 )
 
-            message = await self._llm.ask(
-                messages=list(self.memory.get_messages()),
-                tools=self.get_tool_schemas(),
-                tool_choice=self.tool_choice,
-            )
+            message = await self._ask_model(list(self.memory.get_messages()))
             logger.debug(f"Response from model: {message}")
             await self._add_to_memory([message])
 
-            async for event in self._tool_loop(message):
-                yield event
+            async with aclosing(self._tool_loop(message)) as events:
+                async for event in events:
+                    yield event
         finally:
             self._output_tool = None
 
@@ -305,8 +342,14 @@ class BaseAgent(ABC):
                     self._output_tool
                     and function_name == self._output_tool.name
                 ):
-                    response, structured_output = self._handle_output_call(tool_call)
+                    if function_name == "deliver_result" and len(message.tool_calls) != 1:
+                        response, structured_output = LLMMessage.tool(tool_call_id=tool_call.id, name=function_name, content="Call deliver_result alone after all work and plan updates are complete."), None
+                    else:
+                        response, structured_output = self._handle_output_call(tool_call)
                     tool_responses.append(response)
+                    if structured_output is None and self._stream_message_id:
+                        await self._stream_queue.put(MessageDeltaEvent(message_id=self._stream_message_id, reset=True))
+                        self._stream_message_id = None
                     continue
 
                 tool = self.get_tool(function_name)
@@ -356,36 +399,44 @@ class BaseAgent(ABC):
                             return f"l:{len(console)}:{tail}"
                         return f"o:{type(console).__name__}:{str(console)[-80:]}"
 
-                    while not invoke_task.done():
-                        done, _ = await asyncio.wait({invoke_task}, timeout=1.0)
-                        if done:
-                            break
-                        try:
-                            view = await tool.toolkit.sandbox.view_shell(
-                                shell_id, console=True
-                            )
-                            console = (
-                                view.data.get("console", [])
-                                if view and getattr(view, "data", None)
-                                else []
-                            )
-                            fingerprint = _console_fingerprint(console)
-                            if fingerprint != last_fingerprint:
-                                last_fingerprint = fingerprint
-                                yield TerminalUpdateEvent(
-                                    shell_id=shell_id,
-                                    output=console,
+                    try:
+                        while not invoke_task.done():
+                            done, _ = await asyncio.wait({invoke_task}, timeout=1.0)
+                            if done:
+                                break
+                            try:
+                                view = await tool.toolkit.sandbox.view_shell(
+                                    shell_id, console=True
                                 )
-                        except Exception:
-                            logger.debug(
-                                "Shell live poll failed for %s",
-                                shell_id,
-                                exc_info=True,
-                            )
-                    tool_result = await invoke_task
+                                console = (
+                                    view.data.get("console", [])
+                                    if view and getattr(view, "data", None)
+                                    else []
+                                )
+                                fingerprint = _console_fingerprint(console)
+                                if fingerprint != last_fingerprint:
+                                    last_fingerprint = fingerprint
+                                    yield TerminalUpdateEvent(
+                                        shell_id=shell_id,
+                                        output=console,
+                                    )
+                            except Exception:
+                                logger.debug(
+                                    "Shell live poll failed for %s",
+                                    shell_id,
+                                    exc_info=True,
+                                )
+                        tool_result = await invoke_task
+                    finally:
+                        if not invoke_task.done():
+                            invoke_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await invoke_task
                 else:
                     tool_result = await self.invoke_tool(tool, tool_call)
 
+                if function_name != "message_ask_user":
+                    await self._add_to_memory([tool_result])
                 # Generate event after tool call
                 yield ToolEvent(
                     status=ToolStatus.CALLED,
@@ -397,13 +448,14 @@ class BaseAgent(ABC):
                     brief=brief,
                 )
 
-                tool_responses.append(tool_result)
+                if function_name == "message_ask_user":
+                    tool_responses.append(tool_result)
 
             if structured_output is not None:
                 # Persist the tool responses so the tool-call pairing in
                 # memory stays consistent, then finish.
                 await self._add_to_memory(tool_responses)
-                yield StructuredOutputEvent(output=structured_output)
+                yield StructuredOutputEvent(output=structured_output, message_id=self._stream_message_id)
                 return
 
             message = await self.ask_with_messages(tool_responses)
@@ -453,11 +505,7 @@ class BaseAgent(ABC):
             await self._repository.save_memory(self._agent_id, self.name, self.memory)
 
         context = list(self.memory.get_messages())
-        message = await self._llm.ask(
-            messages=context,
-            tools=self.get_tool_schemas(),
-            tool_choice=self.tool_choice,
-        )
+        message = await self._ask_model(context)
         logger.debug(f"Response from model: {message}")
 
         await self._add_to_memory([message])
@@ -470,20 +518,19 @@ class BaseAgent(ABC):
 
     async def roll_back(self, message: Message):
         await self._ensure_memory()
-        last_message = self.memory.get_last_message()
-        if not last_message:
+        messages = self.memory.messages
+        assistant_index = next((i for i in range(len(messages) - 1, -1, -1) if messages[i].role == Role.ASSISTANT), None)
+        if assistant_index is None:
             return
-        if last_message.role != Role.ASSISTANT:
+        last_message = messages[assistant_index]
+        if not last_message.tool_calls or any(m.role != Role.TOOL for m in messages[assistant_index + 1:]):
             return
-        if not last_message.tool_calls:
-            return
-        tool_call = last_message.tool_calls[0]
-        function_name = tool_call.name
-        tool_call_id = tool_call.id
-        if function_name == "message_ask_user":
-            self.memory.add_message(LLMMessage.tool(tool_call_id=tool_call_id, name=function_name, content=message.message))
-        else:
-            self.memory.roll_back()
+        answered = {m.tool_call_id for m in messages[assistant_index + 1:] if m.role == Role.TOOL}
+        for call in last_message.tool_calls:
+            if call.id in answered:
+                continue
+            content = message.message if call.name == "message_ask_user" else '{"success":false,"message":"Interrupted tool call; its outcome is unconfirmed. Verify before retrying."}'
+            self.memory.add_message(LLMMessage.tool(tool_call_id=call.id, name=call.name, content=content))
         await self._repository.save_memory(self._agent_id, self.name, self.memory)
 
     async def compact_memory(self) -> None:

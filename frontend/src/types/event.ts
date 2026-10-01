@@ -5,8 +5,8 @@ export type AgentStatus = 'pending' | 'running' | 'waiting' | 'completed' | 'err
 
 /** Chat / session agent event over WebSocket (and history REST payloads). */
 export type AgentEvent = {
-  event: 'accepted' | 'tool' | 'step' | 'message' | 'error' | 'done' | 'title' | 'wait' | 'plan' | 'attachments' | 'status_update' | 'terminal_update' | 'file_update';
-  data: AcceptedEventData | ToolEventData | StepEventData | MessageEventData | ErrorEventData | DoneEventData | TitleEventData | WaitEventData | PlanEventData | StatusUpdateEventData | TerminalUpdateEventData | FileUpdateEventData;
+  event: 'message_delta' | 'accepted' | 'tool' | 'step' | 'message' | 'error' | 'done' | 'title' | 'wait' | 'plan' | 'attachments' | 'status_update' | 'terminal_update' | 'file_update';
+  data: MessageDeltaEventData | AcceptedEventData | ToolEventData | StepEventData | MessageEventData | ErrorEventData | DoneEventData | TitleEventData | WaitEventData | PlanEventData | StatusUpdateEventData | TerminalUpdateEventData | FileUpdateEventData;
 }
 
 /** @deprecated Transport is WebSocket; retained for old event fixtures only. */
@@ -65,7 +65,15 @@ export interface StepEventData extends BaseEventData {
   result?: string
 }
 
+export interface MessageDeltaEventData extends BaseEventData {
+  message_id: string;
+  delta: string;
+  offset: number;
+  reset: boolean;
+}
+
 export interface MessageEventData extends BaseEventData {
+  message_id?: string;
   content: string;
   role: "user" | "assistant";
   attachments: FileInfo[];

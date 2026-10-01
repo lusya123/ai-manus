@@ -1,0 +1,51 @@
+# Single-loop smoke: real sandbox work before complete plan_report and final.
+- choices:
+    - index: 0
+      message:
+        role: assistant
+        content: null
+        tool_calls:
+          - type: function
+            function:
+              name: create_plan
+              arguments: '{"message":"I will run a quick smoke command.","language":"en","title":"Single Loop E2E Task","goal":"Run a shell command and report the result","steps":[{"id":"1","description":"Run the single loop smoke command"}]}'
+- choices:
+    - index: 0
+      message:
+        role: assistant
+        content: null
+        tool_calls:
+          - type: function
+            function:
+              name: message_notify_user
+              arguments: '{"text":"Starting the single loop smoke command."}'
+- choices:
+    - index: 0
+      message:
+        role: assistant
+        content: null
+        tool_calls:
+          - type: function
+            function:
+              name: shell_exec
+              arguments: '{"id":"e2e-single-loop","exec_dir":"/home/ubuntu","command":"echo single-loop-smoke-ok"}'
+- choices:
+    - index: 0
+      message:
+        role: assistant
+        content: null
+        tool_calls:
+          - type: function
+            function:
+              name: plan_report
+              arguments: '{"steps":[{"id":"1","status":"completed","reflection":"single-loop-smoke-ok returned"}],"reflection":"The command succeeded."}'
+- choices:
+    - index: 0
+      message:
+        role: assistant
+        content: null
+        tool_calls:
+          - type: function
+            function:
+              name: deliver_result
+              arguments: '{"message":"Single loop E2E smoke finished after the real sandbox command returned single-loop-smoke-ok. The verified plan is complete.","attachments":[]}'

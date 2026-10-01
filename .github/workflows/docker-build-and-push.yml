@@ -1139,6 +1139,8 @@ jobs:
           done
           compose_b64="$(base64 < docker-compose.yml | tr -d '\n')"
           echo "compose_b64=${compose_b64}" >> "$GITHUB_OUTPUT"
+          config_b64="$(tar -czf - config | base64 | tr -d '\n')"
+          echo "config_b64=${config_b64}" >> "$GITHUB_OUTPUT"
 
       - name: Deploy fork images on server
         uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
@@ -1155,6 +1157,7 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GHCR_USER: ${{ github.actor }}
           COMPOSE_B64: ${{ steps.deploy.outputs.compose_b64 }}
+          OPERATOR_CONFIG_B64: ${{ steps.deploy.outputs.config_b64 }}
           DEPLOY_REF: ${{ github.ref }}
           EXPECTED_SHA: ${{ github.sha }}
           FORK_SEARCH_PROVIDER: ${{ needs.deploy-preflight.outputs.search_provider }}
@@ -1168,7 +1171,7 @@ jobs:
           password: ${{ secrets.SERVER_PASSWORD }}
           fingerprint: ${{ secrets.SERVER_HOST_FINGERPRINT }}
           command_timeout: 30m
-          envs: REGISTRY,OWNER,IMAGE_TAG,FRONTEND_IMAGE,BACKEND_IMAGE,SANDBOX_IMAGE,MOCKSERVER_IMAGE,DEPLOY_PATH,FRONTEND_HOST_PORT,GHCR_TOKEN,GHCR_USER,COMPOSE_B64,DEPLOY_REF,EXPECTED_SHA,FORK_SEARCH_PROVIDER,PUBLIC_HOST,CORE_RESOURCE_PREFIX,HOTPATCH_ENABLED,HOTPATCH_TARGET
+          envs: REGISTRY,OWNER,IMAGE_TAG,FRONTEND_IMAGE,BACKEND_IMAGE,SANDBOX_IMAGE,MOCKSERVER_IMAGE,DEPLOY_PATH,FRONTEND_HOST_PORT,GHCR_TOKEN,GHCR_USER,COMPOSE_B64,OPERATOR_CONFIG_B64,DEPLOY_REF,EXPECTED_SHA,FORK_SEARCH_PROVIDER,PUBLIC_HOST,CORE_RESOURCE_PREFIX,HOTPATCH_ENABLED,HOTPATCH_TARGET
           script: |
             set -eu
             cd "$DEPLOY_PATH"
@@ -3071,6 +3074,27 @@ jobs:
             }
             trap rollback EXIT
 
+            # Seed new operator files; never replace an operator-edited catalog
+            # or skill package on a subsequent image rollout.
+            python3 - <<'PYCONFIG'
+            import base64, io, os, tarfile
+            from pathlib import Path
+            archive = tarfile.open(fileobj=io.BytesIO(base64.b64decode(os.environ["OPERATOR_CONFIG_B64"])), mode="r:gz")
+            for member in archive.getmembers():
+                path = Path(member.name)
+                if not member.isfile():
+                    continue
+                if path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] != "config":
+                    raise SystemExit("Invalid operator configuration archive")
+                if any(parent.is_symlink() for parent in [path, *path.parents]):
+                    raise SystemExit("Operator configuration path must not be a symlink")
+                if path.exists():
+                    continue
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("xb") as target:
+                    target.write(archive.extractfile(member).read())
+                path.chmod(0o644)
+            PYCONFIG
             printf '%s' "$COMPOSE_B64" | base64 -d > "$incoming_compose"
             chmod 600 "$incoming_compose"
             if [ -n "${FORK_SEARCH_PROVIDER:-}" ]; then

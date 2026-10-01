@@ -1,4 +1,4 @@
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Callable
 from pydantic import BaseModel, Field, field_validator
 from enum import Enum
 
@@ -14,6 +14,11 @@ class MCPServerConfig(BaseModel):
     """
     MCP server configuration model
     """
+    # User-managed connectors pin a validated public address for the connection.
+    user_managed: bool = False
+    pinned_ip: Optional[str] = None
+    http_client_factory: Optional[Callable] = Field(default=None, exclude=True)
+
     # For stdio transport
     command: Optional[str] = None
     args: Optional[List[str]] = None

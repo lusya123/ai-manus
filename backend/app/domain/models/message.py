@@ -55,6 +55,8 @@ class LLMMessage(BaseModel):
     # Raw tool result object, kept only in memory for event rendering; never
     # persisted (excluded from model_dump).
     artifact: Optional[Any] = Field(default=None, exclude=True)
+    # Trusted execution outcome survives context compaction; never sent to models.
+    tool_success: Optional[bool] = None
 
     @field_validator("content", mode="before")
     @classmethod
@@ -95,4 +97,5 @@ class LLMMessage(BaseModel):
             tool_call_id=tool_call_id,
             name=name,
             artifact=artifact,
+            tool_success=getattr(artifact, "success", None),
         )

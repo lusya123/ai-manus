@@ -22,6 +22,9 @@
         <template #personalization>
           <PersonalizationSettings />
         </template>
+        <template #connectors>
+          <ConnectorsSettings />
+        </template>
         <template #skills>
           <SkillsSettings />
         </template>
@@ -48,6 +51,7 @@ import AccountSettings from './AccountSettings.vue'
 import ModelSettings from './ModelSettings.vue'
 import ShortcutsSettings from './ShortcutsSettings.vue'
 import PersonalizationSettings from './PersonalizationSettings.vue'
+import ConnectorsSettings from './ConnectorsSettings.vue'
 import SkillsSettings from './SkillsSettings.vue'
 import HelpSettings from './HelpSettings.vue'
 

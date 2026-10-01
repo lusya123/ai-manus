@@ -61,6 +61,10 @@ Tool loop (`BaseAgent`):
 
 **Change external capabilities**: define the Protocol in `domain/external/` first, implement in `infrastructure/external/`, wire in `interfaces/dependencies.py`. The harness must keep depending on the Protocol only.
 
+**MCP config**: `MCPRepository.get_mcp_config(user_id)` returns that user's enabled Mongo connectors (`ConnectorMCPRepository`). `AgentTaskRunner` passes `self._user_id`. Custom MCP CRUD lives in Settings → Connectors. The ChatBox **Connect apps** popover lists user Custom MCP switches (`connector.enabled`, same Mongo flag the toolkit already respects). Browse **Apps** is `connectors.json` inside the operator config directory (`CONFIG_DIR`, else `/etc/ai-manus`, else repo-root `config/`; `CONNECTOR_CATALOG_PATH` overrides the file). Install sends only `catalog_uid` plus headers via `POST /connectors/from-catalog` (idempotent). Not part of the Plan-Act loop.
+
+**Official skills**: catalog is `skills/{name}/SKILL.md` in that same directory (`SKILLS_PATH` overrides the skills folder), reloaded on each request. Subscription id is `skill_` plus the directory name with hyphens turned into underscores. Sandbox sync still writes `/home/ubuntu/skills/{name}/`.
+
 ## Testing pyramid
 
 **1. Offline unit tests (seconds — always run these when touching the harness):**
@@ -155,3 +159,13 @@ When you change flow transitions, event contracts, memory/rollback
 semantics, or output tools, update the **Invariants** section above, the
 affected scripted tests, and the eval scenarios in `backend/evals/` in the
 same PR.
+
+
+## Single-loop rollout and visible streaming
+
+- `AGENT_FLOW=agent_loop` selects Manus for new sessions. Persist `Session.agent_flow`; absent legacy fields mean `plan_act`. Do not change waiting legacy sessions across flows.
+- Both flows load the per-user skill catalog/body and preserve selected skills. Durable turn claims pass `resumes_waiting` even though the claimed session already says running.
+- Manus must report a full snapshot of known plan ids, at most one running step, and successful tool work before completing a step. `deliver_result` is rejected while plan work remains. Errors/iteration exhaustion never silently complete open steps.
+- Persist completed tool responses before emitting CALLED. On resume, pair every outstanding tool call; never replay a completed side effect. Cancel and reap shell invocation/poll tasks when the generator closes.
+- LangChain `ask_stream` emits visible chat text or only `deliver_result.message`, never planner/step JSON, ordinary tool arguments, or thinking blocks. On retry emit a reset. Canonical `MessageEvent.message_id` replaces the provisional bubble. Deltas use offsets, share the turn id, and are ignored by public-share projection. Final responses retain existing sanitization.
+- User-managed connectors accept public HTTPS only, revalidate DNS at use and pin transport with original Host/TLS SNI; reject redirects/cross-origin SSE messages and user STDIO. Headers are encrypted with the independent credential keyring and masked in REST responses. Keep operator MCP config separate and resolve name collisions without overriding operator servers.

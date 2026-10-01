@@ -14,6 +14,8 @@ export interface BaseContent {
 }
 
 export interface MessageContent extends BaseContent {
+  message_id?: string;
+  streaming?: boolean;
   content: string;
   /** User-turn attachments rendered above the text bubble (official ChatQuestion). */
   attachments?: FileInfo[];

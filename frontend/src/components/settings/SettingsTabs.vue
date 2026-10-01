@@ -7,6 +7,7 @@ import {
   Keyboard,
   LayoutGrid,
   Puzzle,
+  Cable,
   CircleHelp,
   Search,
   ChevronsUpDown,
@@ -22,6 +23,7 @@ export type SettingsTabId =
   | 'model'
   | 'shortcuts'
   | 'personalization'
+  | 'connectors'
   | 'skills'
   | 'help'
 
@@ -70,6 +72,7 @@ const navGroups: SettingsNavGroup[] = [
     label: 'Features',
     items: [
       { id: 'personalization', label: 'Personalization', icon: LayoutGrid },
+      { id: 'connectors', label: 'Connectors', icon: Cable },
       { id: 'skills', label: 'Skills', icon: Puzzle },
     ],
   },

@@ -3077,7 +3077,7 @@ jobs:
             # Seed new operator files; never replace an operator-edited catalog
             # or skill package on a subsequent image rollout.
             python3 - <<'PYCONFIG'
-            import base64, io, os, tarfile, time
+            import base64, io, os, tarfile, time, subprocess
             from pathlib import Path
             legacy = Path("mcp.json")
             if legacy.is_symlink():
@@ -3087,7 +3087,14 @@ jobs:
                     raise SystemExit("Legacy MCP directory is not empty; preserve and repair it manually")
                 backup = Path("recovery-backups") / ("mcp-path-repair-" + str(time.time_ns()))
                 backup.mkdir(parents=True, mode=0o700)
-                legacy.rename(backup / "mcp.json.empty-directory")
+                destination = backup / "mcp.json.empty-directory"
+                try:
+                    legacy.rename(destination)
+                except PermissionError:
+                    # Docker created the empty bind source as root. Moving
+                    # a directory between parents also needs write access
+                    # to that directory, even when both parents are writable.
+                    subprocess.run(["sudo", "-n", "mv", "--", str(legacy), str(destination)], check=True)
             if not legacy.exists():
                 with legacy.open("x") as stream:
                     stream.write('{"mcpServers": {}}\n')

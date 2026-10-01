@@ -117,15 +117,17 @@ async def migrate(*, apply: bool) -> int:
             }
             if is_legacy_system_key(plaintext, legacy_system_keys):
                 update = {
-                    "$set": {"is_byok": False},
-                    "$unset": {
-                        "api_key": "",
-                        "api_key_encrypted": "",
-                        # Without an explicit model_id mapping this record must
-                        # safely fall back to the current deployment default.
+                    "$set": {
+                        "is_byok": False,
+                        # The persisted document requires model_name even
+                        # when the runtime falls back to the server default.
                         "model_name": "",
                         "model_provider": "",
                         "api_base": "",
+                    },
+                    "$unset": {
+                        "api_key": "",
+                        "api_key_encrypted": "",
                     },
                 }
             else:

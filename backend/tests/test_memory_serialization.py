@@ -78,6 +78,34 @@ class TestLegacyLangChainFormat:
         m = deserialize_memory({"messages": [{"type": "human", "content": "hi"}]})
         assert m.messages[0].role == Role.USER
 
+    def test_anthropic_content_blocks_keep_text_and_single_tool_call(self):
+        raw = {"messages": [{
+            "type": "ai",
+            "content": [
+                {"type": "text", "text": "I will inspect the file."},
+                {"type": "tool_use", "id": "call_1", "name": "shell_exec", "input": {"cmd": "ls"}},
+            ],
+            "tool_calls": [{"id": "call_1", "name": "shell_exec", "args": {"cmd": "ls"}}],
+        }]}
+
+        message = deserialize_memory(raw).messages[0]
+        assert message.content == "I will inspect the file."
+        assert message.tool_calls == [
+            ToolCall(id="call_1", name="shell_exec", args={"cmd": "ls"})
+        ]
+
+    def test_anthropic_tool_use_block_recovers_missing_tool_calls(self):
+        raw = {"messages": [{
+            "type": "ai",
+            "content": [{"type": "tool_use", "id": "call_2", "name": "shell_exec", "input": {"cmd": "pwd"}}],
+        }]}
+
+        message = deserialize_memory(raw).messages[0]
+        assert message.content == ""
+        assert message.tool_calls == [
+            ToolCall(id="call_2", name="shell_exec", args={"cmd": "pwd"})
+        ]
+
 
 class TestNativeAndRoundTrip:
     def test_empty_and_none(self):

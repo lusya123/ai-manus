@@ -11,7 +11,8 @@ Supported inbound (persisted) message shapes:
   "tool_call_id", "name"}``.
 * LangChain ``model_dump`` shape: discriminated by a ``type`` field
   (``system`` / ``human`` / ``ai`` / ``tool``) with extra keys such as
-  ``additional_kwargs``, ``invalid_tool_calls`` and ``status``.
+  ``additional_kwargs``, ``invalid_tool_calls`` and ``status``. Historical
+  Anthropic AI messages may carry text/tool_use content blocks.
 * Old OpenAI chat shape: ``role`` based, tool messages use ``function_name``,
   tool calls nested under ``function`` with a stringified ``arguments``.
 """
@@ -79,6 +80,31 @@ def _upgrade_message(raw: Any) -> Dict[str, Any]:
     # Old OpenAI persisted tool messages carried "function_name".
     if data.get("role") == "tool" and not data.get("name") and data.get("function_name"):
         data["name"] = data.get("function_name")
+
+    # Older LangChain Anthropic responses stored content as text/tool_use
+    # blocks. The domain message needs text, while tool calls have their own
+    # field. Preserve that field when present and recover it from blocks when
+    # absent. Leave unknown block shapes untouched rather than dropping data.
+    content = data.get("content")
+    if data.get("role") == "assistant" and isinstance(content, list) and all(
+        isinstance(block, dict)
+        and block.get("type") in {"text", "tool_use"}
+        and (block.get("type") != "text" or isinstance(block.get("text"), str))
+        for block in content
+    ):
+        data["content"] = "\n".join(
+            block["text"] for block in content if block["type"] == "text"
+        )
+        if not data.get("tool_calls"):
+            data["tool_calls"] = [
+                {
+                    "id": block.get("id") or "",
+                    "name": block.get("name") or "",
+                    "args": _coerce_args(block.get("input")),
+                }
+                for block in content
+                if block["type"] == "tool_use"
+            ]
 
     if data.get("content") is None:
         data["content"] = ""

@@ -224,6 +224,15 @@ async function installApiMocks(page, options = {}) {
       return;
     }
 
+    if (["/api/v1/connectors", "/api/v1/connectors/catalog"].includes(url.pathname) && request.method() === "GET") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ code: 0, msg: "success", data: { connectors: [] } }),
+      });
+      return;
+    }
+
     await route.fulfill({
       status: 404,
       contentType: "application/json",

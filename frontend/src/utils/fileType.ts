@@ -1,14 +1,17 @@
-import type { Component } from 'vue';
+import { defineAsyncComponent, type Component } from 'vue';
 import { useI18n } from 'vue-i18n';
 import FileIcon from '../components/icons/FileIcon.vue';
 import CodeFileIcon from '../components/icons/CodeFileIcon.vue';
 import ImageFileIcon from '../components/icons/ImageFileIcon.vue';
-import UnknownFilePreview from '../components/filePreviews/UnknownFilePreview.vue';
-import MarkdownFilePreview from '../components/filePreviews/MarkdownFilePreview.vue';
-import CodeFilePreview from '../components/filePreviews/CodeFilePreview.vue';
-import ImageFilePreview from '../components/filePreviews/ImageFilePreview.vue';
-import PdfFilePreview from '../components/filePreviews/PdfFilePreview.vue';
-import HtmlFilePreview from '../components/filePreviews/HtmlFilePreview.vue';
+
+// Keep the editor and preview renderers off the initial page's dependency path.
+// File chips need icons/type labels; renderers load only when a preview opens.
+const UnknownFilePreview = defineAsyncComponent(() => import('../components/filePreviews/UnknownFilePreview.vue'));
+const MarkdownFilePreview = defineAsyncComponent(() => import('../components/filePreviews/MarkdownFilePreview.vue'));
+const CodeFilePreview = defineAsyncComponent(() => import('../components/filePreviews/CodeFilePreview.vue'));
+const ImageFilePreview = defineAsyncComponent(() => import('../components/filePreviews/ImageFilePreview.vue'));
+const PdfFilePreview = defineAsyncComponent(() => import('../components/filePreviews/PdfFilePreview.vue'));
+const HtmlFilePreview = defineAsyncComponent(() => import('../components/filePreviews/HtmlFilePreview.vue'));
 
 export interface FileType {
   icon: Component;

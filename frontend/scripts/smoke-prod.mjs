@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { chromium } from "playwright-core";
@@ -395,9 +395,25 @@ async function main() {
       ...(executablePath ? { executablePath } : {}),
     });
 
+    // Startup must work even when heavy preview/editor chunks are unavailable.
+    // Blocking built JS above 1 MB reproduces the public cold-load white screen.
+    const assetDir = join(process.cwd(), "dist/assets");
+    const heavyAssets = new Set(readdirSync(assetDir).filter((name) =>
+      name.endsWith(".js") && statSync(join(assetDir, name)).size > 1_000_000,
+    ));
     for (const routePath of ROUTES_TO_VERIFY) {
       const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
       await installApiMocks(page);
+      const blockedPreviewRequests = [];
+      await page.route("**/assets/*.js", async (route) => {
+        const name = new URL(route.request().url()).pathname.split("/").pop();
+        if (heavyAssets.has(name)) {
+          blockedPreviewRequests.push(name);
+          await route.abort();
+        } else {
+          await route.continue();
+        }
+      });
 
       page.on("console", (message) => {
         if (message.type() === "error") {
@@ -423,8 +439,14 @@ async function main() {
           }
           return true;
         },
+        null,
         { timeout: 20_000 },
       );
+
+      await page.locator('.chat-input-editor .ProseMirror[contenteditable="true"]').waitFor({ timeout: 10_000 });
+      if (blockedPreviewRequests.length) {
+        throw new Error(`Startup requested heavy preview chunks: ${blockedPreviewRequests.join(", ")}`);
+      }
 
       checkedRoutes.push(
         await page.evaluate(() => {
